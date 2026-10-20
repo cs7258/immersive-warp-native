@@ -1,0 +1,24 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (MSVC / D3D11)
+        shell: cmd
+        run: build.bat
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmersiveWarpNative
+          path: build/ImmersiveWarpNative.exe
+          if-no-files-found: error
