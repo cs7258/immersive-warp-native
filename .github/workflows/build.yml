@@ -22,3 +22,11 @@ jobs:
           name: ImmersiveWarpNative
           path: build/ImmersiveWarpNative.exe
           if-no-files-found: error
+
+      - name: Publish exe to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest build/ImmersiveWarpNative.exe --title "P0 build" --notes "auto build"
