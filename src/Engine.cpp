@@ -413,15 +413,17 @@ void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
             float tc = cols > 1 ? fc - ci : 0;
             float dx, dy;
             if (rows >= 4 && cols >= 4) {
-                float c0 = catmull(pt(cfg, ri, ci - 1, 0), pt(cfg, ri, ci, 0), pt(cfg, ri, ci + 1, 0), pt(cfg, ri, ci + 2, 0), tc);
-                float c1 = catmull(pt(cfg, ri + 1, ci - 1, 0), pt(cfg, ri + 1, ci, 0), pt(cfg, ri + 1, ci + 1, 0), pt(cfg, ri + 1, ci + 2, 0), tc);
-                float c2 = catmull(pt(cfg, ri + 2, ci - 1, 0), pt(cfg, ri + 2, ci, 0), pt(cfg, ri + 2, ci + 1, 0), pt(cfg, ri + 2, ci + 2, 0), tc);
-                float c3 = catmull(pt(cfg, ri + 3, ci - 1, 0), pt(cfg, ri + 3, ci, 0), pt(cfg, ri + 3, ci + 1, 0), pt(cfg, ri + 3, ci + 2, 0), tc);
+                // Catmull-Rom: outer lerp must return ROW ri at tr=0 and ROW ri+1
+                // at tr=1, so the four rows are (ri-1, ri, ri+1, ri+2)
+                float c0 = catmull(pt(cfg, ri - 1, ci - 1, 0), pt(cfg, ri - 1, ci, 0), pt(cfg, ri - 1, ci + 1, 0), pt(cfg, ri - 1, ci + 2, 0), tc);
+                float c1 = catmull(pt(cfg, ri, ci - 1, 0), pt(cfg, ri, ci, 0), pt(cfg, ri, ci + 1, 0), pt(cfg, ri, ci + 2, 0), tc);
+                float c2 = catmull(pt(cfg, ri + 1, ci - 1, 0), pt(cfg, ri + 1, ci, 0), pt(cfg, ri + 1, ci + 1, 0), pt(cfg, ri + 1, ci + 2, 0), tc);
+                float c3 = catmull(pt(cfg, ri + 2, ci - 1, 0), pt(cfg, ri + 2, ci, 0), pt(cfg, ri + 2, ci + 1, 0), pt(cfg, ri + 2, ci + 2, 0), tc);
                 dx = catmull(c0, c1, c2, c3, tr);
-                float r0 = catmull(pt(cfg, ri, ci - 1, 1), pt(cfg, ri, ci, 1), pt(cfg, ri, ci + 1, 1), pt(cfg, ri, ci + 2, 1), tc);
-                float r1 = catmull(pt(cfg, ri + 1, ci - 1, 1), pt(cfg, ri + 1, ci, 1), pt(cfg, ri + 1, ci + 1, 1), pt(cfg, ri + 1, ci + 2, 1), tc);
-                float r2 = catmull(pt(cfg, ri + 2, ci - 1, 1), pt(cfg, ri + 2, ci, 1), pt(cfg, ri + 2, ci + 1, 1), pt(cfg, ri + 2, ci + 2, 1), tc);
-                float r3 = catmull(pt(cfg, ri + 3, ci - 1, 1), pt(cfg, ri + 3, ci, 1), pt(cfg, ri + 3, ci + 1, 1), pt(cfg, ri + 3, ci + 2, 1), tc);
+                float r0 = catmull(pt(cfg, ri - 1, ci - 1, 1), pt(cfg, ri - 1, ci, 1), pt(cfg, ri - 1, ci + 1, 1), pt(cfg, ri - 1, ci + 2, 1), tc);
+                float r1 = catmull(pt(cfg, ri, ci - 1, 1), pt(cfg, ri, ci, 1), pt(cfg, ri, ci + 1, 1), pt(cfg, ri, ci + 2, 1), tc);
+                float r2 = catmull(pt(cfg, ri + 1, ci - 1, 1), pt(cfg, ri + 1, ci, 1), pt(cfg, ri + 1, ci + 1, 1), pt(cfg, ri + 1, ci + 2, 1), tc);
+                float r3 = catmull(pt(cfg, ri + 2, ci - 1, 1), pt(cfg, ri + 2, ci, 1), pt(cfg, ri + 2, ci + 1, 1), pt(cfg, ri + 2, ci + 2, 1), tc);
                 dy = catmull(r0, r1, r2, r3, tr);
             } else {
                 float a = pt(cfg, ri, ci, 0), b = pt(cfg, ri, ci + 1, 0);
