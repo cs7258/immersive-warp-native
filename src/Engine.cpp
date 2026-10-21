@@ -318,6 +318,13 @@ static float catmull(float p0, float p1, float p2, float p3, float t) {
 }
 static int cidx(int i, int n) { return i < 0 ? 0 : (i >= n ? n - 1 : i); }
 static float pt(const OutputCfg& c, int r, int col, int axis) {
+    // defensive: fall back to identity grid if points vector is missing/short
+    size_t need = (size_t)c.rows * c.cols * 2;
+    if (c.points.size() < need) {
+        float rr = (c.rows > 1) ? (float)cidx(r, c.rows) / (c.rows - 1) : 0.5f;
+        float cc = (c.cols > 1) ? (float)cidx(col, c.cols) / (c.cols - 1) : 0.5f;
+        return axis == 0 ? cc : rr;
+    }
     return c.points[((size_t)cidx(r, c.rows) * c.cols + cidx(col, c.cols)) * 2 + axis];
 }
 

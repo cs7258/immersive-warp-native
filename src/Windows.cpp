@@ -318,21 +318,27 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             if (sel >= 0) {
                 auto displays = enumerateDisplays();
                 if (sel < (int)displays.size()) {
-                    std::lock_guard<std::mutex> lk(g_cfgMutex);
-                    OutputCfg* found = nullptr;
-                    for (auto& o : g_cfg.outputs)
-                        if (o.deviceName == displays[sel].deviceName) { found = &o; break; }
-                    if (!found) {
-                        g_cfg.outputs.emplace_back();
-                        found = &g_cfg.outputs.back();
-                        found->deviceName = displays[sel].deviceName;
-                        found->label = displays[sel].label;
+                    bool enabledNow = false;
+                    {   // scoped lock: refreshList() below also locks g_cfgMutex,
+                        // so it MUST be called after this block releases the lock
+                        std::lock_guard<std::mutex> lk(g_cfgMutex);
+                        OutputCfg* found = nullptr;
+                        for (auto& o : g_cfg.outputs)
+                            if (o.deviceName == displays[sel].deviceName) { found = &o; break; }
+                        if (!found) {
+                            g_cfg.outputs.emplace_back();
+                            found = &g_cfg.outputs.back();
+                            found->deviceName = displays[sel].deviceName;
+                            found->label = displays[sel].label;
+                            found->initIdentity(); // new entry needs identity grid
+                        }
+                        found->enabled = !found->enabled;
+                        enabledNow = found->enabled;
+                        g_rev++;
                     }
-                    found->enabled = !found->enabled;
-                    g_rev++;
                     refreshList();
-                    setStatus(found->enabled ? L"Display assigned as projector. Press Start Output."
-                                             : L"Display unassigned.");
+                    setStatus(enabledNow ? L"Display assigned as projector. Press Start Output."
+                                         : L"Display unassigned.");
                 }
             }
         } else if (id == IDC_START && HIWORD(wp) == BN_CLICKED) {
