@@ -10,6 +10,10 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+
+// debug logging (%APPDATA%\ImmersiveWarpNative\debug.log)
+void dbgLogLine(const std::string& line);
+#include <atomic>
 #include <cmath>
 #include <algorithm>
 

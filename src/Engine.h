@@ -36,7 +36,8 @@ private:
         int meshRev = -1;
         ID3D11Buffer* frameCB = nullptr;
         ID3D11Buffer* overlayVB = nullptr;
-        UINT overlayVtx = 0;
+        UINT overlayLineVtx = 0;   // drawn as LINELIST
+        UINT overlayTriVtx = 0;    // drawn as TRIANGLELIST, starts after line verts
     };
 
     bool compileShaders();

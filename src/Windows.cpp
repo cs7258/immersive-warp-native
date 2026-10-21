@@ -17,13 +17,18 @@ struct OutWinState {
 static const wchar_t* OUT_CLASS = L"IWN_OutputWnd";
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
 
-static OutputCfg* cfgForWindow(OutWinState* st) {
+static OutputCfg* cfgForWindowNoLock(OutWinState* st) {
+    // caller must already hold g_cfgMutex
     auto displays = enumerateDisplays();
     if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return nullptr;
-    std::lock_guard<std::mutex> lk(g_cfgMutex);
     for (auto& o : g_cfg.outputs)
         if (o.enabled && o.deviceName == displays[st->displayIdx].deviceName) return &o;
     return nullptr;
+}
+
+static OutputCfg* cfgForWindow(OutWinState* st) {
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    return cfgForWindowNoLock(st);
 }
 
 static float normPointRadius(HWND hwnd) { return 12.0f; }
@@ -89,7 +94,7 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp >= VK_LEFT && wp <= VK_DOWN && st) { // nudge selected point
             float step = (GetKeyState(VK_SHIFT) & 0x8000) ? 0.01f : 0.002f;
             std::lock_guard<std::mutex> lk(g_cfgMutex);
-            if (auto* cfg = cfgForWindow(st)) {
+            if (auto* cfg = cfgForWindowNoLock(st)) {
                 if (st->subMode == 0 && st->dragKind == 0) {
                     int i = st->dragIdx * 2;
                     if (i + 1 < (int)cfg->points.size()) {
@@ -136,7 +141,7 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         float dx = nx - st->lastX, dy = ny - st->lastY;
         st->lastX = nx; st->lastY = ny;
         std::lock_guard<std::mutex> lk(g_cfgMutex);
-        if (auto* cfg = cfgForWindow(st)) {
+        if (auto* cfg = cfgForWindowNoLock(st)) {
             if (st->dragKind == 0) {
                 int i = st->dragIdx * 2;
                 if (i + 1 < (int)cfg->points.size()) {
@@ -173,7 +178,7 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!g_calib.load() || !st || st->dragKind < 1) break;
         float dir = (short)HIWORD(wp) > 0 ? 0.05f : -0.05f;
         std::lock_guard<std::mutex> lk(g_cfgMutex);
-        if (auto* cfg = cfgForWindow(st)) {
+        if (auto* cfg = cfgForWindowNoLock(st)) {
             if (st->dragKind == 1) {
                 auto& b = cfg->blend[st->dragIdx];
                 b.gamma = clampf(b.gamma + dir, 0.1f, 6.0f);
@@ -185,7 +190,10 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
     case WM_DESTROY:
+        dbgLogLine("output window destroyed");
         for (size_t i = 0; i < g_outWins.size(); i++)
             if (g_outWins[i].first == hwnd) { delete g_outWins[i].second; g_outWins.erase(g_outWins.begin() + i); break; }
         return 0;
@@ -213,8 +221,12 @@ void createOutputWindows() {
         auto* st = new OutWinState();
         st->displayIdx = (int)i;
         RECT r = displays[i].desktop;
-        HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, OUT_CLASS, cfg->label.c_str(), WS_POPUP | WS_VISIBLE,
-            r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        // WS_EX_NOACTIVATE: clicking the output never raises it above the
+        // console and never steals keyboard focus (hotkeys handle F3/F10/Esc)
+        HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, OUT_CLASS,
+            cfg->label.c_str(), WS_POPUP | WS_VISIBLE,
+            r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
         g_outWins.push_back({ hwnd, st });
         Engine::inst().attachOutput((int)i, hwnd);
@@ -224,6 +236,7 @@ void createOutputWindows() {
 }
 
 void destroyOutputWindows() {
+    dbgLogLine("destroyOutputWindows: " + std::to_string(g_outWins.size()) + " window(s)");
     for (auto& p : g_outWins) DestroyWindow(p.first);
     g_outWins.clear();
     Engine::inst().detachAll();

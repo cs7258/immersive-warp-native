@@ -173,7 +173,9 @@ bool Engine::compileShaders() {
 }
 
 // ---------------- debug log (%APPDATA%\ImmersiveWarpNative\debug.log) ----------------
-static void dbgLog(const std::string& line) {
+static void dbgLog(const std::string& line) { dbgLogLine(line); }
+
+void dbgLogLine(const std::string& line) {
     static std::ofstream* f = nullptr;
     if (!f) {
         wchar_t path[MAX_PATH];
@@ -465,6 +467,17 @@ void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
     memcpy(mp.pData, idx.data(), idx.size() * sizeof(uint32_t));
     m_ctx->Unmap(oc.meshIB, 0);
     oc.indexCount = (UINT)idx.size();
+
+    // diagnostics: dest-coordinate extremes pin down any fill/offset bug
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+    for (auto& v : vtx) {
+        minX = std::min(minX, v.dx); maxX = std::max(maxX, v.dx);
+        minY = std::min(minY, v.dy); maxY = std::max(maxY, v.dy);
+    }
+    dbgLog("mesh: rows=" + std::to_string(cfg.rows) + " cols=" + std::to_string(cfg.cols) +
+           " sub=" + std::to_string(g_cfg.subdivide) + " pts=" + std::to_string(cfg.points.size()) +
+           " destX=[" + std::to_string(minX) + "," + std::to_string(maxX) +
+           "] destY=[" + std::to_string(minY) + "," + std::to_string(maxY) + "]");
 }
 
 // ---------------- overlay (calibration points) ----------------
@@ -481,24 +494,24 @@ static void ovLine(std::vector<OvVtx>& v, float x0, float y0, float x1, float y1
 }
 
 void Engine::buildOverlay(OutputCtx& oc, const OutputCfg& cfg) {
-    std::vector<OvVtx> v;
+    std::vector<OvVtx> lines, tris;
     for (int r = 0; r < cfg.rows; r++)
         for (int c = 0; c + 1 < cfg.cols; c++) {
             float x0 = cfg.points[((size_t)r * cfg.cols + c) * 2], y0 = cfg.points[((size_t)r * cfg.cols + c) * 2 + 1];
             float x1 = cfg.points[((size_t)r * cfg.cols + c + 1) * 2], y1 = cfg.points[((size_t)r * cfg.cols + c + 1) * 2 + 1];
-            ovLine(v, x0, y0, x1, y1, 0.4f, 0.75f, 1.0f);
+            ovLine(lines, x0, y0, x1, y1, 0.4f, 0.75f, 1.0f);
         }
     for (int c = 0; c < cfg.cols; c++)
         for (int r = 0; r + 1 < cfg.rows; r++) {
             float x0 = cfg.points[((size_t)r * cfg.cols + c) * 2], y0 = cfg.points[((size_t)r * cfg.cols + c) * 2 + 1];
             float x1 = cfg.points[((size_t)(r + 1) * cfg.cols + c) * 2], y1 = cfg.points[((size_t)(r + 1) * cfg.cols + c) * 2 + 1];
-            ovLine(v, x0, y0, x1, y1, 0.4f, 0.75f, 1.0f);
+            ovLine(lines, x0, y0, x1, y1, 0.4f, 0.75f, 1.0f);
         }
     float half = 6.0f / std::max((float)oc.w, 1.0f);
     size_t nPts = cfg.points.size() / 2;
     for (size_t p = 0; p < nPts; p++) {
         float x = cfg.points[p * 2], y = cfg.points[p * 2 + 1];
-        ovQuad(v, x, y, half, 0.2f, 1.0f, 0.4f);
+        ovQuad(tris, x, y, half, 0.2f, 1.0f, 0.4f);
     }
     for (int sIdx = 0; sIdx < 4; sIdx++) {
         auto& adv = cfg.adv[sIdx];
@@ -509,7 +522,7 @@ void Engine::buildOverlay(OutputCtx& oc, const OutputCfg& cfg) {
                 else if (sIdx == 1) { x = 1 - p.fade; y = p.pos; }
                 else if (sIdx == 2) { x = p.pos; y = p.fade; }
                 else { x = p.pos; y = 1 - p.fade; }
-                ovQuad(v, x, y, half, 0.3f, 0.55f, 1.0f);
+                ovQuad(tris, x, y, half, 0.3f, 0.55f, 1.0f);
             }
         } else {
             auto& b = cfg.blend[sIdx];
@@ -519,16 +532,22 @@ void Engine::buildOverlay(OutputCtx& oc, const OutputCfg& cfg) {
                 else if (sIdx == 1) { x = 1 - b.fade; y = 0.5f; }
                 else if (sIdx == 2) { x = 0.5f; y = b.fade; }
                 else { x = 0.5f; y = 1 - b.fade; }
-                ovQuad(v, x, y, half, 1.0f, 0.3f, 0.3f);
+                ovQuad(tris, x, y, half, 1.0f, 0.3f, 0.3f);
             }
         }
     }
+    // layout: [line verts][triangle verts] — drawn with separate topologies
+    std::vector<OvVtx> all;
+    all.reserve(lines.size() + tris.size());
+    all.insert(all.end(), lines.begin(), lines.end());
+    all.insert(all.end(), tris.begin(), tris.end());
     D3D11_MAPPED_SUBRESOURCE mp{};
     m_ctx->Map(oc.overlayVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp);
-    UINT n = (UINT)std::min(v.size(), (size_t)256 * 1024);
-    memcpy(mp.pData, v.data(), n * sizeof(OvVtx));
+    UINT n = (UINT)std::min(all.size(), (size_t)256 * 1024);
+    memcpy(mp.pData, all.data(), n * sizeof(OvVtx));
     m_ctx->Unmap(oc.overlayVB, 0);
-    oc.overlayVtx = n;
+    oc.overlayLineVtx = (UINT)std::min(lines.size(), (size_t)n);
+    oc.overlayTriVtx = (UINT)std::min(tris.size(), (size_t)std::max(0, (int)n - (int)lines.size()));
 }
 
 // ---------------- constant buffer ----------------
@@ -600,15 +619,21 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
         m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         m_ctx->DrawIndexed(oc.indexCount, 0, 0);
     }
-    if (g_calib.load() && oc.overlayVtx) {
+    if (g_calib.load() && (oc.overlayLineVtx || oc.overlayTriVtx)) {
         m_ctx->VSSetShader(m_vsOv, nullptr, 0);
         m_ctx->PSSetShader(m_psOv, nullptr, 0);
         UINT stride = sizeof(OvVtx), off = 0;
         ID3D11Buffer* vbs[] = { oc.overlayVB };
         m_ctx->IASetVertexBuffers(0, 1, vbs, &stride, &off);
         m_ctx->IASetInputLayout(m_layoutOv);
-        m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        m_ctx->Draw(oc.overlayVtx, 0);
+        if (oc.overlayLineVtx) {
+            m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+            m_ctx->Draw(oc.overlayLineVtx, 0);
+        }
+        if (oc.overlayTriVtx) {
+            m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            m_ctx->Draw(oc.overlayTriVtx, oc.overlayLineVtx);
+        }
     }
     oc.swap->Present(g_calib.load() ? 0 : 1, 0);
 }
