@@ -126,7 +126,6 @@ bool loadConfig(const std::wstring& pathIn) {
         std::string key = line.substr(0, eq), val = line.substr(eq + 1);
         if (key == "testPattern") c.testPattern = val == "1";
         else if (key == "advancedBlend") c.advancedBlend = val == "1";
-        else if (key == "enabled") c.enabled = val == "1";
         else if (key == "subdivide") c.subdivide = atoi(val.c_str());
         else if (key == "outputs") c.outputs.resize((size_t)atoi(val.c_str()));
         else if (key == "dev") {
@@ -134,9 +133,9 @@ bool loadConfig(const std::wstring& pathIn) {
             for (auto& o : c.outputs) if (o.deviceName.empty()) { cur = &o; break; }
             if (cur) cur->deviceName = fromUtf8(val);
         }
-        else if (!cur) continue;
+        else if (!cur) { if (key == "enabled") c.enabled = val == "1"; }  // global keys
+        else if (key == "enabled") cur->enabled = val == "1";             // per-output
         else if (key == "label") cur->label = fromUtf8(val);
-        else if (key == "enabled") cur->enabled = val == "1";
         else if (key == "grid") sscanf_s(val.c_str(), "%d %d", &cur->rows, &cur->cols);
         else if (key == "pt") {
             float x = 0, y = 0;
