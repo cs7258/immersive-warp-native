@@ -219,6 +219,8 @@ void createOutputWindows() {
         g_outWins.push_back({ hwnd, st });
         Engine::inst().attachOutput((int)i, hwnd);
     }
+    // console always stays on top of the output windows (like the original)
+    notifyOutputRaised();
 }
 
 void destroyOutputWindows() {
@@ -227,8 +229,6 @@ void destroyOutputWindows() {
     Engine::inst().detachAll();
 }
 
-void setCalibrationMode(bool on) { g_calib.store(on); }
-
 // ------------------------------------------------------------------
 // Control window
 // ------------------------------------------------------------------
@@ -236,6 +236,41 @@ static const wchar_t* CTL_CLASS = L"IWN_ControlWnd";
 static HWND g_ctl = nullptr;
 static HWND g_list = nullptr, g_status = nullptr;
 static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
+
+static void setStatus(const wchar_t* s) {
+    if (g_status) SetWindowTextW(g_status, s);
+}
+
+void setCalibrationMode(bool on) {
+    bool was = g_calib.exchange(on);
+    if (was == on) return;
+    // Esc is captured globally only while calibrating, so it never
+    // interferes with normal Escape usage in other apps
+    if (on) RegisterHotKey(nullptr, 3, 0, VK_ESCAPE);
+    else UnregisterHotKey(nullptr, 3);
+}
+
+void toggleCalibration() {
+    if (g_calib.load()) {
+        setCalibrationMode(false);
+        setStatus(L"Calibration OFF.");
+    } else {
+        if (g_outWins.empty()) createOutputWindows();
+        setCalibrationMode(true);
+        setStatus(L"Calibration ON: drag green points (warp), F10 = blend mode, Esc = exit.");
+    }
+}
+
+void switchSubModeAll() {
+    if (!g_calib.load()) return;
+    for (auto& p : g_outWins) p.second->subMode = 1 - p.second->subMode;
+}
+
+void notifyOutputRaised() {
+    // keep the control console visible above the (topmost) output window
+    if (g_ctl) SetWindowPos(g_ctl, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
 
 #define IDC_LIST      1001
 #define IDC_TOGGLE    1002
@@ -248,10 +283,6 @@ static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 #define IDC_CKENABLE  1009
 #define IDC_CKTEST    1010
 #define IDC_CKADV     1011
-
-static void setStatus(const wchar_t* s) {
-    if (g_status) SetWindowTextW(g_status, s);
-}
 
 static void refreshList() {
     if (!g_list) return;
@@ -380,6 +411,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     case WM_DESTROY:
         g_ctl = nullptr;
+        UnregisterHotKey(nullptr, 1);
+        UnregisterHotKey(nullptr, 2);
+        UnregisterHotKey(nullptr, 3);
         PostQuitMessage(0);
         return 0;
     }
@@ -394,12 +428,15 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
-    g_ctl = CreateWindowExW(0, CTL_CLASS, L"Immersive Warp Native",
+    g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
         WS_OVERLAPPEDWINDOW, 100, 100, 580, 460,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);
     refreshList();
+    // global hotkeys so calibration keys work no matter which window has focus
+    RegisterHotKey(nullptr, 1, 0, VK_F3);   // enter/exit calibration
+    RegisterHotKey(nullptr, 2, 0, VK_F10);  // warp <-> blend mode
 }
 
 // GET_X_LPARAM / GET_Y_LPARAM come from windowsx.h (included above)

@@ -9,8 +9,21 @@ static void renderLoop() {
     }
 }
 
+static void enableDpiAwareness() {
+    // physical-pixel coordinates everywhere: prevents DWM virtualization from
+    // offsetting/scaling the fullscreen output window on scaled displays
+    typedef BOOL (WINAPI *SetCtxFn)(HANDLE);
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((HANDLE)-4)
+#endif
+    auto fn = (SetCtxFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext");
+    if (fn) fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    else SetProcessDPIAware();
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     (void)nCmdShow;
+    enableDpiAwareness();
     // initial config: one entry per display, all disabled
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -38,6 +51,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_HOTKEY) {
+            if (msg.wParam == 1) toggleCalibration();       // F3
+            else if (msg.wParam == 2) switchSubModeAll();   // F10
+            else if (msg.wParam == 3) toggleCalibration();  // Esc (registered while calibrating)
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

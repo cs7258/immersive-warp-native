@@ -1,5 +1,8 @@
 #include "Engine.h"
 #include <d3dcompiler.h>
+#include <shlobj.h>
+#include <fstream>
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 
@@ -169,6 +172,32 @@ bool Engine::compileShaders() {
     return true;
 }
 
+// ---------------- debug log (%APPDATA%\ImmersiveWarpNative\debug.log) ----------------
+static void dbgLog(const std::string& line) {
+    static std::ofstream* f = nullptr;
+    if (!f) {
+        wchar_t path[MAX_PATH];
+        SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path);
+        std::wstring dir = std::wstring(path) + L"\\ImmersiveWarpNative";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        f = new std::ofstream(dir + L"\\debug.log", std::ios::app);
+    }
+    if (*f) {
+        SYSTEMTIME st{}; GetLocalTime(&st);
+        char ts[40];
+        sprintf_s(ts, "[%04u-%02u-%02u %02u:%02u:%02u.%03u] ",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        *f << ts << line << "\n";
+        f->flush();
+    }
+}
+static std::string rectStr(const RECT& r) {
+    char b[96];
+    sprintf_s(b, "(%ld,%ld)-(%ld,%ld) %ldx%ld", r.left, r.top, r.right, r.bottom,
+        r.right - r.left, r.bottom - r.top);
+    return b;
+}
+
 bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     auto displays = enumerateDisplays();
     if (displayIdx < 0 || displayIdx >= (int)displays.size()) return false;
@@ -181,6 +210,11 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     GetClientRect(hwnd, &rc);
     oc->w = rc.right - rc.left;
     oc->h = rc.bottom - rc.top;
+    HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(hmon, &mi);
+    dbgLog("attach: displayIdx=" + std::to_string(displayIdx) +
+           " client=" + rectStr(rc) + " monitor=" + rectStr(mi.rcMonitor));
 
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferDesc.Width = oc->w; sd.BufferDesc.Height = oc->h;
@@ -209,12 +243,29 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     vb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     m_dev->CreateBuffer(&vb, nullptr, &oc->overlayVB);
 
-    createDuplication(*oc, di);
+    createDuplication(*oc);
     m_outs.push_back(oc);
     return true;
 }
 
-bool Engine::createDuplication(OutputCtx& oc, const DisplayInfo& di) {
+// Duplicate the desktop of the first display that is NOT itself an enabled
+// output. Capturing our own fullscreen output window would create an infinite
+// feedback loop (recursion), so on a single-display setup there is no capture
+// at all and the output falls back to the test pattern / black.
+// Requires g_cfgMutex to be held by the caller.
+bool Engine::createDuplication(OutputCtx& oc) {
+    auto displays = enumerateDisplays();
+    const DisplayInfo* src = nullptr;
+    for (auto& d : displays) {
+        bool isOutput = false;
+        for (auto& o : g_cfg.outputs)
+            if (o.enabled && o.deviceName == d.deviceName) { isOutput = true; break; }
+        if (!isOutput) { src = &d; break; }
+    }
+    if (!src) {
+        dbgLog("dupl: no source display available (all displays are outputs)");
+        return false;
+    }
     IDXGIAdapter1* adapter = nullptr;
     if (FAILED(m_factory->EnumAdapters1(0, &adapter))) return false;
     IDXGIOutput* out = nullptr;
@@ -222,7 +273,7 @@ bool Engine::createDuplication(OutputCtx& oc, const DisplayInfo& di) {
     for (UINT i = 0; adapter->EnumOutputs(i, &out) != DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_OUTPUT_DESC d{};
         out->GetDesc(&d);
-        if (d.DeviceName == di.deviceName) { found = true; break; }
+        if (d.DeviceName == src->deviceName) { found = true; break; }
         out->Release(); out = nullptr;
     }
     adapter->Release();
@@ -232,7 +283,22 @@ bool Engine::createDuplication(OutputCtx& oc, const DisplayInfo& di) {
     HRESULT hr = o1->DuplicateOutput(m_dev, &oc.dupl);
     oc.output1 = o1;
     out->Release();
+    dbgLog(std::string("dupl: source=") + (found ? "ok" : "fail") +
+           " hr=0x" + std::to_string((unsigned long)hr));
     return SUCCEEDED(hr);
+}
+
+void Engine::resizeSwapChain(OutputCtx& oc, UINT w, UINT h) {
+    if (oc.rtv) { oc.rtv->Release(); oc.rtv = nullptr; }
+    if (oc.backBuf) { oc.backBuf->Release(); oc.backBuf = nullptr; }
+    if (SUCCEEDED(oc.swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0))) {
+        oc.w = w; oc.h = h;
+        if (SUCCEEDED(oc.swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&oc.backBuf)))
+            m_dev->CreateRenderTargetView(oc.backBuf, nullptr, &oc.rtv);
+        dbgLog("swapchain resized to " + std::to_string(w) + "x" + std::to_string(h));
+    } else {
+        dbgLog("swapchain ResizeBuffers FAILED " + std::to_string(w) + "x" + std::to_string(h));
+    }
 }
 
 void Engine::detachAll() {
@@ -279,9 +345,8 @@ void Engine::captureFrame(OutputCtx& oc) {
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         oc.dupl->Release(); oc.dupl = nullptr;
         oc.frameValid = false;
-        auto displays = enumerateDisplays();
-        if (oc.displayIdx < (int)displays.size())
-            createDuplication(oc, displays[oc.displayIdx]);
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        createDuplication(oc);   // re-pick source (topology may have changed)
         return;
     }
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) return;
@@ -559,6 +624,29 @@ void Engine::renderAll() {
                 if (o.enabled && o.deviceName == displays[oc->displayIdx].deviceName) { cfg = &o; break; }
         }
         if (!cfg) continue;
+
+        // ---- geometry self-heal: snap window to its monitor and fit the
+        //      swapchain to the client area, so output always fills the screen
+        RECT wr{};
+        GetWindowRect(oc->hwnd, &wr);
+        HMONITOR hmon = MonitorFromWindow(oc->hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(hmon, &mi);
+        if (wr.left != mi.rcMonitor.left || wr.top != mi.rcMonitor.top ||
+            wr.right != mi.rcMonitor.right || wr.bottom != mi.rcMonitor.bottom) {
+            dbgLog("heal: window " + rectStr(wr) + " -> monitor " + rectStr(mi.rcMonitor));
+            SetWindowPos(oc->hwnd, HWND_TOPMOST,
+                mi.rcMonitor.left, mi.rcMonitor.top,
+                mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            notifyOutputRaised();
+        }
+        RECT crc{};
+        GetClientRect(oc->hwnd, &crc);
+        UINT cw = crc.right - crc.left, ch = crc.bottom - crc.top;
+        if (cw && ch && (cw != oc->w || ch != oc->h))
+            resizeSwapChain(*oc, cw, ch);
+
         captureFrame(*oc);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);

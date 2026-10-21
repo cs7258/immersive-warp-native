@@ -40,7 +40,8 @@ private:
     };
 
     bool compileShaders();
-    bool createDuplication(OutputCtx& oc, const DisplayInfo& di);
+    bool createDuplication(OutputCtx& oc);   // picks a source display that is NOT an output (no recursion)
+    void resizeSwapChain(OutputCtx& oc, UINT w, UINT h);
     void captureFrame(OutputCtx& oc);
     void buildMesh(OutputCtx& oc, const OutputCfg& cfg);
     void buildOverlay(OutputCtx& oc, const OutputCfg& cfg);

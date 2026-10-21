@@ -93,6 +93,9 @@ bool loadConfig(const std::wstring& path);
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);
 void createOutputWindows();
+void toggleCalibration();      // global hotkey F3: enter/exit calibration
+void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all outputs
+void notifyOutputRaised();     // output window raised itself; keep control window above
 void destroyOutputWindows();
 void setCalibrationMode(bool on);
 
