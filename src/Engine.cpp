@@ -115,7 +115,7 @@ bool Engine::init() {
     if (!compileShaders()) return false;
 
     D3D11_SAMPLER_DESC sd{};
-    sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_POINT;
+    sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.MaxLOD = 1e9f;
     m_dev->CreateSamplerState(&sd, &m_sampler);

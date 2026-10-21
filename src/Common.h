@@ -1,5 +1,8 @@
 #pragma once
 // Immersive Warp Native - common types & configuration (P0)
+#ifndef NOMINMAX
+#define NOMINMAX // prevent windows.h min/max macros from breaking std::min/std::max
+#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
