@@ -478,6 +478,13 @@ void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
            " sub=" + std::to_string(g_cfg.subdivide) + " pts=" + std::to_string(cfg.points.size()) +
            " destX=[" + std::to_string(minX) + "," + std::to_string(maxX) +
            "] destY=[" + std::to_string(minY) + "," + std::to_string(maxY) + "]");
+    if (cfg.points.size() >= 4) {
+        char pb[128];
+        sprintf_s(pb, "mesh: pt[0]=(%.4f,%.4f) pt[1]=(%.4f,%.4f) pt[last]=(%.4f,%.4f)",
+            cfg.points[0], cfg.points[1], cfg.points[2], cfg.points[3],
+            cfg.points[cfg.points.size() - 2], cfg.points[cfg.points.size() - 1]);
+        dbgLog(pb);
+    }
 }
 
 // ---------------- overlay (calibration points) ----------------
