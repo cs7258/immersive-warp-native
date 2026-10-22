@@ -3,9 +3,11 @@
 // one request -> one reply, meant for show-control / OSC-style integration.
 // Binds to 127.0.0.1 only: remote control stays on this machine unless a
 // future version explicitly opts into LAN exposure.
-#include "Common.h"
+// winsock2.h MUST come before windows.h (pulled in via Common.h), otherwise
+// the ancient winsock.h inside windows.h collides with it (sockaddr redefined)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include "Common.h"
 #include <thread>
 
 static std::atomic<bool> g_netRun{ false };
