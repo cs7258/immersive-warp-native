@@ -284,11 +284,11 @@ bool Engine::setTestImage(int id) {
             for (UINT x = 0; x < W; x++) {
                 BYTE r, g, b;
                 if (y < H * 2 / 3) {
-                    int k = (int)std::min(7, x * 8 / W);
+                    int k = x * 8 / W; if (k > 7) k = 7;
                     r = bars[k][0]; g = bars[k][1]; b = bars[k][2];
                 } else {
-                    BYTE v = (BYTE)std::min(255, x * 256 / W);
-                    r = g = b = v;
+                    int vi = x * 256 / W; if (vi > 255) vi = 255;
+                    r = g = b = (BYTE)vi;
                 }
                 if (x % 80 == 0 || y % 80 == 0) { r = g = b = 255; }
                 if (x > W / 2 - 2 && x < W / 2 + 2 && y > H / 2 - 40 && y < H / 2 + 40) { r = 255; g = 60; b = 60; }
@@ -310,7 +310,9 @@ bool Engine::setTestImage(int id) {
     case 2: {  // gray ramp + black/white reference blocks
         for (UINT y = 0; y < H; y++)
             for (UINT x = 0; x < W; x++) {
-                BYTE v = (BYTE)std::min(255, x * 256 / W);
+                BYTE v = 0;
+                int vi = x * 256 / W; if (vi > 255) vi = 255;
+                v = (BYTE)vi;
                 if (y < H / 6 && x < W / 8) v = 0;
                 if (y < H / 6 && x > W - W / 8) v = 255;
                 put(x, y, v, v, v);
