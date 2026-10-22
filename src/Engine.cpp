@@ -795,8 +795,10 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
     bool useImg = g_cfg.useImage && m_imgSRV != nullptr;
     d.flags[0] = (useImg || oc.frameValid) ? 1 : 0;
     // test pattern overrides capture, but a loaded image keeps priority so that
-    // geometry can be aligned on real content
-    d.flags[1] = (!useImg && (g_cfg.testPattern || g_calib.load())) ? 1 : 0;
+    // geometry can be aligned on real content. Calibration no longer forces the
+    // pattern on: aligning against live desktop content is the whole point of
+    // the snapshot-freeze workflow, so the checkbox alone decides.
+    d.flags[1] = (!useImg && g_cfg.testPattern) ? 1 : 0;
     // aspect-preserving letterbox: uv scale = output extent / drawn image extent
     d.imgFit[0] = 1.0f; d.imgFit[1] = 1.0f;
     if (useImg && m_imgW > 0 && m_imgH > 0 && oc.w && oc.h) {
