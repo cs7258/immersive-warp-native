@@ -125,10 +125,17 @@ bool Engine::init() {
     if (!compileShaders()) return false;
 
     D3D11_SAMPLER_DESC sd{};
-    sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.MaxLOD = 1e9f;
-    m_dev->CreateSamplerState(&sd, &m_sampler);
+    // 0 = trilinear, 1/2 = anisotropic (warped meshes sample at steep angles,
+    // anisotropy keeps projected grid lines crisp)
+    sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    m_dev->CreateSamplerState(&sd, &m_samplers[0]);
+    sd.Filter = D3D11_FILTER_ANISOTROPIC; sd.MaxAnisotropy = 4;
+    m_dev->CreateSamplerState(&sd, &m_samplers[1]);
+    sd.MaxAnisotropy = 8;
+    m_dev->CreateSamplerState(&sd, &m_samplers[2]);
+    m_sampIdx.store(0);
 
     D3D11_RASTERIZER_DESC rd{};
     rd.FillMode = D3D11_FILL_SOLID;
@@ -182,8 +189,13 @@ bool Engine::compileShaders() {
 // ---------------- image source (WIC + built-in test library) ----------------
 static void dbgLog(const std::string& line);   // defined below
 
-void Engine::clearImage() {
-    if (m_imgSRV) m_imgGarbageSRV.push_back(m_imgSRV);
+void Engine::setSampling(int q) {
+    if (q < 0) q = 0;
+    if (q > 2) q = 2;
+    m_sampIdx.store(q);
+}
+
+void Engine::clearImage() {    if (m_imgSRV) m_imgGarbageSRV.push_back(m_imgSRV);
     if (m_imgTex) m_imgGarbageTex.push_back(m_imgTex);
     m_imgSRV = nullptr; m_imgTex = nullptr; m_imgW = m_imgH = 0;
     m_testImg = -1;
@@ -516,7 +528,9 @@ void Engine::shutdown() {
     if (m_vsOv) m_vsOv->Release();
     if (m_layout) m_layout->Release();
     if (m_layoutOv) m_layoutOv->Release();
-    if (m_sampler) m_sampler->Release();
+    if (m_samplers[0]) m_samplers[0]->Release();
+    if (m_samplers[1]) m_samplers[1]->Release();
+    if (m_samplers[2]) m_samplers[2]->Release();
     if (m_blendOpaque) m_blendOpaque->Release();
     if (m_raster) m_raster->Release();
     if (m_ctx) m_ctx->Release();
@@ -839,7 +853,7 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
         ID3D11ShaderResourceView* srvs[] = {
             (g_cfg.useImage && m_imgSRV) ? m_imgSRV : oc.srv };
         m_ctx->PSSetShaderResources(0, 1, srvs);
-        ID3D11SamplerState* samps[] = { m_sampler };
+        ID3D11SamplerState* samps[] = { m_samplers[m_sampIdx.load()] };
         m_ctx->PSSetSamplers(0, 1, samps);
         UINT stride = sizeof(MeshVtx), off = 0;
         ID3D11Buffer* vbs[] = { oc.meshVB };

@@ -67,6 +67,8 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SAVE;` | `OK saved` | 保存配置到 config.txt |
 | `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
 | `SET testpattern=off;` | `OK testpattern=off` | 切换测试图 |
+| `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/各边 fade·gamma） |
+| `AUTOSTART ON;\|AUTOSTART OFF;` | `OK autostart=on` | 开机自启（写入 HKCU Run，无需管理员） |
 | 其他 | `ERR UNKNOWN` | 未知命令 |
 
 ## 工程结构

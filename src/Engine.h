@@ -12,6 +12,8 @@ public:
     void shutdown();
     bool loadImage(const std::wstring& path);   // WIC -> texture (image source)
     bool hasImage() const { return m_imgSRV != nullptr; }
+    void setSampling(int q);                    // 0 linear, 1 aniso 4x, 2 aniso 8x
+    int sampling() const { return m_sampIdx.load(); }
     int imageWidth() const { return m_imgW; }
     int imageHeight() const { return m_imgH; }
     // built-in test image library (like the original's Images page):
@@ -69,7 +71,11 @@ private:
     ID3D11PixelShader* m_psOv = nullptr;
     ID3D11InputLayout* m_layout = nullptr;
     ID3D11InputLayout* m_layoutOv = nullptr;
-    ID3D11SamplerState* m_sampler = nullptr;
+    // three prebuilt samplers (linear / aniso4x / aniso8x); the render thread
+    // indexes by an atomic so quality can be switched without touching D3D
+    // objects from the UI thread
+    ID3D11SamplerState* m_samplers[3] = { nullptr, nullptr, nullptr };
+    std::atomic<int> m_sampIdx{ 0 };
     // image source. Old textures are retired (not released) on reload so the
     // render thread can never touch a freed object mid-frame.
     ID3D11Texture2D* m_imgTex = nullptr;

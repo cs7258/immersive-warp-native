@@ -87,6 +87,8 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "testImg=" << g_cfg.testImg << "\n";
     os << "cmdnet=" << g_cfg.cmdnet << "\n";
     os << "cmdnetPort=" << g_cfg.cmdnetPort << "\n";
+    os << "sampling=" << g_cfg.sampling << "\n";
+    os << "autostart=" << g_cfg.autostart << "\n";
     os << "subdivide=" << g_cfg.subdivide << "\n";
     os << "outputs=" << g_cfg.outputs.size() << "\n";
     for (auto& o : g_cfg.outputs) {
@@ -143,6 +145,8 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "testImg") c.testImg = atoi(val.c_str());
         else if (key == "cmdnet") c.cmdnet = atoi(val.c_str());
         else if (key == "cmdnetPort") c.cmdnetPort = atoi(val.c_str());
+        else if (key == "sampling") c.sampling = atoi(val.c_str());
+        else if (key == "autostart") c.autostart = atoi(val.c_str());
         else if (key == "subdivide") c.subdivide = atoi(val.c_str());
         else if (key == "outputs") c.outputs.resize((size_t)atoi(val.c_str()));
         else if (key == "dev") {

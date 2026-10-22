@@ -11,6 +11,7 @@
 #include <thread>
 #include <cstdlib>
 #include <cctype>
+#include <cstdio>
 
 static std::atomic<bool> g_netRun{ false };
 static std::thread g_netThread;
@@ -58,6 +59,47 @@ static std::string dispatch(std::string line) {
 
     if (cmd == "PING") return "OK\n";
 
+    // GET key: query a single value (integration-friendly counterpart of SET)
+    if (cmd == "GET") {
+        std::string k = arg;
+        for (auto& c : k) c = (char)tolower((unsigned char)c);
+        if (k == "calib")    return std::string("OK calib=")    + (g_calib.load() ? "on" : "off") + "\n";
+        if (k == "mode")     return std::string("OK mode=")     + (g_calibMode.load() == 1 ? "blend" : "warp") + "\n";
+        if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
+        if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
+        if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
+        if (k == "testpattern") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return std::string("OK testpattern=") + (g_cfg.testPattern ? "on" : "off") + "\n";
+        }
+        if (k == "outputs") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            int n = 0; for (auto& o : g_cfg.outputs) if (o.enabled) n++;
+            return "OK outputs=" + std::to_string(n) + "\n";
+        }
+        if (k == "edges") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            for (auto& o : g_cfg.outputs) if (o.enabled) return "OK edges=" + edgesName(o.edges) + "\n";
+            return "ERR no output\n";
+        }
+        static const char* sides[4] = { "left", "right", "top", "bottom" };
+        for (int s = 0; s < 4; s++) {
+            std::string pfx = std::string(sides[s]) + ".";
+            if (k.compare(0, pfx.size(), pfx) == 0) {
+                std::string field = k.substr(pfx.size());
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled) continue;
+                    char b[64];
+                    if (field == "fade")  { sprintf_s(b, "OK %s.fade=%.3f\n",  sides[s], o.blend[s].fade);  return b; }
+                    if (field == "gamma") { sprintf_s(b, "OK %s.gamma=%.3f\n", sides[s], o.blend[s].gamma); return b; }
+                }
+                return "ERR GET " + k + "\n";
+            }
+        }
+        return "ERR GET " + arg + "\n";
+    }
+
     if (cmd == "STATUS") {
         int edges = 15, outs = 0;
         {
@@ -99,6 +141,12 @@ static std::string dispatch(std::string line) {
     }
 
     if (cmd == "SAVE") return saveConfig(L"") ? "OK saved\n" : "ERR SAVE\n";
+
+    if (cmd == "AUTOSTART") {
+        bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !queryAutostart();
+        setAutostart(want);
+        return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
+    }
 
     // SET <side>.<field>=<value>  e.g. "SET left.fade=0.2" / "SET testpattern=off"
     if (cmd == "SET") {

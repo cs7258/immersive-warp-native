@@ -78,6 +78,8 @@ struct AppConfig {
     int subdivide = 8;                // mesh subdivision per control cell
     int cmdnet = 0;                   // CMDNET ASCII TCP show-control service on/off
     int cmdnetPort = 5252;            // CMDNET listen port (loopback only)
+    int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x
+    int autostart = 0;                // start with Windows (HKCU Run mirror)
 
     OutputCfg* findByDevice(const std::wstring& dev) {
         for (auto& o : outputs) if (o.deviceName == dev) return &o;
@@ -132,5 +134,8 @@ void setBlendEdgesMask(int mask); // explicit edge set (CMDNET), complements cyc
 // CMDNET ASCII TCP show-control service: "<COMMAND> <PARAM>;\n", one request one reply
 void cmdnetStart(int port);       // loopback only
 void cmdnetStop();
+// start with Windows: HKCU\...\Run value "ImmersiveWarpNative" (no admin needed)
+void setAutostart(bool on);
+bool queryAutostart();
 
 inline float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }

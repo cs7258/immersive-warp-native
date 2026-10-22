@@ -3,6 +3,7 @@
 #include <windowsx.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <cstdio>
 #include <cwchar>
 #pragma comment(lib, "comdlg32.lib")
@@ -302,6 +303,79 @@ static HWND g_list = nullptr, g_status = nullptr, g_statusInfo = nullptr;
 static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
 static HWND g_ckNet = nullptr;
+static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
+
+// ---------------- tray icon ----------------
+static NOTIFYICONDATAW g_nid{};
+static bool g_trayOn = false;
+
+static void trayInit(HWND hwnd) {
+    if (g_trayOn) return;
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    lstrcpynW(g_nid.szTip, APP_NAME, 64);
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    g_trayOn = true;
+}
+
+static void trayRemove() {
+    if (!g_trayOn) return;
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    g_trayOn = false;
+}
+
+static void showTrayMenu(HWND hwnd) {
+    POINT p; GetCursorPos(&p);
+    HMENU m = CreatePopupMenu();
+    bool visible = IsWindowVisible(hwnd);
+    AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, visible ? L"Hide console" : L"Show console");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_TRAY_START, L"Start Output");
+    AppendMenuW(m, MF_STRING, IDM_TRAY_STOP, L"Stop Output");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_TRAY_EXIT, L"Exit");
+    SetForegroundWindow(hwnd);   // required so the menu dismisses on outside click
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, nullptr);
+    DestroyMenu(m);
+}
+
+// ---------------- autostart (HKCU Run, no admin needed) ----------------
+void setAutostart(bool on) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_SET_VALUE | KEY_QUERY_VALUE, &k) == ERROR_SUCCESS) {
+        if (on) {
+            wchar_t path[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, path, MAX_PATH);
+            std::wstring v = L"\"" + std::wstring(path) + L"\"";
+            RegSetValueExW(k, APP_NAME, 0, REG_SZ, (const BYTE*)v.c_str(),
+                           (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+        } else {
+            RegDeleteValueW(k, APP_NAME);
+        }
+        RegCloseKey(k);
+    }
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    g_cfg.autostart = on ? 1 : 0;
+}
+
+bool queryAutostart() {
+    HKEY k;
+    bool on = false;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_QUERY_VALUE, &k) == ERROR_SUCCESS) {
+        on = RegQueryValueExW(k, APP_NAME, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+        RegCloseKey(k);
+    }
+    return on;
+}
 static HWND g_cbImg = nullptr;
 
 static void setStatus(const wchar_t* s) {
@@ -467,6 +541,16 @@ void notifyOutputRaised() {
 #define IDC_COLOR     1017   // color adjustment dialog
 #define IDC_EDGES     1018   // cycle blended edges (same as Ctrl+F12)
 #define IDC_CKNET     1019   // CMDNET TCP show-control service on/off
+#define IDC_CKAUTO    1020   // start with Windows
+#define IDC_CBSAMP    1021   // sampling quality dropdown
+
+// tray menu ids (must not collide with control ids 1001..1021)
+#define IDM_TRAY_SHOW  2001
+#define IDM_TRAY_START 2002
+#define IDM_TRAY_STOP  2003
+#define IDM_TRAY_EXIT  2004
+
+static UINT WM_TRAYICON = WM_APP + 7;
 
 static void refreshList() {
     if (!g_list) return;
@@ -665,6 +749,19 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 190, 392, 190, 24,
             hwnd, (HMENU)IDC_CKNET, nullptr, nullptr);
+        g_ckAuto = CreateWindowW(L"BUTTON", L"Start with Windows",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 390, 392, 170, 24,
+            hwnd, (HMENU)IDC_CKAUTO, nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Sampling:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 424, 62, 18,
+            hwnd, nullptr, nullptr, nullptr);
+        g_cbSamp = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            76, 420, 170, 200,
+            hwnd, (HMENU)IDC_CBSAMP, nullptr, nullptr);
+        ComboBox_AddString(g_cbSamp, L"Trilinear");
+        ComboBox_AddString(g_cbSamp, L"Anisotropic 4x");
+        ComboBox_AddString(g_cbSamp, L"Anisotropic 8x");
         CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 190, 388, 200, 28,
             hwnd, (HMENU)IDC_EDGES, nullptr, nullptr);
@@ -683,6 +780,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckNet, g_cfg.cmdnet ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
+            Engine::inst().setSampling(g_cfg.sampling);
+            ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
+            trayInit(hwnd);
         }
         refreshStatusBar();
         return 0;
@@ -736,6 +837,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             g_previewMode.store(g_cfg.previewMode);
             Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
+            Engine::inst().setSampling(g_cfg.sampling);
+            ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
             ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
             if (!g_cfg.imagePath.empty() && engineLoadImage(g_cfg.imagePath)) {
                 const wchar_t* base = g_cfg.imagePath.c_str();
@@ -854,7 +958,42 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             if (on) cmdnetStart(g_cfg.cmdnetPort); else cmdnetStop();
             setStatus(on ? L"TCP control: listening on 127.0.0.1 (CMDNET)."
                          : L"TCP control: off.");
+        } else if (id == IDC_CKAUTO && HIWORD(wp) == BN_CLICKED) {
+            bool on = Button_GetCheck((HWND)lp) == BST_CHECKED;
+            setAutostart(on);
+            setStatus(on ? L"Autostart: registered (HKCU Run)."
+                         : L"Autostart: removed.");
+        } else if (id == IDC_CBSAMP && HIWORD(wp) == CBN_SELCHANGE) {
+            int sel = ComboBox_GetCurSel(g_cbSamp);
+            if (sel >= 0) {
+                { std::lock_guard<std::mutex> lk(g_cfgMutex); g_cfg.sampling = sel; }
+                Engine::inst().setSampling(sel);
+                setStatus(sel == 0 ? L"Sampling: trilinear."
+                                   : L"Sampling: anisotropic.");
+            }
+        } else if (id == IDM_TRAY_SHOW) {
+            if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+            else { ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); }
+        } else if (id == IDM_TRAY_START) {
+            createOutputWindows();
+        } else if (id == IDM_TRAY_STOP) {
+            destroyOutputWindows();
+        } else if (id == IDM_TRAY_EXIT) {
+            DestroyWindow(hwnd);
         }
+        return 0;
+    case WM_TRAYICON:
+        if (lp == WM_LBUTTONUP) {          // left click: toggle console
+            if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+            else { ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); }
+        } else if (lp == WM_RBUTTONUP || lp == WM_LBUTTONDBLCLK) {
+            showTrayMenu(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        // the console closes to the tray like the original; Exit is in the
+        // tray menu (or the Exit button) so a stray click never kills output
+        ShowWindow(hwnd, SW_HIDE);
         return 0;
     }
     case WM_KEYDOWN:
@@ -870,6 +1009,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     case WM_DESTROY:
         g_ctl = nullptr;
+        trayRemove();
         UnregisterHotKey(nullptr, 1);
         UnregisterHotKey(nullptr, 2);
         UnregisterHotKey(nullptr, 3);
