@@ -31,6 +31,11 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
    - Esc 退出校准
 5. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载
 
+## 单屏模式（无投影仪也能用）
+
+- **图片源**："Load image..." 选择 PNG/JPG/BMP（系统 WIC 解码），勾选 "Image source" 后图片替代桌面捕获作为校正内容，几何/融合校准直接在真实图像上做。宽高比不同时自动信箱式适配（多余区域为黑）。
+- **窗口化预览**：勾选 "Windowed preview (single screen)" 后输出变为 60% 大小的可拖动窗口，并通过 `WDA_EXCLUDEFROMCAPTURE` 将自身从桌面捕获中排除——因此单显示器也能实时扭曲桌面画面且不产生画面递归（捕获帧中该窗口区域为黑，属预期行为）。Win10 2004 之前系统无此 API 时自动禁用捕获，回退测试图/图片源。
+
 ## 工程结构
 
 | 文件 | 职责 |
