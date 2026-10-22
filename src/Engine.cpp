@@ -1,6 +1,7 @@
 #include "Engine.h"
 #include <d3dcompiler.h>
 #include <shlobj.h>
+#include <wincodec.h>
 #include <fstream>
 #include <cstdio>
 #include <cstring>
@@ -9,6 +10,8 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 
 Engine& Engine::inst() { static Engine e; return e; }
 
@@ -41,7 +44,8 @@ cbuffer FrameCB : register(b0) {
     float4 masks[8];        // x,y,w,h
     float4 color;           // gammaR, gammaG, gammaB, bright
     float contrast;
-    float3 pad;
+    float pad0;
+    float2 imgFit;          // uv scale for aspect-preserving letterbox
 }
 // piecewise interpolation over advanced edge points: x=pos, y=fade, z=gamma
 void edgeParams(float4 pts[8], int count, float c, float baseF, float baseG,
@@ -82,8 +86,11 @@ float4 main(VOut i) : SV_Target {
     if (fw > 0.001 && i.nom.y > 1 - fw) a *= pow(saturate((1 - i.nom.y) / fw), g);
 
     float3 c;
-    if (flags.x > 0 && flags.y < 1) c = tex.Sample(samp, i.src).rgb;
-    else c = testPattern(i.nom);
+    float2 uv = (i.src - 0.5) * imgFit + 0.5;   // letterbox: keep source aspect
+    if (flags.x > 0 && flags.y < 1) {
+        if (any(uv < 0) || any(uv > 1)) c = float3(0, 0, 0);
+        else c = tex.Sample(samp, uv).rgb;
+    } else c = testPattern(i.nom);
     c = pow(saturate(c), color.rgb);
     c = (c - 0.5) * contrast + 0.5;
     c *= color.w;
@@ -172,6 +179,83 @@ bool Engine::compileShaders() {
     return true;
 }
 
+// ---------------- image source (WIC) ----------------
+static void dbgLog(const std::string& line);   // defined below
+// Decodes PNG / JPG / BMP / TIFF / GIF / ICO into a BGRA texture. Empty path
+// clears the image (falls back to desktop capture / test pattern).
+bool Engine::loadImage(const std::wstring& path) {
+    if (!m_dev) return false;
+    if (path.empty()) {
+        if (m_imgSRV) m_imgGarbageSRV.push_back(m_imgSRV);
+        if (m_imgTex) m_imgGarbageTex.push_back(m_imgTex);
+        m_imgSRV = nullptr; m_imgTex = nullptr; m_imgW = m_imgH = 0;
+        return true;
+    }
+
+    static bool comInit = false;
+    if (!comInit) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); comInit = true; }
+
+    IWICImagingFactory* fac = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  __uuidof(IWICImagingFactory), (void**)&fac);
+    if (FAILED(hr)) { dbgLog("img: WIC factory failed"); return false; }
+
+    IWICBitmapDecoder* dec = nullptr;
+    hr = fac->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                        WICDecodeMetadataCacheOnLoad, &dec);
+    if (FAILED(hr)) { fac->Release(); dbgLog("img: decode failed"); return false; }
+
+    IWICBitmapFrameDecode* frm = nullptr;
+    hr = dec->GetFrame(0, &frm);
+    IWICFormatConverter* conv = nullptr;
+    if (SUCCEEDED(hr)) hr = fac->CreateFormatConverter(&conv);
+    if (SUCCEEDED(hr))
+        hr = conv->Initialize(frm, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone,
+                              nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    UINT w = 0, h = 0;
+    std::vector<BYTE> buf;
+    if (SUCCEEDED(hr)) {
+        hr = conv->GetSize(&w, &h);
+        if (SUCCEEDED(hr) && w && h) {
+            buf.resize((size_t)w * h * 4);
+            hr = conv->CopyPixels(nullptr, w * 4, (UINT)buf.size(), buf.data());
+        } else hr = E_FAIL;
+    }
+    if (conv) conv->Release();
+    if (frm) frm->Release();
+    if (dec) dec->Release();
+    fac->Release();
+    if (FAILED(hr)) { dbgLog("img: convert/copy failed"); return false; }
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w; td.Height = h;
+    td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd{};
+    sd.pSysMem = buf.data();
+    sd.SysMemPitch = w * 4;
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(m_dev->CreateTexture2D(&td, &sd, &tex))) { dbgLog("img: CreateTexture2D failed"); return false; }
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (FAILED(m_dev->CreateShaderResourceView(tex, nullptr, &srv))) {
+        tex->Release(); dbgLog("img: CreateSRV failed"); return false;
+    }
+
+    // retire the previous image instead of releasing it: the render thread may
+    // still hold the pointer for the frame it is currently submitting
+    if (m_imgSRV) m_imgGarbageSRV.push_back(m_imgSRV);
+    if (m_imgTex) m_imgGarbageTex.push_back(m_imgTex);
+    m_imgSRV = srv; m_imgTex = tex; m_imgW = (int)w; m_imgH = (int)h;
+    dbgLog("img: loaded " + std::to_string(w) + "x" + std::to_string(h));
+    return true;
+}
+
+bool engineLoadImage(const std::wstring& path) { return Engine::inst().loadImage(path); }
+bool engineHasImage() { return Engine::inst().hasImage(); }
+
 // ---------------- debug log (%APPDATA%\ImmersiveWarpNative\debug.log) ----------------
 static void dbgLog(const std::string& line) { dbgLogLine(line); }
 
@@ -258,7 +342,17 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
 bool Engine::createDuplication(OutputCtx& oc) {
     auto displays = enumerateDisplays();
     const DisplayInfo* src = nullptr;
+    if (g_previewMode.load() && oc.displayIdx >= 0 && oc.displayIdx < (int)displays.size()) {
+        // windowed preview: the output window is small and marked
+        // WDA_EXCLUDEFROMCAPTURE, so capturing its own display does NOT recurse
+        if (g_previewNoCapture.load()) {
+            dbgLog("dupl: preview mode but capture exclusion unavailable -> no capture");
+            return false;
+        }
+        src = &displays[oc.displayIdx];
+    }
     for (auto& d : displays) {
+        if (src) break;
         bool isOutput = false;
         for (auto& o : g_cfg.outputs)
             if (o.enabled && o.deviceName == d.deviceName) { isOutput = true; break; }
@@ -323,6 +417,12 @@ void Engine::detachAll() {
 
 void Engine::shutdown() {
     detachAll();
+    for (auto* s : m_imgGarbageSRV) s->Release();
+    m_imgGarbageSRV.clear();
+    for (auto* t : m_imgGarbageTex) t->Release();
+    m_imgGarbageTex.clear();
+    if (m_imgSRV) { m_imgSRV->Release(); m_imgSRV = nullptr; }
+    if (m_imgTex) { m_imgTex->Release(); m_imgTex = nullptr; }
     if (m_ps) m_ps->Release();
     if (m_vs) m_vs->Release();
     if (m_psOv) m_psOv->Release();
@@ -580,7 +680,7 @@ struct FrameCBData {
     int advCounts[4]; int flags[4];
     float masks[8][4];
     float color[4];
-    float contrast; float pad[3];
+    float contrast; float pad0; float imgFit[2];
 };
 static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
@@ -598,8 +698,18 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
             dst[i][0] = src[i].pos; dst[i][1] = src[i].fade; dst[i][2] = src[i].gamma; dst[i][3] = 0;
         }
     }
-    d.flags[0] = oc.frameValid ? 1 : 0;
-    d.flags[1] = (g_cfg.testPattern || g_calib.load()) ? 1 : 0;
+    bool useImg = g_cfg.useImage && m_imgSRV != nullptr;
+    d.flags[0] = (useImg || oc.frameValid) ? 1 : 0;
+    // test pattern overrides capture, but a loaded image keeps priority so that
+    // geometry can be aligned on real content
+    d.flags[1] = (!useImg && (g_cfg.testPattern || g_calib.load())) ? 1 : 0;
+    // aspect-preserving letterbox: uv scale = output extent / drawn image extent
+    d.imgFit[0] = 1.0f; d.imgFit[1] = 1.0f;
+    if (useImg && m_imgW > 0 && m_imgH > 0 && oc.w && oc.h) {
+        float w0 = (float)oc.w, h0 = (float)oc.h;
+        float s = std::min(w0 / (float)m_imgW, h0 / (float)m_imgH);
+        if (s > 0) { d.imgFit[0] = w0 / ((float)m_imgW * s); d.imgFit[1] = h0 / ((float)m_imgH * s); }
+    }
     d.flags[2] = (int)std::min(cfg.masks.size(), (size_t)MAX_MASKS);
     for (int i = 0; i < d.flags[2]; i++) {
         d.masks[i][0] = cfg.masks[i].x; d.masks[i][1] = cfg.masks[i].y;
@@ -630,7 +740,8 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
         m_ctx->PSSetShader(m_ps, nullptr, 0);
         ID3D11Buffer* cbs[] = { oc.frameCB };
         m_ctx->PSSetConstantBuffers(0, 1, cbs);
-        ID3D11ShaderResourceView* srvs[] = { oc.srv };
+        ID3D11ShaderResourceView* srvs[] = {
+            (g_cfg.useImage && m_imgSRV) ? m_imgSRV : oc.srv };
         m_ctx->PSSetShaderResources(0, 1, srvs);
         ID3D11SamplerState* samps[] = { m_sampler };
         m_ctx->PSSetSamplers(0, 1, samps);
@@ -674,20 +785,24 @@ void Engine::renderAll() {
         if (!cfg) continue;
 
         // ---- geometry self-heal: snap window to its monitor and fit the
-        //      swapchain to the client area, so output always fills the screen
-        RECT wr{};
-        GetWindowRect(oc->hwnd, &wr);
-        HMONITOR hmon = MonitorFromWindow(oc->hwnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{ sizeof(mi) };
-        GetMonitorInfoW(hmon, &mi);
-        if (wr.left != mi.rcMonitor.left || wr.top != mi.rcMonitor.top ||
-            wr.right != mi.rcMonitor.right || wr.bottom != mi.rcMonitor.bottom) {
-            dbgLog("heal: window " + rectStr(wr) + " -> monitor " + rectStr(mi.rcMonitor));
-            SetWindowPos(oc->hwnd, HWND_TOPMOST,
-                mi.rcMonitor.left, mi.rcMonitor.top,
-                mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            notifyOutputRaised();
+        //      swapchain to the client area, so output always fills the screen.
+        //      Skipped in windowed preview mode, where the window is intentionally
+        //      smaller than the monitor and freely movable.
+        if (!g_previewMode.load()) {
+            RECT wr{};
+            GetWindowRect(oc->hwnd, &wr);
+            HMONITOR hmon = MonitorFromWindow(oc->hwnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{ sizeof(mi) };
+            GetMonitorInfoW(hmon, &mi);
+            if (wr.left != mi.rcMonitor.left || wr.top != mi.rcMonitor.top ||
+                wr.right != mi.rcMonitor.right || wr.bottom != mi.rcMonitor.bottom) {
+                dbgLog("heal: window " + rectStr(wr) + " -> monitor " + rectStr(mi.rcMonitor));
+                SetWindowPos(oc->hwnd, HWND_TOPMOST,
+                    mi.rcMonitor.left, mi.rcMonitor.top,
+                    mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                notifyOutputRaised();
+            }
         }
         RECT crc{};
         GetClientRect(oc->hwnd, &crc);

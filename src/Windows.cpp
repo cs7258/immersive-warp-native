@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "Engine.h"
 #include <windowsx.h>
+#include <commdlg.h>
+#pragma comment(lib, "comdlg32.lib")
 
 // ------------------------------------------------------------------
 // Output windows (fullscreen per display) + calibration interaction
@@ -8,10 +10,11 @@
 struct OutWinState {
     int displayIdx = -1;
     int subMode = 0;              // 0 = geometrical correction, 1 = edge blending
-    int dragKind = -1;            // -1 none, 0 warp point, 1 simple blend side, 2 advanced point
+    int dragKind = -1;            // -1 none, 0 warp point, 1 simple blend side, 2 advanced point, 3 window move
     int dragIdx = -1;             // warp point index or blend side index
     int advIdx = -1;              // advanced point index
     float lastX = 0, lastY = 0;
+    int moveOffX = 0, moveOffY = 0;   // preview window drag offset
 };
 static const wchar_t* OUT_CLASS = L"IWN_OutputWnd";
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
@@ -110,7 +113,18 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_LBUTTONDOWN: {
-        if (!g_calib.load() || !st) break;
+        if (!st) break;
+        if (!g_calib.load()) {
+            // windowed preview: the output window is movable by dragging
+            if (g_previewMode.load()) {
+                POINT pt{}; GetCursorPos(&pt);
+                RECT wr{}; GetWindowRect(hwnd, &wr);
+                st->moveOffX = pt.x - wr.left; st->moveOffY = pt.y - wr.top;
+                st->dragKind = 3;
+                SetCapture(hwnd);
+            }
+            return 0;
+        }
         RECT rc; GetClientRect(hwnd, &rc);
         float nx = GET_X_LPARAM(lp) / (float)(rc.right - rc.left);
         float ny = GET_Y_LPARAM(lp) / (float)(rc.bottom - rc.top);
@@ -132,7 +146,14 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_MOUSEMOVE: {
-        if (!g_calib.load() || !st || st->dragKind < 0) break;
+        if (!st || st->dragKind < 0) break;
+        if (st->dragKind == 3) {   // preview window move
+            POINT pt{}; GetCursorPos(&pt);
+            SetWindowPos(hwnd, HWND_TOPMOST, pt.x - st->moveOffX, pt.y - st->moveOffY, 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE);
+            return 0;
+        }
+        if (!g_calib.load()) break;
         RECT rc; GetClientRect(hwnd, &rc);
         float nx = GET_X_LPARAM(lp) / (float)(rc.right - rc.left);
         float ny = GET_Y_LPARAM(lp) / (float)(rc.bottom - rc.top);
@@ -220,12 +241,33 @@ void createOutputWindows() {
         st->displayIdx = (int)i;
         st->subMode = g_calibMode.load();
         RECT r = displays[i].desktop;
+        bool preview = g_previewMode.load();
+        if (preview) {
+            // windowed preview: 60% of the monitor, centered. Combined with
+            // WDA_EXCLUDEFROMCAPTURE this allows live desktop warping on a
+            // single display without capturing our own output (no recursion).
+            int mw = r.right - r.left, mh = r.bottom - r.top;
+            int pw = (int)(mw * 0.6f), ph = (int)(mh * 0.6f);
+            r.left += (mw - pw) / 2; r.top += (mh - ph) / 2;
+            r.right = r.left + pw; r.bottom = r.top + ph;
+        }
         // WS_EX_NOACTIVATE: clicking the output never raises it above the
         // console and never steals keyboard focus (hotkeys handle F3/F10/Esc)
         HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, OUT_CLASS,
             cfg->label.c_str(), WS_POPUP | WS_VISIBLE,
             r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
             GetModuleHandleW(nullptr), nullptr);
+        if (preview) {
+            // 0x11 = WDA_EXCLUDEFROMCAPTURE (Win10 2004+), 0x01 = WDA_MONITOR
+            typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
+            auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity");
+            BOOL ok = fn ? fn(hwnd, 0x11) : FALSE;
+            if (!ok && fn) ok = fn(hwnd, 0x01);
+            g_previewNoCapture.store(!ok);
+            dbgLogLine(std::string("preview: window ") + (ok ? "excluded" : "NOT excluded") +
+                       " from capture, rect=" + std::to_string(r.left) + "," + std::to_string(r.top) +
+                       " " + std::to_string(r.right - r.left) + "x" + std::to_string(r.bottom - r.top));
+        }
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
         g_outWins.push_back({ hwnd, st });
         Engine::inst().attachOutput((int)i, hwnd);
@@ -248,6 +290,7 @@ static const wchar_t* CTL_CLASS = L"IWN_ControlWnd";
 static HWND g_ctl = nullptr;
 static HWND g_list = nullptr, g_status = nullptr;
 static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
+static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
 
 static void setStatus(const wchar_t* s) {
     if (g_status) SetWindowTextW(g_status, s);
@@ -298,6 +341,10 @@ void notifyOutputRaised() {
 #define IDC_CKENABLE  1009
 #define IDC_CKTEST    1010
 #define IDC_CKADV     1011
+#define IDC_CKPREVIEW 1012
+#define IDC_CKIMAGE   1013
+#define IDC_LOADIMG   1014
+#define IDC_CLEARIMG  1015
 
 static void refreshList() {
     if (!g_list) return;
@@ -348,13 +395,30 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         g_ckAdv = CreateWindowW(L"BUTTON", L"Advanced blending",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 390, 300, 160, 24,
             hwnd, (HMENU)IDC_CKADV, nullptr, nullptr);
+        g_ckPreview = CreateWindowW(L"BUTTON", L"Windowed preview (single screen)",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 330, 240, 24,
+            hwnd, (HMENU)IDC_CKPREVIEW, nullptr, nullptr);
+        g_ckImage = CreateWindowW(L"BUTTON", L"Image source",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 250, 330, 120, 24,
+            hwnd, (HMENU)IDC_CKIMAGE, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Load image...",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 375, 330, 100, 24,
+            hwnd, (HMENU)IDC_LOADIMG, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Clear",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 480, 330, 60, 24,
+            hwnd, (HMENU)IDC_CLEARIMG, nullptr, nullptr);
+        g_imgLabel = CreateWindowW(L"STATIC", L"Image: (none)",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 358, 540, 18,
+            hwnd, nullptr, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 340, 540, 60,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 382, 540, 60,
             hwnd, nullptr, nullptr, nullptr);
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         Button_SetCheck(g_ckTest, g_cfg.testPattern ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(g_ckAdv, g_cfg.advancedBlend ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(g_ckEnable, g_cfg.enabled ? BST_CHECKED : BST_UNCHECKED);
+        Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
+        Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
         return 0;
     }
     case WM_COMMAND: {
@@ -402,6 +466,19 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         } else if (id == IDC_LOAD && HIWORD(wp) == BN_CLICKED) {
             setStatus(loadConfig(L"") ? L"Config loaded." : L"Load failed (no file?).");
             refreshList();
+            // config may have changed preview/image state -> resync the UI
+            g_previewMode.store(g_cfg.previewMode);
+            Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
+            if (!g_cfg.imagePath.empty() && engineLoadImage(g_cfg.imagePath)) {
+                const wchar_t* base = g_cfg.imagePath.c_str();
+                for (const wchar_t* p = g_cfg.imagePath.c_str(); *p; p++)
+                    if (*p == L'\\' || *p == L'/') base = p + 1;
+                wchar_t line[512];
+                wsprintfW(line, L"Image: %s  (%d x %d)", base,
+                          Engine::inst().imageWidth(), Engine::inst().imageHeight());
+                SetWindowTextW(g_imgLabel, line);
+            }
         } else if (id == IDC_CKENABLE && HIWORD(wp) == BN_CLICKED) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             g_cfg.enabled = Button_GetCheck(g_ckEnable) == BST_CHECKED;
@@ -414,6 +491,71 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             g_cfg.advancedBlend = Button_GetCheck(g_ckAdv) == BST_CHECKED;
             g_rev++;
+        } else if (id == IDC_CKPREVIEW && HIWORD(wp) == BN_CLICKED) {
+            bool on = Button_GetCheck(g_ckPreview) == BST_CHECKED;
+            g_previewMode.store(on);
+            if (!on) g_previewNoCapture.store(false);
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.previewMode = on;
+                g_rev++;
+            }
+            // the capture source depends on this mode, so rebuild the outputs
+            bool running = !g_outWins.empty();
+            if (running) { destroyOutputWindows(); createOutputWindows(); }
+            setStatus(on ? L"Preview: 60% window, live desktop warp on a single screen. Drag the window to move it."
+                         : L"Preview off: fullscreen output.");
+        } else if (id == IDC_CKIMAGE && HIWORD(wp) == BN_CLICKED) {
+            bool on = Button_GetCheck(g_ckImage) == BST_CHECKED;
+            if (on && !engineHasImage()) {
+                Button_SetCheck(g_ckImage, BST_UNCHECKED);
+                setStatus(L"No image loaded yet - click \"Load image...\" first.");
+                return 0;
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.useImage = on;
+                g_rev++;
+            }
+            setStatus(on ? L"Image source active." : L"Image source off (desktop capture / test pattern).");
+        } else if (id == IDC_LOADIMG && HIWORD(wp) == BN_CLICKED) {
+            wchar_t file[MAX_PATH] = L"";
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff\0All files\0*.*\0\0";
+            ofn.lpstrFile = file;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+            if (!GetOpenFileNameW(&ofn)) return 0;
+            if (!engineLoadImage(file)) { setStatus(L"Image load failed (unsupported or unreadable file)."); return 0; }
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.useImage = true;
+                g_cfg.imagePath = file;
+                g_rev++;
+            }
+            Button_SetCheck(g_ckImage, BST_CHECKED);
+            {
+                const wchar_t* base = file;
+                for (const wchar_t* p = file; *p; p++) if (*p == L'\\' || *p == L'/') base = p + 1;
+                wchar_t line[512];
+                wsprintfW(line, L"Image: %s  (%d x %d)", base,
+                          Engine::inst().imageWidth(), Engine::inst().imageHeight());
+                SetWindowTextW(g_imgLabel, line);
+            }
+            setStatus(L"Image loaded and set as source.");
+        } else if (id == IDC_CLEARIMG && HIWORD(wp) == BN_CLICKED) {
+            engineLoadImage(L"");
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.useImage = false;
+                g_cfg.imagePath.clear();
+                g_rev++;
+            }
+            Button_SetCheck(g_ckImage, BST_UNCHECKED);
+            SetWindowTextW(g_imgLabel, L"Image: (none)");
+            setStatus(L"Image cleared.");
         }
         return 0;
     }
@@ -444,7 +586,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 580, 460,
+        WS_OVERLAPPEDWINDOW, 100, 100, 580, 520,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);

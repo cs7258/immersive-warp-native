@@ -8,6 +8,8 @@ std::mutex g_cfgMutex;
 std::atomic<int> g_rev{ 1 };
 std::atomic<bool> g_calib{ false };
 std::atomic<int> g_calibMode{ 0 };     // 0 = warp, 1 = blend
+std::atomic<bool> g_previewMode{ false };
+std::atomic<bool> g_previewNoCapture{ false };
 std::atomic<bool> g_running{ true };
 
 std::vector<DisplayInfo> enumerateDisplays() {
@@ -78,6 +80,9 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "testPattern=" << (g_cfg.testPattern ? 1 : 0) << "\n";
     os << "advancedBlend=" << (g_cfg.advancedBlend ? 1 : 0) << "\n";
     os << "enabled=" << (g_cfg.enabled ? 1 : 0) << "\n";
+    os << "preview=" << (g_cfg.previewMode ? 1 : 0) << "\n";
+    os << "useImage=" << (g_cfg.useImage ? 1 : 0) << "\n";
+    os << "image=" << toUtf8(g_cfg.imagePath) << "\n";
     os << "subdivide=" << g_cfg.subdivide << "\n";
     os << "outputs=" << g_cfg.outputs.size() << "\n";
     for (auto& o : g_cfg.outputs) {
@@ -127,6 +132,9 @@ bool loadConfig(const std::wstring& pathIn) {
         std::string key = line.substr(0, eq), val = line.substr(eq + 1);
         if (key == "testPattern") c.testPattern = val == "1";
         else if (key == "advancedBlend") c.advancedBlend = val == "1";
+        else if (key == "preview") c.previewMode = val == "1";
+        else if (key == "useImage") c.useImage = val == "1";
+        else if (key == "image") c.imagePath = fromUtf8(val);
         else if (key == "subdivide") c.subdivide = atoi(val.c_str());
         else if (key == "outputs") c.outputs.resize((size_t)atoi(val.c_str()));
         else if (key == "dev") {

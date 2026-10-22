@@ -8,6 +8,10 @@ public:
 
     bool init();                       // create device + shaders
     void shutdown();
+    bool loadImage(const std::wstring& path);   // WIC -> texture (image source)
+    bool hasImage() const { return m_imgSRV != nullptr; }
+    int imageWidth() const { return m_imgW; }
+    int imageHeight() const { return m_imgH; }
 
     // windows are created by Windows.cpp; engine attaches a render target per output
     bool attachOutput(int displayIdx, HWND hwnd);
@@ -60,6 +64,13 @@ private:
     ID3D11InputLayout* m_layout = nullptr;
     ID3D11InputLayout* m_layoutOv = nullptr;
     ID3D11SamplerState* m_sampler = nullptr;
+    // image source. Old textures are retired (not released) on reload so the
+    // render thread can never touch a freed object mid-frame.
+    ID3D11Texture2D* m_imgTex = nullptr;
+    ID3D11ShaderResourceView* m_imgSRV = nullptr;
+    int m_imgW = 0, m_imgH = 0;
+    std::vector<ID3D11ShaderResourceView*> m_imgGarbageSRV;
+    std::vector<ID3D11Texture2D*> m_imgGarbageTex;
     ID3D11BlendState* m_blendOpaque = nullptr;
     ID3D11RasterizerState* m_raster = nullptr;
 

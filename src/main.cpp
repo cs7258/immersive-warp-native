@@ -42,6 +42,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         MessageBoxW(nullptr, L"D3D11 device creation failed.", APP_NAME, MB_ICONERROR);
         return 1;
     }
+    // restore saved image source / preview mode before any window is created
+    if (!g_cfg.imagePath.empty()) Engine::inst().loadImage(g_cfg.imagePath);
+    g_previewMode.store(g_cfg.previewMode);
 
     registerAndCreateControlWindow(hInst);
 

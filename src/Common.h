@@ -68,6 +68,9 @@ struct AppConfig {
     bool testPattern = true;
     bool advancedBlend = false;
     bool enabled = false;             // Enable Desktop warping
+    bool previewMode = false;         // windowed preview (single screen live warp)
+    bool useImage = false;            // image source instead of pattern/capture
+    std::wstring imagePath;
     int subdivide = 8;                // mesh subdivision per control cell
 
     OutputCfg* findByDevice(const std::wstring& dev) {
@@ -78,6 +81,10 @@ struct AppConfig {
 
 // ---- global shared state ----
 extern std::atomic<int> g_calibMode;   // 0 = geometrical correction, 1 = edge blending
+extern std::atomic<bool> g_previewMode; // windowed preview (single-screen live warp)
+// set when WDA_EXCLUDEFROMCAPTURE is unavailable: capturing our own display
+// would recursively film the output window, so capture is disabled instead
+extern std::atomic<bool> g_previewNoCapture;
 extern AppConfig g_cfg;
 extern std::mutex g_cfgMutex;
 extern std::atomic<int> g_rev;        // config revision, bumped on every edit
@@ -97,6 +104,9 @@ bool loadConfig(const std::wstring& path);
 
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);
+// image source (WIC decode); empty path clears back to pattern/capture
+bool engineLoadImage(const std::wstring& path);
+bool engineHasImage();
 void createOutputWindows();
 void toggleCalibration();      // global hotkey F3: enter/exit calibration
 void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all outputs
