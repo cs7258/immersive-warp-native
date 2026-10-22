@@ -173,6 +173,14 @@ bool loadConfig(const std::wstring& pathIn) {
             (void)matched; (void)advSide;
         }
     }
+    // repair: a config without a full control-point grid (older file, manual
+    // edit, interrupted save) would leave OutputCfg::points empty and every
+    // grid draw would read out of bounds -> rebuild the identity grid
+    for (auto& o : c.outputs) {
+        if (o.rows < 2) o.rows = 2;
+        if (o.cols < 2) o.cols = 2;
+        if (o.points.size() != (size_t)o.rows * o.cols * 2) o.initIdentity();
+    }
     g_cfg = c;
     g_rev++;
     return true;
