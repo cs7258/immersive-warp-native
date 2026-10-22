@@ -25,10 +25,15 @@ jobs:
           path: build/ImmersiveWarpNative.exe
           if-no-files-found: error
 
+      # 只有 main 分支的构建才允许覆盖 latest release。
+      # 临时分支（复现/二分）通过 workflow_dispatch 触发的构建只上传 artifact，
+      # 否则一次老提交的复现构建会把 latest 指向旧代码。
       - name: Publish exe to Release
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create latest build/ImmersiveWarpNative.exe --title "P0 build" --notes "auto build"
+          gh release create latest build/ImmersiveWarpNative.exe --title "latest" \
+            --notes "commit ${{ github.sha }} · $(date -u +%Y-%m-%dT%H:%M:%SZ)"
