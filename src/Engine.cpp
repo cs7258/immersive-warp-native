@@ -856,7 +856,17 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
             m_ctx->Draw(oc.overlayTriVtx, oc.overlayLineVtx);
         }
     }
-    HRESULT phr = oc.swap->Present(g_calib.load() ? 0 : 1, 0);
+    // SyncInterval=0: vsync Present(1) latches into DXGI's occluded skip-mode
+    // when the window is briefly not composited (e.g. during startup or a
+    // transient overlay) and never recovers -> permanent black output. The
+    // render thread is already throttled by Sleep(6), so vsync is not needed.
+    HRESULT phr = oc.swap->Present(0, 0);
+    if (phr == (HRESULT)0x087A0001 /* DXGI_STATUS_OCCLUDED */) {
+        // force a non-vsync blit so DWM re-attaches the swapchain, then pause
+        // briefly so the occluded retry does not spin hot
+        Sleep(20);
+        phr = oc.swap->Present(0, 0);
+    }
     if ((++m_frameCount % 180) == 1) {
         char b[200];
         sprintf_s(b, "draw: out=%ux%u idx=%u rtv=%p meshVB=%p hr=0x%08lX useImg=%d imgSRV=%p",
