@@ -77,6 +77,7 @@ struct AppConfig {
 };
 
 // ---- global shared state ----
+extern std::atomic<int> g_calibMode;   // 0 = geometrical correction, 1 = edge blending
 extern AppConfig g_cfg;
 extern std::mutex g_cfgMutex;
 extern std::atomic<int> g_rev;        // config revision, bumped on every edit

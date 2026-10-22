@@ -504,24 +504,31 @@ static void ovLine(std::vector<OvVtx>& v, float x0, float y0, float x1, float y1
 
 void Engine::buildOverlay(OutputCtx& oc, const OutputCfg& cfg) {
     std::vector<OvVtx> lines, tris;
-    for (int r = 0; r < cfg.rows; r++)
-        for (int c = 0; c + 1 < cfg.cols; c++) {
-            float x0 = cfg.points[((size_t)r * cfg.cols + c) * 2], y0 = cfg.points[((size_t)r * cfg.cols + c) * 2 + 1];
-            float x1 = cfg.points[((size_t)r * cfg.cols + c + 1) * 2], y1 = cfg.points[((size_t)r * cfg.cols + c + 1) * 2 + 1];
-            ovLine(lines, x0, y0, x1, y1, 0.4f, 0.75f, 1.0f);
+    bool blendMode = g_calibMode.load() == 1;
+    if (!blendMode) {
+        // geometrical correction: blue mesh lines + green control points
+        for (int r = 0; r < cfg.rows; r++)
+            for (int c = 0; c + 1 < cfg.cols; c++) {
+                float x0 = cfg.points[((size_t)r * cfg.cols + c) * 2], y0 = cfg.points[((size_t)r * cfg.cols + c) * 2 + 1];
+                float x1 = cfg.points[((size_t)r * cfg.cols + c + 1) * 2], y1 = cfg.points[((size_t)r * cfg.cols + c + 1) * 2 + 1];
+                ovLine(lines, x0, y0, x1, y1, 0.4f, 0.75f, 1.0f);
+            }
+        for (int c = 0; c < cfg.cols; c++)
+            for (int r = 0; r + 1 < cfg.rows; r++) {
+                float x0 = cfg.points[((size_t)r * cfg.cols + c) * 2], y0 = cfg.points[((size_t)r * cfg.cols + c) * 2 + 1];
+                float x1 = cfg.points[((size_t)(r + 1) * cfg.cols + c) * 2], y1 = cfg.points[((size_t)(r + 1) * cfg.cols + c) * 2 + 1];
+                ovLine(lines, x0, y0, x1, y1, 0.4f, 0.75f, 1.0f);
+            }
+        float half = 6.0f / std::max((float)oc.w, 1.0f);
+        size_t nPts = cfg.points.size() / 2;
+        for (size_t p = 0; p < nPts; p++) {
+            float x = cfg.points[p * 2], y = cfg.points[p * 2 + 1];
+            ovQuad(tris, x, y, half, 0.2f, 1.0f, 0.4f);
         }
-    for (int c = 0; c < cfg.cols; c++)
-        for (int r = 0; r + 1 < cfg.rows; r++) {
-            float x0 = cfg.points[((size_t)r * cfg.cols + c) * 2], y0 = cfg.points[((size_t)r * cfg.cols + c) * 2 + 1];
-            float x1 = cfg.points[((size_t)(r + 1) * cfg.cols + c) * 2], y1 = cfg.points[((size_t)(r + 1) * cfg.cols + c) * 2 + 1];
-            ovLine(lines, x0, y0, x1, y1, 0.4f, 0.75f, 1.0f);
-        }
-    float half = 6.0f / std::max((float)oc.w, 1.0f);
-    size_t nPts = cfg.points.size() / 2;
-    for (size_t p = 0; p < nPts; p++) {
-        float x = cfg.points[p * 2], y = cfg.points[p * 2 + 1];
-        ovQuad(tris, x, y, half, 0.2f, 1.0f, 0.4f);
     }
+    // blend handles: visible in blend mode even when parked at the edge;
+    // in warp mode only shown when actually configured (fade > 0)
+    float half = 6.0f / std::max((float)oc.w, 1.0f);
     for (int sIdx = 0; sIdx < 4; sIdx++) {
         auto& adv = cfg.adv[sIdx];
         if (g_cfg.advancedBlend && !adv.empty()) {
@@ -535,12 +542,19 @@ void Engine::buildOverlay(OutputCtx& oc, const OutputCfg& cfg) {
             }
         } else {
             auto& b = cfg.blend[sIdx];
-            if (b.fade > 0.001f) {
+            if (blendMode || b.fade > 0.001f) {
                 float x, y;
                 if (sIdx == 0) { x = b.fade; y = 0.5f; }
                 else if (sIdx == 1) { x = 1 - b.fade; y = 0.5f; }
                 else if (sIdx == 2) { x = 0.5f; y = b.fade; }
                 else { x = 0.5f; y = 1 - b.fade; }
+                // blend-width indicator line across the edge
+                float lx0, ly0, lx1, ly1;
+                if (sIdx == 0) { lx0 = b.fade; ly0 = 0; lx1 = b.fade; ly1 = 1; }
+                else if (sIdx == 1) { lx0 = 1 - b.fade; ly0 = 0; lx1 = 1 - b.fade; ly1 = 1; }
+                else if (sIdx == 2) { lx0 = 0; ly0 = b.fade; lx1 = 1; ly1 = b.fade; }
+                else { lx0 = 0; ly0 = 1 - b.fade; lx1 = 1; ly1 = 1 - b.fade; }
+                ovLine(lines, lx0, ly0, lx1, ly1, 1.0f, 0.45f, 0.2f);
                 ovQuad(tris, x, y, half, 1.0f, 0.3f, 0.3f);
             }
         }

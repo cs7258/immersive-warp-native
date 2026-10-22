@@ -7,6 +7,7 @@ AppConfig g_cfg;
 std::mutex g_cfgMutex;
 std::atomic<int> g_rev{ 1 };
 std::atomic<bool> g_calib{ false };
+std::atomic<int> g_calibMode{ 0 };     // 0 = warp, 1 = blend
 std::atomic<bool> g_running{ true };
 
 std::vector<DisplayInfo> enumerateDisplays() {

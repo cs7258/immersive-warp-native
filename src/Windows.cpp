@@ -13,7 +13,6 @@ struct OutWinState {
     int advIdx = -1;              // advanced point index
     float lastX = 0, lastY = 0;
 };
-
 static const wchar_t* OUT_CLASS = L"IWN_OutputWnd";
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
 
@@ -59,8 +58,7 @@ static bool hitTestBlend(OutWinState* st, HWND hwnd, float nx, float ny, int& si
     bool found = false;
     for (int s = 0; s < 4; s++) {
         if (g_cfg.advancedBlend) {
-            for (size_t i = 0; i < cfg->adv[s].size(); i++) {
-                auto& p = cfg->adv[s][i];
+            for (size_t i = 0; i < cfg->adv[s].size(); i++) {                auto& p = cfg->adv[s][i];
                 float x, y;
                 if (s == 0) { x = p.fade; y = p.pos; }
                 else if (s == 1) { x = 1 - p.fade; y = p.pos; }
@@ -71,7 +69,7 @@ static bool hitTestBlend(OutWinState* st, HWND hwnd, float nx, float ny, int& si
             }
         } else {
             auto& b = cfg->blend[s];
-            if (b.fade <= 0.001f) continue;
+            // handles are visible/draggable even at fade=0 (parked at the edge)
             float x, y;
             if (s == 0) { x = b.fade; y = 0.5f; }
             else if (s == 1) { x = 1 - b.fade; y = 0.5f; }
@@ -220,6 +218,7 @@ void createOutputWindows() {
         n++;
         auto* st = new OutWinState();
         st->displayIdx = (int)i;
+        st->subMode = g_calibMode.load();
         RECT r = displays[i].desktop;
         // WS_EX_NOACTIVATE: clicking the output never raises it above the
         // console and never steals keyboard focus (hotkeys handle F3/F10/Esc)
@@ -275,8 +274,11 @@ void toggleCalibration() {
 }
 
 void switchSubModeAll() {
-    if (!g_calib.load()) return;
-    for (auto& p : g_outWins) p.second->subMode = 1 - p.second->subMode;
+    if (!g_calib.load()) { setStatus(L"Press F3 (or Configure alignment) first."); return; }
+    int m = g_calibMode.fetch_xor(1) ^ 1;   // 0 warp <-> 1 blend
+    for (auto& p : g_outWins) p.second->subMode = m;
+    setStatus(m == 1 ? L"Mode: Edge blending (red = simple handles, blue = advanced). F10 to switch back."
+                     : L"Mode: Geometrical correction (drag green points). F10 to switch.");
 }
 
 void notifyOutputRaised() {
