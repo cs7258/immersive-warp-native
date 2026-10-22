@@ -301,6 +301,7 @@ static HWND g_ctl = nullptr;
 static HWND g_list = nullptr, g_status = nullptr, g_statusInfo = nullptr;
 static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
+static HWND g_ckNet = nullptr;
 static HWND g_cbImg = nullptr;
 
 static void setStatus(const wchar_t* s) {
@@ -411,6 +412,26 @@ void cycleBlendEdges() {
     refreshStatusBar();
 }
 
+// explicit edge set for CMDNET (complements the F12 cycle)
+void setBlendEdgesMask(int mask) {
+    mask &= 15;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs) if (o.enabled) o.edges = mask;
+        g_rev++;
+    }
+    wchar_t msg[96], e[16] = L"";
+    if (mask & 1) lstrcatW(e, L"L");
+    if (mask & 2) lstrcatW(e, e[0] ? L"+R" : L"R");
+    if (mask & 4) lstrcatW(e, e[0] ? L"+T" : L"T");
+    if (mask & 8) lstrcatW(e, e[0] ? L"+B" : L"B");
+    if (mask == 15) wsprintfW(msg, L"Blend edges: ALL");
+    else if (!mask) wsprintfW(msg, L"Blend edges: NONE");
+    else wsprintfW(msg, L"Blend edges: %s", e);
+    setStatus(msg);
+    refreshStatusBar();
+}
+
 // Ctrl+F3: freeze the captured desktop so alignment is done on a still image.
 void toggleSnapshot() {
     bool on = !g_snapshot.load();
@@ -445,6 +466,7 @@ void notifyOutputRaised() {
 #define IDC_CBIMG     1016   // built-in test image pattern dropdown
 #define IDC_COLOR     1017   // color adjustment dialog
 #define IDC_EDGES     1018   // cycle blended edges (same as Ctrl+F12)
+#define IDC_CKNET     1019   // CMDNET TCP show-control service on/off
 
 static void refreshList() {
     if (!g_list) return;
@@ -640,6 +662,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         CreateWindowW(L"BUTTON", L"Color adjustment...",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 388, 170, 28,
             hwnd, (HMENU)IDC_COLOR, nullptr, nullptr);
+        g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 190, 392, 190, 24,
+            hwnd, (HMENU)IDC_CKNET, nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 190, 388, 200, 28,
             hwnd, (HMENU)IDC_EDGES, nullptr, nullptr);
@@ -657,6 +682,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             Button_SetCheck(g_ckEnable, g_cfg.enabled ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckNet, g_cfg.cmdnet ? BST_CHECKED : BST_UNCHECKED);
         }
         refreshStatusBar();
         return 0;
@@ -822,6 +848,12 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             openColorDialog(GetModuleHandleW(nullptr), hwnd);
         } else if (id == IDC_EDGES && HIWORD(wp) == BN_CLICKED) {
             cycleBlendEdges();
+        } else if (id == IDC_CKNET && HIWORD(wp) == BN_CLICKED) {
+            bool on = Button_GetCheck((HWND)lp) == BST_CHECKED;
+            g_cfg.cmdnet = on;
+            if (on) cmdnetStart(g_cfg.cmdnetPort); else cmdnetStop();
+            setStatus(on ? L"TCP control: listening on 127.0.0.1 (CMDNET)."
+                         : L"TCP control: off.");
         }
         return 0;
     }

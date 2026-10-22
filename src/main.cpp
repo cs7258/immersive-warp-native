@@ -37,6 +37,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }
     loadConfig(L""); // override from saved file if present
+    if (g_cfg.cmdnet) cmdnetStart(g_cfg.cmdnetPort);
 
     if (!Engine::inst().init()) {
         MessageBoxW(nullptr, L"D3D11 device creation failed.", APP_NAME, MB_ICONERROR);
@@ -71,6 +72,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_running.store(false);
     worker.join();
     saveConfig(L"");
+    cmdnetStop();
     Engine::inst().shutdown();
     return 0;
 }

@@ -51,6 +51,22 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 - **图片源**："Load image..." 选择 PNG/JPG/BMP（系统 WIC 解码），勾选 "Image source" 后图片替代桌面捕获作为校正内容，几何/融合校准直接在真实图像上做。宽高比不同时自动信箱式适配（多余区域为黑）。
 - **窗口化预览**：勾选 "Windowed preview (single screen)" 后输出变为 60% 大小的可拖动窗口，并通过 `WDA_EXCLUDEFROMCAPTURE` 将自身从桌面捕获中排除——因此单显示器也能实时扭曲桌面画面且不产生画面递归（捕获帧中该窗口区域为黑，属预期行为）。Win10 2004 之前系统无此 API 时自动禁用捕获，回退测试图/图片源。
 
+## CMDNET TCP 控制服务（演出集成）
+
+- 控制台勾选 "TCP control (CMDNET)" 或配置 `cmdnet=1` 后，监听 `127.0.0.1:5252`（仅本机回环，端口由 `cmdnetPort=` 配置）。
+- 协议与原版 CMDNET 一致：ASCII 明文 `<COMMAND> <PARAM>;\n`，一请求一应答。命令不区分大小写。
+
+| 命令 | 应答 | 说明 |
+|---|---|---|
+| `PING;` | `OK` | 连通性 |
+| `STATUS;` | `calib=off;mode=warp;edges=ALL;snapshot=off;outputs=1` | 当前状态 |
+| `CALIB ON;\|CALIB OFF;` | `OK calib=on` | 进入/退出校准（同 F3） |
+| `MODE WARP;\|MODE BLEND;` | `OK mode=blend` | 校准模式切换（同 F10，未校准时自动进入校准） |
+| `EDGES ALL;` / `EDGES L;` / `EDGES T+B;` | `OK edges=T+B` | 直接设置参与融合的边（ALL/L/R/T/B/NONE 及 `+` 组合） |
+| `SNAPSHOT ON;\|SNAPSHOT OFF;` | `OK snapshot=on` | 冻结/恢复捕获帧（同 Ctrl+F3） |
+| `SAVE;` | `OK saved` | 保存配置到 config.txt |
+| 其他 | `ERR UNKNOWN` | 未知命令 |
+
 ## 工程结构
 
 | 文件 | 职责 |

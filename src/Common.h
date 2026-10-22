@@ -76,6 +76,8 @@ struct AppConfig {
     std::wstring imagePath;
     int testImg = -1;                 // built-in test image library (0..3), -1 = none
     int subdivide = 8;                // mesh subdivision per control cell
+    int cmdnet = 0;                   // CMDNET ASCII TCP show-control service on/off
+    int cmdnetPort = 5252;            // CMDNET listen port (loopback only)
 
     OutputCfg* findByDevice(const std::wstring& dev) {
         for (auto& o : outputs) if (o.deviceName == dev) return &o;
@@ -125,5 +127,9 @@ void openColorDialogEx();      // global hotkey D: color adjustment dialog
 void notifyOutputRaised();     // output window raised itself; keep control window above
 void destroyOutputWindows();
 void setCalibrationMode(bool on);
+void setBlendEdgesMask(int mask); // explicit edge set (CMDNET), complements cycleBlendEdges
+// CMDNET ASCII TCP show-control service: "<COMMAND> <PARAM>;\n", one request one reply
+void cmdnetStart(int port);       // loopback only
+void cmdnetStop();
 
 inline float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
