@@ -90,4 +90,5 @@ private:
     // frame that is currently drawing it.
     std::vector<std::shared_ptr<OutputCtx>> m_outs;
     std::mutex m_outsMutex;
+    UINT m_frameCount = 0;
 };

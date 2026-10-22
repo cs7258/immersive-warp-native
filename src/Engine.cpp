@@ -420,6 +420,11 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     m_dev->CreateBuffer(&vb, nullptr, &oc->overlayVB);
 
     createDuplication(*oc);
+    dbgLog(std::string("attach res: swap=") + (oc->swap ? "ok" : "NULL") +
+           " backBuf=" + (oc->backBuf ? "ok" : "NULL") +
+           " rtv=" + (oc->rtv ? "ok" : "NULL") +
+           " frameCB=" + (oc->frameCB ? "ok" : "NULL") +
+           " overlayVB=" + (oc->overlayVB ? "ok" : "NULL"));
     {
         std::lock_guard<std::mutex> lk(m_outsMutex);
         m_outs.push_back(oc);
@@ -851,7 +856,14 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
             m_ctx->Draw(oc.overlayTriVtx, oc.overlayLineVtx);
         }
     }
-    oc.swap->Present(g_calib.load() ? 0 : 1, 0);
+    HRESULT phr = oc.swap->Present(g_calib.load() ? 0 : 1, 0);
+    if ((++m_frameCount % 180) == 1) {
+        char b[200];
+        sprintf_s(b, "draw: out=%ux%u idx=%u rtv=%p meshVB=%p hr=0x%08lX useImg=%d imgSRV=%p",
+                  oc.w, oc.h, oc.indexCount, (void*)oc.rtv, (void*)oc.meshVB,
+                  (unsigned long)phr, (int)(g_cfg.useImage ? 1 : 0), (void*)m_imgSRV);
+        dbgLog(b);
+    }
 }
 
 void Engine::renderAll() {
