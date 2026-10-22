@@ -229,13 +229,19 @@ void createOutputWindows() {
     RegisterClassW(&wc);
 
     auto displays = enumerateDisplays();
+    dbgLogLine("createOutputWindows: displays=" + std::to_string(displays.size()) +
+               " preview=" + std::to_string((int)g_previewMode.load()));
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     int n = 0;
     for (size_t i = 0; i < displays.size(); i++) {
         OutputCfg* cfg = nullptr;
         for (auto& o : g_cfg.outputs)
             if (o.enabled && o.deviceName == displays[i].deviceName) { cfg = &o; break; }
-        if (!cfg) continue;
+        if (!cfg) {
+            dbgLogLine("createOutputWindows: no enabled cfg for " +
+                       std::string(displays[i].deviceName.begin(), displays[i].deviceName.end()));
+            continue;
+        }
         n++;
         auto* st = new OutWinState();
         st->displayIdx = (int)i;

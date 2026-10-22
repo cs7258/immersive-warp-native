@@ -183,5 +183,20 @@ bool loadConfig(const std::wstring& pathIn) {
     }
     g_cfg = c;
     g_rev++;
+    {
+        // startup diagnostics: proves what the parser actually produced
+        int en = 0;
+        for (auto& o : g_cfg.outputs) if (o.enabled) en++;
+        char b[256];
+        sprintf_s(b, "loadConfig: outputs=%zu enabledOut=%d globalEnabled=%d preview=%d useImage=%d img=%s",
+            g_cfg.outputs.size(), en, (int)g_cfg.enabled, (int)g_cfg.previewMode,
+            (int)g_cfg.useImage, g_cfg.imagePath.empty() ? "(none)" : "(set)");
+        dbgLogLine(b);
+        for (auto& o : g_cfg.outputs) {
+            sprintf_s(b, "loadConfig: dev=%ls enabled=%d pts=%zu grid=%dx%d",
+                o.deviceName.c_str(), (int)o.enabled, o.points.size(), o.rows, o.cols);
+            dbgLogLine(b);
+        }
+    }
     return true;
 }
