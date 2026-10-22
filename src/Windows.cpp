@@ -325,7 +325,10 @@ void refreshStatusBar() {
         }
     }
     wchar_t l1[128], l2[160], l3[192], l4[128];
-    wsprintfW(l1, L"Projector: %d [%d]%s", nProj, sel + 1,
+    // [n] = which projector is being edited (1-based). refreshList() resets the
+    // listbox selection, so fall back to 1 instead of showing [0].
+    int cur = (sel >= 0 && sel < nProj) ? sel + 1 : (nProj > 0 ? 1 : 0);
+    wsprintfW(l1, L"Projector: %d [%d]%s", nProj, cur,
               g_previewMode.load() ? L"   Preview: ON" : L"");
     // wsprintfW (user32) has no floating point support -> use the CRT here
     _snwprintf_s(l2, 160, _TRUNCATE, L"Mode: %s   Snapshot: %s",
