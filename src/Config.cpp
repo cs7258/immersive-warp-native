@@ -11,6 +11,7 @@ std::atomic<int> g_calibMode{ 0 };     // 0 = warp, 1 = blend
 std::atomic<bool> g_previewMode{ false };
 std::atomic<bool> g_previewNoCapture{ false };
 std::atomic<bool> g_running{ true };
+std::atomic<bool> g_snapshot{ false };
 
 std::vector<DisplayInfo> enumerateDisplays() {
     std::vector<DisplayInfo> result;
@@ -91,6 +92,7 @@ bool saveConfig(const std::wstring& pathIn) {
         os << "label=" << toUtf8(o.label) << "\n";
         os << "enabled=" << (o.enabled ? 1 : 0) << "\n";
         os << "grid=" << o.rows << " " << o.cols << "\n";
+        os << "edges=" << o.edges << "\n";
         for (size_t i = 0; i + 1 < o.points.size(); i += 2)
             os << "pt=" << o.points[i] << " " << o.points[i + 1] << "\n";
         writeSide(os, "left", o.blend[0], o.adv[0]);
@@ -148,6 +150,7 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "enabled") cur->enabled = val == "1";             // per-output
         else if (key == "label") cur->label = fromUtf8(val);
         else if (key == "grid") sscanf_s(val.c_str(), "%d %d", &cur->rows, &cur->cols);
+        else if (key == "edges") cur->edges = atoi(val.c_str()) & 15;
         else if (key == "pt") {
             float x = 0, y = 0;
             sscanf_s(val.c_str(), "%f %f", &x, &y);

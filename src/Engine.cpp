@@ -528,6 +528,9 @@ void Engine::shutdown() {
 // ---------------- capture ----------------
 void Engine::captureFrame(OutputCtx& oc) {
     if (!oc.dupl) return;
+    // Ctrl+F3 snapshot: stop acquiring so the last frame stays on screen.
+    // Alignment on a frozen image is far steadier than on live desktop motion.
+    if (g_snapshot.load() && oc.frameValid) return;
     DXGI_OUTDUPL_FRAME_INFO info{};
     IDXGIResource* res = nullptr;
     HRESULT hr = oc.dupl->AcquireNextFrame(0, &info, &res);
@@ -717,6 +720,9 @@ void Engine::buildOverlay(OutputCtx& oc, const OutputCfg& cfg) {
     // in warp mode only shown when actually configured (fade > 0)
     float half = 6.0f / std::max((float)oc.w, 1.0f);
     for (int sIdx = 0; sIdx < 4; sIdx++) {
+        // an edge switched off with F12 is neither blended nor shown, so the
+        // user can see exactly which edges are active for this projector
+        if (blendMode && !(cfg.edges & (1 << sIdx))) continue;
         auto& adv = cfg.adv[sIdx];
         if (g_cfg.advancedBlend && !adv.empty()) {
             for (auto& p : adv) {
@@ -773,14 +779,15 @@ static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
 void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
     FrameCBData d{};
-    d.LR[0] = cfg.blend[0].fade; d.LR[1] = cfg.blend[0].gamma;
-    d.LR[2] = cfg.blend[1].fade; d.LR[3] = cfg.blend[1].gamma;
-    d.TB[0] = cfg.blend[2].fade; d.TB[1] = cfg.blend[2].gamma;
-    d.TB[2] = cfg.blend[3].fade; d.TB[3] = cfg.blend[3].gamma;
+    // edges masked off by F12 contribute zero fade => nothing is blended there
+    d.LR[0] = (cfg.edges & 1) ? cfg.blend[0].fade : 0.0f; d.LR[1] = cfg.blend[0].gamma;
+    d.LR[2] = (cfg.edges & 2) ? cfg.blend[1].fade : 0.0f; d.LR[3] = cfg.blend[1].gamma;
+    d.TB[0] = (cfg.edges & 4) ? cfg.blend[2].fade : 0.0f; d.TB[1] = cfg.blend[2].gamma;
+    d.TB[2] = (cfg.edges & 8) ? cfg.blend[3].fade : 0.0f; d.TB[3] = cfg.blend[3].gamma;
     for (int s = 0; s < 4; s++) {
         auto& src = cfg.adv[s];
         float(*dst)[4] = s == 0 ? d.advL : s == 1 ? d.advR : s == 2 ? d.advT : d.advB;
-        d.advCounts[s] = (int)std::min(src.size(), (size_t)MAX_ADV);
+        d.advCounts[s] = (cfg.edges & (1 << s)) ? (int)std::min(src.size(), (size_t)MAX_ADV) : 0;
         for (int i = 0; i < d.advCounts[s]; i++) {
             dst[i][0] = src[i].pos; dst[i][1] = src[i].fade; dst[i][2] = src[i].gamma; dst[i][3] = 0;
         }

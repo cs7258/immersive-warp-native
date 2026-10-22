@@ -59,6 +59,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             if (msg.wParam == 1) toggleCalibration();       // F3
             else if (msg.wParam == 2) switchSubModeAll();   // F10
             else if (msg.wParam == 3) toggleCalibration();  // Esc (registered while calibrating)
+            else if (msg.wParam == 4) cycleBlendEdges();    // F12
+            else if (msg.wParam == 5) toggleSnapshot();     // Ctrl+F3
+            else if (msg.wParam == 6) openColorDialogEx();  // D (registered while calibrating)
             continue;
         }
         TranslateMessage(&msg);

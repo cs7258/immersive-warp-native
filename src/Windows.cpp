@@ -296,7 +296,7 @@ void destroyOutputWindows() {
 // ------------------------------------------------------------------
 static const wchar_t* CTL_CLASS = L"IWN_ControlWnd";
 static HWND g_ctl = nullptr;
-static HWND g_list = nullptr, g_status = nullptr;
+static HWND g_list = nullptr, g_status = nullptr, g_statusInfo = nullptr;
 static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
 static HWND g_cbImg = nullptr;
@@ -305,13 +305,59 @@ static void setStatus(const wchar_t* s) {
     if (g_status) SetWindowTextW(g_status, s);
 }
 
+// Structured status block, same information the original shows at the bottom
+// of its console: "Projector: 1 [1]" / mode / "Color balancing: R() G() B()".
+// Never call while holding g_cfgMutex.
+void refreshStatusBar() {
+    if (!g_statusInfo) return;
+    int nProj = 0, sel = g_list ? ListBox_GetCurSel(g_list) : -1;
+    ColorAdj c;
+    int edges = 15;
+    bool snapshot = g_snapshot.load();
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs) {
+            if (!o.enabled) continue;
+            if (nProj == 0) { c = o.color; edges = o.edges; }
+            nProj++;
+        }
+    }
+    wchar_t l1[128], l2[160], l3[192], l4[128];
+    wsprintfW(l1, L"Projector: %d [%d]%s", nProj, sel + 1,
+              g_previewMode.load() ? L"   Preview: ON" : L"");
+    if (nProj == 0) wsprintfW(l2, L"Mode: -   (no projector assigned)");
+    else wsprintfW(l2, L"Mode: %s   Snapshot: %s",
+                   g_calibMode.load() == 1 ? L"Edge blending" : L"Geometrical correction",
+                   snapshot ? L"ON (frozen)" : L"off");
+    wsprintfW(l3, L"Color balancing: R(%.3f) G(%.3f) B(%.3f)", c.gammaR, c.gammaG, c.gammaB);
+    // human readable edge mask for the first enabled projector
+    static const wchar_t* side[4] = { L"L", L"R", L"T", L"B" };
+    wchar_t buf[32] = L"";
+    if (edges == 15) lstrcpyW(buf, L"ALL");
+    else if (edges == 0) lstrcpyW(buf, L"NONE");
+    else for (int i = 0; i < 4; i++) if (edges & (1 << i)) { lstrcatW(buf, side[i]); }
+    wsprintfW(l4, L"Blend edges: %s", buf);
+
+    wchar_t all[600];
+    wsprintfW(all, L"%s\r\n%s\r\n%s\r\n%s", l1, l2, l3, l4);
+    SetWindowTextW(g_statusInfo, all);
+}
+
 void setCalibrationMode(bool on) {
     bool was = g_calib.exchange(on);
     if (was == on) return;
     // Esc is captured globally only while calibrating, so it never
     // interferes with normal Escape usage in other apps
-    if (on) RegisterHotKey(nullptr, 3, 0, VK_ESCAPE);
-    else UnregisterHotKey(nullptr, 3);
+    if (on) {
+        RegisterHotKey(nullptr, 3, 0, VK_ESCAPE);
+        // D opens the advanced RGB dialog, exactly like the original. Only
+        // registered during calibration so normal typing never hits it.
+        RegisterHotKey(nullptr, 6, 0, 'D');
+    } else {
+        UnregisterHotKey(nullptr, 3);
+        UnregisterHotKey(nullptr, 6);
+    }
+    refreshStatusBar();
 }
 
 void toggleCalibration() {
@@ -331,6 +377,41 @@ void switchSubModeAll() {
     for (auto& p : g_outWins) p.second->subMode = m;
     setStatus(m == 1 ? L"Mode: Edge blending (red = simple handles, blue = advanced). F10 to switch back."
                      : L"Mode: Geometrical correction (drag green points). F10 to switch.");
+    refreshStatusBar();
+}
+
+// F12: cycle which edges take part in blending for all projectors.
+// all -> left -> right -> top -> bottom -> none -> all
+void cycleBlendEdges() {
+    static const int seq[6] = { 15, 1, 2, 4, 8, 0 };
+    static const wchar_t* name[6] = {
+        L"ALL (left+right+top+bottom)", L"LEFT only", L"RIGHT only",
+        L"TOP only", L"BOTTOM only", L"NONE (blending off)" };
+    int cur = 15, idx = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs) if (o.enabled) { cur = o.edges; break; }
+    }
+    for (int i = 0; i < 6; i++) if (seq[i] == cur) { idx = (i + 1) % 6; break; }
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs) if (o.enabled) o.edges = seq[idx];
+        g_rev++;
+    }
+    wchar_t msg[160];
+    wsprintfW(msg, L"Blend edges: %s", name[idx]);
+    setStatus(msg);
+    refreshStatusBar();
+}
+
+// Ctrl+F3: freeze the captured desktop so alignment is done on a still image.
+void toggleSnapshot() {
+    bool on = !g_snapshot.load();
+    g_snapshot.store(on);
+    if (on && g_outWins.empty()) { setStatus(L"Snapshot: no output running."); refreshStatusBar(); return; }
+    setStatus(on ? L"Snapshot ON: captured frame frozen. Align on the still image, Ctrl+F3 to resume live."
+                 : L"Snapshot OFF: live desktop capture resumed.");
+    refreshStatusBar();
 }
 
 void notifyOutputRaised() {
@@ -361,16 +442,19 @@ static void refreshList() {
     if (!g_list) return;
     ListBox_ResetContent(g_list);
     auto displays = enumerateDisplays();
-    std::lock_guard<std::mutex> lk(g_cfgMutex);
-    for (auto& d : displays) {
-        wchar_t line[256];
-        const wchar_t* mark = L"";
-        for (auto& o : g_cfg.outputs)
-            if (o.enabled && o.deviceName == d.deviceName) { mark = L"  [PROJECTOR]"; break; }
-        if (d.primary) wsprintfW(line, L"%s [Primary]%s", d.label.c_str(), mark);
-        else wsprintfW(line, L"%s%s", d.label.c_str(), mark);
-        ListBox_AddString(g_list, line);
+    {   // scoped: refreshStatusBar() locks the same mutex
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& d : displays) {
+            wchar_t line[256];
+            const wchar_t* mark = L"";
+            for (auto& o : g_cfg.outputs)
+                if (o.enabled && o.deviceName == d.deviceName) { mark = L"  [PROJECTOR]"; break; }
+            if (d.primary) wsprintfW(line, L"%s [Primary]%s", d.label.c_str(), mark);
+            else wsprintfW(line, L"%s%s", d.label.c_str(), mark);
+            ListBox_AddString(g_list, line);
+        }
     }
+    refreshStatusBar();
 }
 
 // ---- color adjustment dialog (brightness / contrast / gamma R G B) ----
@@ -403,6 +487,7 @@ static void colorApplyFromSliders() {
         wsprintfW(t, L"%d.%02d", (int)tbPosF(i), (int)(tbPosF(i) * 100) % 100);
         SetWindowTextW(g_tbVal[i], t);
     }
+    refreshStatusBar();
 }
 
 static void colorSetSliders(const ColorAdj& c) {
@@ -481,6 +566,10 @@ static void openColorDialog(HINSTANCE hInst, HWND owner) {
         140, 140, 370, 300, nullptr, nullptr, hInst, nullptr);
 }
 
+void openColorDialogEx() {   // hotkey D (registered only while calibrating)
+    openColorDialog(GetModuleHandleW(nullptr), g_ctl);
+}
+
 static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -543,15 +632,22 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         CreateWindowW(L"BUTTON", L"Color adjustment...",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 388, 170, 28,
             hwnd, (HMENU)IDC_COLOR, nullptr, nullptr);
-        g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 424, 540, 60,
+        // structured status block (Projector / Mode / Color balancing / edges)
+        g_statusInfo = CreateWindowW(L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 420, 545, 76,
             hwnd, nullptr, nullptr, nullptr);
-        std::lock_guard<std::mutex> lk(g_cfgMutex);
-        Button_SetCheck(g_ckTest, g_cfg.testPattern ? BST_CHECKED : BST_UNCHECKED);
-        Button_SetCheck(g_ckAdv, g_cfg.advancedBlend ? BST_CHECKED : BST_UNCHECKED);
-        Button_SetCheck(g_ckEnable, g_cfg.enabled ? BST_CHECKED : BST_UNCHECKED);
-        Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
-        Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
+        g_status = CreateWindowW(L"STATIC", L"Ready.",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 496, 545, 40,
+            hwnd, nullptr, nullptr, nullptr);
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            Button_SetCheck(g_ckTest, g_cfg.testPattern ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckAdv, g_cfg.advancedBlend ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckEnable, g_cfg.enabled ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
+        }
+        refreshStatusBar();
         return 0;
     }
     case WM_COMMAND: {
@@ -728,6 +824,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         UnregisterHotKey(nullptr, 1);
         UnregisterHotKey(nullptr, 2);
         UnregisterHotKey(nullptr, 3);
+        UnregisterHotKey(nullptr, 4);
+        UnregisterHotKey(nullptr, 5);
+        UnregisterHotKey(nullptr, 6);
         PostQuitMessage(0);
         return 0;
     }
@@ -745,14 +844,16 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 580, 520,
+        WS_OVERLAPPEDWINDOW, 100, 100, 580, 600,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);
     refreshList();
     // global hotkeys so calibration keys work no matter which window has focus
-    RegisterHotKey(nullptr, 1, 0, VK_F3);   // enter/exit calibration
-    RegisterHotKey(nullptr, 2, 0, VK_F10);  // warp <-> blend mode
+    RegisterHotKey(nullptr, 1, 0, VK_F3);            // enter/exit calibration
+    RegisterHotKey(nullptr, 2, 0, VK_F10);           // warp <-> blend mode
+    RegisterHotKey(nullptr, 4, 0, VK_F12);           // cycle blended edges
+    RegisterHotKey(nullptr, 5, MOD_CONTROL, VK_F3);  // snapshot (freeze capture)
 }
 
 // GET_X_LPARAM / GET_Y_LPARAM come from windowsx.h (included above)

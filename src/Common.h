@@ -49,6 +49,9 @@ struct OutputCfg {
     std::vector<float> points;
     BlendSide blend[4];               // 0=left 1=right 2=top 3=bottom
     std::vector<AdvPoint> adv[4];     // advanced blending per side
+    // which edges participate in blending: bit0=left bit1=right bit2=top bit3=bottom.
+    // F12 cycles through the masks (all / single edges / none) like the original.
+    int edges = 15;
     ColorAdj color;
     std::vector<MaskRect> masks;
 
@@ -91,6 +94,10 @@ extern std::mutex g_cfgMutex;
 extern std::atomic<int> g_rev;        // config revision, bumped on every edit
 extern std::atomic<bool> g_calib;     // calibration mode active
 extern std::atomic<bool> g_running;
+// Ctrl+F3 snapshot mode: freeze the captured desktop into a still frame so
+// alignment can be done on a stable image (matches the original's
+// "Edit Warp and Blend with screenshot")
+extern std::atomic<bool> g_snapshot;
 
 struct DisplayInfo {
     std::wstring deviceName, label;
@@ -112,6 +119,9 @@ bool engineSetTestImage(int id);   // built-in test image library (0..3)
 void createOutputWindows();
 void toggleCalibration();      // global hotkey F3: enter/exit calibration
 void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all outputs
+void cycleBlendEdges();        // global hotkey F12: cycle blended edges
+void toggleSnapshot();         // global hotkey Ctrl+F3: freeze / resume capture
+void openColorDialogEx();      // global hotkey D: color adjustment dialog
 void notifyOutputRaised();     // output window raised itself; keep control window above
 void destroyOutputWindows();
 void setCalibrationMode(bool on);
