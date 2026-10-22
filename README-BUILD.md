@@ -37,7 +37,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 |---|---|
 | F3 | 进入 / 退出校准（几何校正模式） |
 | F10 | 几何校正 ↔ 边缘融合模式切换 |
-| F12 | 切换参与融合的边：ALL → 左 → 右 → 上 → 下 → NONE → ALL（随配置保存） |
+| Ctrl+F12 | 切换参与融合的边：ALL → 左 → 右 → 上 → 下 → NONE → ALL（随配置保存）；控制台窗口有焦点时直接按 F12 也可（F12 被 Windows 保留给调试器，无法注册为全局热键，所以全局绑定是 Ctrl+F12，另有同名按钮） |
 | Ctrl+F3 | 截图校准：冻结当前捕获帧，在静止画面上对齐；再按恢复实时 |
 | D | 打开 RGB 高级对话框（亮度/对比度/Gamma R G B），仅在校准状态注册 |
 | Esc | 退出校准 |

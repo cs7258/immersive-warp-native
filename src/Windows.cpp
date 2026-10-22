@@ -444,6 +444,7 @@ void notifyOutputRaised() {
 #define IDC_CLEARIMG  1015
 #define IDC_CBIMG     1016   // built-in test image pattern dropdown
 #define IDC_COLOR     1017   // color adjustment dialog
+#define IDC_EDGES     1018   // cycle blended edges (same as Ctrl+F12)
 
 static void refreshList() {
     if (!g_list) return;
@@ -639,6 +640,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         CreateWindowW(L"BUTTON", L"Color adjustment...",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 388, 170, 28,
             hwnd, (HMENU)IDC_COLOR, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 190, 388, 200, 28,
+            hwnd, (HMENU)IDC_EDGES, nullptr, nullptr);
         // structured status block (Projector / Mode / Color balancing / edges)
         g_statusInfo = CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 420, 545, 76,
@@ -816,6 +820,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             }
         } else if (id == IDC_COLOR && HIWORD(wp) == BN_CLICKED) {
             openColorDialog(GetModuleHandleW(nullptr), hwnd);
+        } else if (id == IDC_EDGES && HIWORD(wp) == BN_CLICKED) {
+            cycleBlendEdges();
         }
         return 0;
     }
@@ -824,6 +830,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             if (g_outWins.empty()) createOutputWindows();
             setCalibrationMode(true);
             setStatus(L"Calibration ON.");
+        } else if (wp == VK_F12) {
+            cycleBlendEdges();     // console has focus: plain F12 works here
+        } else if (wp == VK_F10) {
+            switchSubModeAll();
         }
         return 0;
     case WM_DESTROY:
@@ -859,8 +869,11 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     // global hotkeys so calibration keys work no matter which window has focus
     RegisterHotKey(nullptr, 1, 0, VK_F3);            // enter/exit calibration
     RegisterHotKey(nullptr, 2, 0, VK_F10);           // warp <-> blend mode
-    RegisterHotKey(nullptr, 4, 0, VK_F12);           // cycle blended edges
-    RegisterHotKey(nullptr, 5, MOD_CONTROL, VK_F3);  // snapshot (freeze capture)
+    // Plain F12 is reserved by Windows for the debugger (RegisterHotKey fails),
+    // so the global binding is Ctrl+F12; plain F12 is also handled in
+    // ControlWndProc::WM_KEYDOWN when the console has focus.
+    RegisterHotKey(nullptr, 4, MOD_CONTROL, VK_F12);  // cycle blended edges
+    RegisterHotKey(nullptr, 5, MOD_CONTROL, VK_F3);   // snapshot (freeze capture)
 }
 
 // GET_X_LPARAM / GET_Y_LPARAM come from windowsx.h (included above)
