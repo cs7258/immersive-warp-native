@@ -305,6 +305,13 @@ static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
 static HWND g_ckNet = nullptr;
 static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
 
+// tray ids must not collide with control ids 1001..1021
+#define IDM_TRAY_SHOW  2001
+#define IDM_TRAY_START 2002
+#define IDM_TRAY_STOP  2003
+#define IDM_TRAY_EXIT  2004
+constexpr UINT WM_TRAYICON = WM_APP + 7;
+
 // ---------------- tray icon ----------------
 static NOTIFYICONDATAW g_nid{};
 static bool g_trayOn = false;
@@ -543,14 +550,6 @@ void notifyOutputRaised() {
 #define IDC_CKNET     1019   // CMDNET TCP show-control service on/off
 #define IDC_CKAUTO    1020   // start with Windows
 #define IDC_CBSAMP    1021   // sampling quality dropdown
-
-// tray menu ids (must not collide with control ids 1001..1021)
-#define IDM_TRAY_SHOW  2001
-#define IDM_TRAY_START 2002
-#define IDM_TRAY_STOP  2003
-#define IDM_TRAY_EXIT  2004
-
-static UINT WM_TRAYICON = WM_APP + 7;
 
 static void refreshList() {
     if (!g_list) return;
@@ -982,6 +981,17 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             DestroyWindow(hwnd);
         }
         return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_F3) {
+            if (g_outWins.empty()) createOutputWindows();
+            setCalibrationMode(true);
+            setStatus(L"Calibration ON.");
+        } else if (wp == VK_F12) {
+            cycleBlendEdges();     // console has focus: plain F12 works here
+        } else if (wp == VK_F10) {
+            switchSubModeAll();
+        }
+        return 0;
     case WM_TRAYICON:
         if (lp == WM_LBUTTONUP) {          // left click: toggle console
             if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
@@ -994,18 +1004,6 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         // the console closes to the tray like the original; Exit is in the
         // tray menu (or the Exit button) so a stray click never kills output
         ShowWindow(hwnd, SW_HIDE);
-        return 0;
-    }
-    case WM_KEYDOWN:
-        if (wp == VK_F3) {
-            if (g_outWins.empty()) createOutputWindows();
-            setCalibrationMode(true);
-            setStatus(L"Calibration ON.");
-        } else if (wp == VK_F12) {
-            cycleBlendEdges();     // console has focus: plain F12 works here
-        } else if (wp == VK_F10) {
-            switchSubModeAll();
-        }
         return 0;
     case WM_DESTROY:
         g_ctl = nullptr;
