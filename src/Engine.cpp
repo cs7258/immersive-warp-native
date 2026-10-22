@@ -179,18 +179,49 @@ bool Engine::compileShaders() {
     return true;
 }
 
-// ---------------- image source (WIC) ----------------
+// ---------------- image source (WIC + built-in test library) ----------------
 static void dbgLog(const std::string& line);   // defined below
+
+void Engine::clearImage() {
+    if (m_imgSRV) m_imgGarbageSRV.push_back(m_imgSRV);
+    if (m_imgTex) m_imgGarbageTex.push_back(m_imgTex);
+    m_imgSRV = nullptr; m_imgTex = nullptr; m_imgW = m_imgH = 0;
+    m_testImg = -1;
+}
+
+// upload a BGRA buffer as the active image source. The previous image is
+// retired (not released) so the render thread can never touch a freed
+// object mid-frame.
+bool Engine::uploadImage(UINT w, UINT h, const std::vector<BYTE>& bgra, const char* tag) {
+    if (!m_dev || !w || !h || bgra.size() < (size_t)w * h * 4) return false;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w; td.Height = h;
+    td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd{};
+    sd.pSysMem = bgra.data();
+    sd.SysMemPitch = w * 4;
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(m_dev->CreateTexture2D(&td, &sd, &tex))) { dbgLog("img: CreateTexture2D failed"); return false; }
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (FAILED(m_dev->CreateShaderResourceView(tex, nullptr, &srv))) {
+        tex->Release(); dbgLog("img: CreateSRV failed"); return false;
+    }
+    if (m_imgSRV) m_imgGarbageSRV.push_back(m_imgSRV);
+    if (m_imgTex) m_imgGarbageTex.push_back(m_imgTex);
+    m_imgSRV = srv; m_imgTex = tex; m_imgW = (int)w; m_imgH = (int)h;
+    dbgLog(std::string("img: loaded ") + tag + " " + std::to_string(w) + "x" + std::to_string(h));
+    return true;
+}
+
 // Decodes PNG / JPG / BMP / TIFF / GIF / ICO into a BGRA texture. Empty path
 // clears the image (falls back to desktop capture / test pattern).
 bool Engine::loadImage(const std::wstring& path) {
     if (!m_dev) return false;
-    if (path.empty()) {
-        if (m_imgSRV) m_imgGarbageSRV.push_back(m_imgSRV);
-        if (m_imgTex) m_imgGarbageTex.push_back(m_imgTex);
-        m_imgSRV = nullptr; m_imgTex = nullptr; m_imgW = m_imgH = 0;
-        return true;
-    }
+    if (path.empty()) { clearImage(); return true; }
 
     static bool comInit = false;
     if (!comInit) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); comInit = true; }
@@ -227,34 +258,91 @@ bool Engine::loadImage(const std::wstring& path) {
     fac->Release();
     if (FAILED(hr)) { dbgLog("img: convert/copy failed"); return false; }
 
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = w; td.Height = h;
-    td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_IMMUTABLE;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA sd{};
-    sd.pSysMem = buf.data();
-    sd.SysMemPitch = w * 4;
-    ID3D11Texture2D* tex = nullptr;
-    if (FAILED(m_dev->CreateTexture2D(&td, &sd, &tex))) { dbgLog("img: CreateTexture2D failed"); return false; }
-    ID3D11ShaderResourceView* srv = nullptr;
-    if (FAILED(m_dev->CreateShaderResourceView(tex, nullptr, &srv))) {
-        tex->Release(); dbgLog("img: CreateSRV failed"); return false;
-    }
+    m_testImg = -1;   // a real file replaces any built-in pattern
+    return uploadImage(w, h, buf, "file");
+}
 
-    // retire the previous image instead of releasing it: the render thread may
-    // still hold the pointer for the frame it is currently submitting
-    if (m_imgSRV) m_imgGarbageSRV.push_back(m_imgSRV);
-    if (m_imgTex) m_imgGarbageTex.push_back(m_imgTex);
-    m_imgSRV = srv; m_imgTex = tex; m_imgW = (int)w; m_imgH = (int)h;
-    dbgLog("img: loaded " + std::to_string(w) + "x" + std::to_string(h));
+// Built-in test image library, generated procedurally (no external files).
+bool Engine::setTestImage(int id) {
+    if (!m_dev) return false;
+    if (id < 0) { clearImage(); return true; }
+    if (id > 3) id = 3;
+
+    const UINT W = 1280, H = 720;
+    std::vector<BYTE> buf((size_t)W * H * 4);
+    auto put = [&](UINT x, UINT y, BYTE r, BYTE g, BYTE b) {
+        BYTE* p = &buf[((size_t)y * W + x) * 4];
+        p[0] = b; p[1] = g; p[2] = r; p[3] = 255;
+    };
+
+    switch (id) {
+    case 0: {  // color bars: 8 vertical bars + gray ramp bottom third + grid
+        static const BYTE bars[8][3] = {
+            {255,255,255},{255,255,0},{0,255,255},{0,255,0},
+            {255,0,255},{255,0,0},{0,0,255},{0,0,0} };
+        for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++) {
+                BYTE r, g, b;
+                if (y < H * 2 / 3) {
+                    int k = (int)std::min(7, x * 8 / W);
+                    r = bars[k][0]; g = bars[k][1]; b = bars[k][2];
+                } else {
+                    BYTE v = (BYTE)std::min(255, x * 256 / W);
+                    r = g = b = v;
+                }
+                if (x % 80 == 0 || y % 80 == 0) { r = g = b = 255; }
+                if (x > W / 2 - 2 && x < W / 2 + 2 && y > H / 2 - 40 && y < H / 2 + 40) { r = 255; g = 60; b = 60; }
+                if (y > H / 2 - 2 && y < H / 2 + 2 && x > W / 2 - 40 && x < W / 2 + 40) { r = 255; g = 60; b = 60; }
+                if (x < 2 || y < 2 || x > W - 3 || y > H - 3) { r = 0; g = 255; b = 0; }
+                put(x, y, r, g, b);
+            }
+        break;
+    }
+    case 1: {  // checkerboard 80px black/white + green border
+        for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++) {
+                bool w = ((x / 80) + (y / 80)) % 2 == 0;
+                if (x < 2 || y < 2 || x > W - 3 || y > H - 3) put(x, y, 0, 255, 0);
+                else put(x, y, w ? 255 : 0, w ? 255 : 0, w ? 255 : 0);
+            }
+        break;
+    }
+    case 2: {  // gray ramp + black/white reference blocks
+        for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++) {
+                BYTE v = (BYTE)std::min(255, x * 256 / W);
+                if (y < H / 6 && x < W / 8) v = 0;
+                if (y < H / 6 && x > W - W / 8) v = 255;
+                put(x, y, v, v, v);
+            }
+        break;
+    }
+    default: {  // identity grid: 10x12 control grid, center crosshair, border
+        for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++) {
+                BYTE r = 30, g = 30, b = 30;
+                float cx = (float)x * 12 / W, cy = (float)y * 10 / H;
+                if (std::abs(cx - std::round(cx)) < 0.02f ||
+                    std::abs(cy - std::round(cy)) < 0.02f) { r = 255; g = 255; b = 255; }
+                if (std::abs(cx - std::round(cx)) < 0.05f &&
+                    std::abs(cy - std::round(cy)) < 0.05f) { r = 80; g = 160; b = 255; }
+                if (x > W / 2 - 2 && x < W / 2 + 2) { r = 255; g = 60; b = 60; }
+                if (y > H / 2 - 2 && y < H / 2 + 2) { r = 255; g = 60; b = 60; }
+                if (x < 2 || y < 2 || x > W - 3 || y > H - 3) { r = 0; g = 255; b = 0; }
+                put(x, y, r, g, b);
+            }
+        break;
+    }
+    }
+    static const char* names[4] = { "colorbars", "checkerboard", "grayramp", "grid" };
+    if (!uploadImage(W, H, buf, names[id])) return false;
+    m_testImg = id;
     return true;
 }
 
 bool engineLoadImage(const std::wstring& path) { return Engine::inst().loadImage(path); }
 bool engineHasImage() { return Engine::inst().hasImage(); }
+bool engineSetTestImage(int id) { return Engine::inst().setTestImage(id); }
 
 // ---------------- debug log (%APPDATA%\ImmersiveWarpNative\debug.log) ----------------
 static void dbgLog(const std::string& line) { dbgLogLine(line); }

@@ -83,6 +83,7 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "preview=" << (g_cfg.previewMode ? 1 : 0) << "\n";
     os << "useImage=" << (g_cfg.useImage ? 1 : 0) << "\n";
     os << "image=" << toUtf8(g_cfg.imagePath) << "\n";
+    os << "testImg=" << g_cfg.testImg << "\n";
     os << "subdivide=" << g_cfg.subdivide << "\n";
     os << "outputs=" << g_cfg.outputs.size() << "\n";
     for (auto& o : g_cfg.outputs) {
@@ -135,6 +136,7 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "preview") c.previewMode = val == "1";
         else if (key == "useImage") c.useImage = val == "1";
         else if (key == "image") c.imagePath = fromUtf8(val);
+        else if (key == "testImg") c.testImg = atoi(val.c_str());
         else if (key == "subdivide") c.subdivide = atoi(val.c_str());
         else if (key == "outputs") c.outputs.resize((size_t)atoi(val.c_str()));
         else if (key == "dev") {

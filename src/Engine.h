@@ -14,6 +14,10 @@ public:
     bool hasImage() const { return m_imgSRV != nullptr; }
     int imageWidth() const { return m_imgW; }
     int imageHeight() const { return m_imgH; }
+    // built-in test image library (like the original's Images page):
+    // 0 = color bars, 1 = checkerboard, 2 = gray ramp, 3 = identity grid, -1 = clear
+    bool setTestImage(int id);
+    int testImage() const { return m_testImg; }
 
     // windows are created by Windows.cpp; engine attaches a render target per output
     bool attachOutput(int displayIdx, HWND hwnd);
@@ -71,8 +75,12 @@ private:
     ID3D11Texture2D* m_imgTex = nullptr;
     ID3D11ShaderResourceView* m_imgSRV = nullptr;
     int m_imgW = 0, m_imgH = 0;
+    int m_testImg = -1;
     std::vector<ID3D11ShaderResourceView*> m_imgGarbageSRV;
     std::vector<ID3D11Texture2D*> m_imgGarbageTex;
+
+    void clearImage();
+    bool uploadImage(UINT w, UINT h, const std::vector<BYTE>& bgra, const char* tag);
     ID3D11BlendState* m_blendOpaque = nullptr;
     ID3D11RasterizerState* m_raster = nullptr;
 

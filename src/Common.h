@@ -71,6 +71,7 @@ struct AppConfig {
     bool previewMode = false;         // windowed preview (single screen live warp)
     bool useImage = false;            // image source instead of pattern/capture
     std::wstring imagePath;
+    int testImg = -1;                 // built-in test image library (0..3), -1 = none
     int subdivide = 8;                // mesh subdivision per control cell
 
     OutputCfg* findByDevice(const std::wstring& dev) {
@@ -107,6 +108,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst);
 // image source (WIC decode); empty path clears back to pattern/capture
 bool engineLoadImage(const std::wstring& path);
 bool engineHasImage();
+bool engineSetTestImage(int id);   // built-in test image library (0..3)
 void createOutputWindows();
 void toggleCalibration();      // global hotkey F3: enter/exit calibration
 void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all outputs

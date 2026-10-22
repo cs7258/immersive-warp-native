@@ -2,7 +2,9 @@
 #include "Engine.h"
 #include <windowsx.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "comctl32.lib")
 
 // ------------------------------------------------------------------
 // Output windows (fullscreen per display) + calibration interaction
@@ -297,6 +299,7 @@ static HWND g_ctl = nullptr;
 static HWND g_list = nullptr, g_status = nullptr;
 static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
+static HWND g_cbImg = nullptr;
 
 static void setStatus(const wchar_t* s) {
     if (g_status) SetWindowTextW(g_status, s);
@@ -351,6 +354,8 @@ void notifyOutputRaised() {
 #define IDC_CKIMAGE   1013
 #define IDC_LOADIMG   1014
 #define IDC_CLEARIMG  1015
+#define IDC_CBIMG     1016   // built-in test image pattern dropdown
+#define IDC_COLOR     1017   // color adjustment dialog
 
 static void refreshList() {
     if (!g_list) return;
@@ -366,6 +371,114 @@ static void refreshList() {
         else wsprintfW(line, L"%s%s", d.label.c_str(), mark);
         ListBox_AddString(g_list, line);
     }
+}
+
+// ---- color adjustment dialog (brightness / contrast / gamma R G B) ----
+// Edits ColorAdj of every ENABLED output live (shader applies per frame).
+static HWND g_colorDlg = nullptr;
+static HWND g_tb[5] = {}, g_tbVal[5] = {};
+static const wchar_t* tbName[5] = { L"Brightness", L"Contrast", L"Gamma R", L"Gamma G", L"Gamma B" };
+static const int tbMin[5] = { 20, 20, 20, 20, 20 };
+static const int tbMax[5] = { 200, 200, 300, 300, 300 };
+
+static float tbPosF(int i) {
+    return (float)SendMessageW(g_tb[i], TBM_GETPOS, 0, 0) / 100.0f;
+}
+
+static void colorApplyFromSliders() {
+    if (!g_tb[0]) return;
+    ColorAdj c;
+    c.bright = tbPosF(0);
+    c.contrast = tbPosF(1);
+    c.gammaR = tbPosF(2);
+    c.gammaG = tbPosF(3);
+    c.gammaB = tbPosF(4);
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs) if (o.enabled) o.color = c;
+        g_rev++;
+    }
+    wchar_t t[32];
+    for (int i = 0; i < 5; i++) {
+        wsprintfW(t, L"%d.%02d", (int)tbPosF(i), (int)(tbPosF(i) * 100) % 100);
+        SetWindowTextW(g_tbVal[i], t);
+    }
+}
+
+static void colorSetSliders(const ColorAdj& c) {
+    int pos[5] = { (int)(c.bright * 100), (int)(c.contrast * 100),
+                   (int)(c.gammaR * 100), (int)(c.gammaG * 100), (int)(c.gammaB * 100) };
+    for (int i = 0; i < 5; i++)
+        SendMessageW(g_tb[i], TBM_SETPOS, TRUE, (LPARAM)pos[i]);
+}
+
+static LRESULT CALLBACK ColorDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        for (int i = 0; i < 5; i++) {
+            CreateWindowW(L"STATIC", tbName[i], WS_CHILD | WS_VISIBLE,
+                10, 14 + i * 42, 90, 18, hwnd, nullptr, nullptr, nullptr);
+            g_tb[i] = CreateWindowW(TRACKBAR_CLASSW, L"",
+                WS_CHILD | WS_VISIBLE | TBS_HORZ,
+                104, 8 + i * 42, 186, 30, hwnd, (HMENU)(2000 + i), nullptr, nullptr);
+            SendMessageW(g_tb[i], TBM_SETRANGE, TRUE, MAKELPARAM(tbMin[i], tbMax[i]));
+            g_tbVal[i] = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                298, 14 + i * 42, 50, 18, hwnd, nullptr, nullptr, nullptr);
+        }
+        CreateWindowW(L"BUTTON", L"Reset",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 104, 226, 90, 26,
+            hwnd, (HMENU)2005, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Close",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 204, 226, 90, 26,
+            hwnd, (HMENU)2006, nullptr, nullptr);
+        // init from the first enabled output (or identity defaults)
+        ColorAdj c;
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            for (auto& o : g_cfg.outputs) if (o.enabled) { c = o.color; break; }
+        }
+        colorSetSliders(c);
+        colorApplyFromSliders();
+        return 0;
+    }
+    case WM_HSCROLL:
+        colorApplyFromSliders();
+        return 0;
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == 2005) { colorSetSliders(ColorAdj()); colorApplyFromSliders(); }
+        else if (id == 2006) DestroyWindow(hwnd);
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        g_colorDlg = nullptr;
+        for (auto& h : g_tb) h = nullptr;
+        for (auto& h : g_tbVal) h = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void openColorDialog(HINSTANCE hInst, HWND owner) {
+    (void)owner;
+    if (g_colorDlg) {
+        SetWindowPos(g_colorDlg, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        return;
+    }
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = ColorDlgProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"IWN_ColorDlg";
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+    g_colorDlg = CreateWindowExW(WS_EX_TOPMOST, L"IWN_ColorDlg",
+        L"Color adjustment (applies to enabled outputs)",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        140, 140, 370, 300, nullptr, nullptr, hInst, nullptr);
 }
 
 static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -414,10 +527,24 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 480, 330, 60, 24,
             hwnd, (HMENU)IDC_CLEARIMG, nullptr, nullptr);
         g_imgLabel = CreateWindowW(L"STATIC", L"Image: (none)",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 358, 540, 18,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 362, 245, 18,
             hwnd, nullptr, nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Patterns:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 262, 362, 62, 18,
+            hwnd, nullptr, nullptr, nullptr);
+        g_cbImg = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            326, 358, 214, 200,
+            hwnd, (HMENU)IDC_CBIMG, nullptr, nullptr);
+        ComboBox_AddString(g_cbImg, L"Color bars");
+        ComboBox_AddString(g_cbImg, L"Checkerboard");
+        ComboBox_AddString(g_cbImg, L"Gray ramp");
+        ComboBox_AddString(g_cbImg, L"Identity grid");
+        CreateWindowW(L"BUTTON", L"Color adjustment...",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 388, 170, 28,
+            hwnd, (HMENU)IDC_COLOR, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 382, 540, 60,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 424, 540, 60,
             hwnd, nullptr, nullptr, nullptr);
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         Button_SetCheck(g_ckTest, g_cfg.testPattern ? BST_CHECKED : BST_UNCHECKED);
@@ -476,6 +603,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             g_previewMode.store(g_cfg.previewMode);
             Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
+            ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
             if (!g_cfg.imagePath.empty() && engineLoadImage(g_cfg.imagePath)) {
                 const wchar_t* base = g_cfg.imagePath.c_str();
                 for (const wchar_t* p = g_cfg.imagePath.c_str(); *p; p++)
@@ -539,9 +667,11 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 g_cfg.useImage = true;
                 g_cfg.imagePath = file;
+                g_cfg.testImg = -1;   // file image replaces built-in pattern
                 g_rev++;
             }
             Button_SetCheck(g_ckImage, BST_CHECKED);
+            ComboBox_SetCurSel(g_cbImg, -1);
             {
                 const wchar_t* base = file;
                 for (const wchar_t* p = file; *p; p++) if (*p == L'\\' || *p == L'/') base = p + 1;
@@ -557,11 +687,32 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 g_cfg.useImage = false;
                 g_cfg.imagePath.clear();
+                g_cfg.testImg = -1;
                 g_rev++;
             }
             Button_SetCheck(g_ckImage, BST_UNCHECKED);
+            ComboBox_SetCurSel(g_cbImg, -1);
             SetWindowTextW(g_imgLabel, L"Image: (none)");
             setStatus(L"Image cleared.");
+        } else if (id == IDC_CBIMG && HIWORD(wp) == CBN_SELCHANGE) {
+            int idx = ComboBox_GetCurSel(g_cbImg);
+            if (idx >= 0 && engineSetTestImage(idx)) {
+                {
+                    std::lock_guard<std::mutex> lk(g_cfgMutex);
+                    g_cfg.useImage = true;
+                    g_cfg.testImg = idx;
+                    g_rev++;
+                }
+                Button_SetCheck(g_ckImage, BST_CHECKED);
+                static const wchar_t* patName[4] = { L"Color bars", L"Checkerboard", L"Gray ramp", L"Identity grid" };
+                wchar_t line[160];
+                wsprintfW(line, L"Image: %s (built-in %dx%d)", patName[idx],
+                          Engine::inst().imageWidth(), Engine::inst().imageHeight());
+                SetWindowTextW(g_imgLabel, line);
+                setStatus(L"Built-in test image set as source.");
+            }
+        } else if (id == IDC_COLOR && HIWORD(wp) == BN_CLICKED) {
+            openColorDialog(GetModuleHandleW(nullptr), hwnd);
         }
         return 0;
     }
@@ -584,6 +735,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 }
 
 void registerAndCreateControlWindow(HINSTANCE hInst) {
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
     WNDCLASSW wc{};
     wc.lpfnWndProc = ControlWndProc;
     wc.hInstance = hInst;
