@@ -981,6 +981,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             DestroyWindow(hwnd);
         }
         return 0;
+    }
     case WM_KEYDOWN:
         if (wp == VK_F3) {
             if (g_outWins.empty()) createOutputWindows();
