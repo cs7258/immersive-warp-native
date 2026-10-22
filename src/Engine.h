@@ -1,5 +1,7 @@
 #pragma once
 #include "Common.h"
+#include <memory>
+#include <mutex>
 
 // Engine: shared D3D11 device, per-output desktop duplication + warp/blend renderer.
 class Engine {
@@ -74,5 +76,10 @@ private:
     ID3D11BlendState* m_blendOpaque = nullptr;
     ID3D11RasterizerState* m_raster = nullptr;
 
-    std::vector<OutputCtx*> m_outs;
+    // shared_ptr + mutex: the render thread snapshots this list each frame,
+    // while the UI thread may destroy/rebuild outputs at any moment (preview
+    // checkbox, Toggle, Start/Stop). Refcounting guarantees a ctx outlives the
+    // frame that is currently drawing it.
+    std::vector<std::shared_ptr<OutputCtx>> m_outs;
+    std::mutex m_outsMutex;
 };

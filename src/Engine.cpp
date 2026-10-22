@@ -288,7 +288,7 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     auto displays = enumerateDisplays();
     if (displayIdx < 0 || displayIdx >= (int)displays.size()) return false;
     auto di = displays[displayIdx];
-    auto* oc = new OutputCtx();
+    auto oc = std::make_shared<OutputCtx>();
     oc->hwnd = hwnd;
     oc->displayIdx = displayIdx;
 
@@ -311,7 +311,7 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     sd.OutputWindow = hwnd;
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    if (FAILED(m_factory->CreateSwapChain(m_dev, &sd, &oc->swap))) { delete oc; return false; }
+    if (FAILED(m_factory->CreateSwapChain(m_dev, &sd, &oc->swap))) return false;
     oc->swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&oc->backBuf);
     m_dev->CreateRenderTargetView(oc->backBuf, nullptr, &oc->rtv);
 
@@ -330,7 +330,10 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     m_dev->CreateBuffer(&vb, nullptr, &oc->overlayVB);
 
     createDuplication(*oc);
-    m_outs.push_back(oc);
+    {
+        std::lock_guard<std::mutex> lk(m_outsMutex);
+        m_outs.push_back(oc);
+    }
     return true;
 }
 
@@ -398,20 +401,9 @@ void Engine::resizeSwapChain(OutputCtx& oc, UINT w, UINT h) {
 }
 
 void Engine::detachAll() {
-    for (auto* oc : m_outs) {
-        if (oc->dupl) oc->dupl->Release();
-        if (oc->output1) oc->output1->Release();
-        if (oc->srv) oc->srv->Release();
-        if (oc->frameTex) oc->frameTex->Release();
-        if (oc->rtv) oc->rtv->Release();
-        if (oc->backBuf) oc->backBuf->Release();
-        if (oc->swap) oc->swap->Release();
-        if (oc->meshVB) oc->meshVB->Release();
-        if (oc->meshIB) oc->meshIB->Release();
-        if (oc->frameCB) oc->frameCB->Release();
-        if (oc->overlayVB) oc->overlayVB->Release();
-        delete oc;
-    }
+    // shared_ptr: each ctx is released once the render thread's in-flight
+    // frame snapshot drops its reference — never while it is being drawn
+    std::lock_guard<std::mutex> lk(m_outsMutex);
     m_outs.clear();
 }
 
@@ -773,7 +765,16 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
 }
 
 void Engine::renderAll() {
-    for (auto* oc : m_outs) {
+    // snapshot the output list under lock; entries stay alive via shared_ptr
+    // even if the UI thread destroys outputs while this frame is drawing
+    std::vector<std::shared_ptr<OutputCtx>> outs;
+    {
+        std::lock_guard<std::mutex> lk(m_outsMutex);
+        outs = m_outs;
+    }
+    for (auto& ocS : outs) {
+        OutputCtx* oc = ocS.get();
+        if (!IsWindow(oc->hwnd)) continue;   // window already destroyed this frame
         OutputCfg* cfg = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
