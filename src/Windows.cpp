@@ -3,6 +3,8 @@
 #include <windowsx.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <cstdio>
+#include <cwchar>
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 
@@ -325,11 +327,13 @@ void refreshStatusBar() {
     wchar_t l1[128], l2[160], l3[192], l4[128];
     wsprintfW(l1, L"Projector: %d [%d]%s", nProj, sel + 1,
               g_previewMode.load() ? L"   Preview: ON" : L"");
-    if (nProj == 0) wsprintfW(l2, L"Mode: -   (no projector assigned)");
-    else wsprintfW(l2, L"Mode: %s   Snapshot: %s",
-                   g_calibMode.load() == 1 ? L"Edge blending" : L"Geometrical correction",
-                   snapshot ? L"ON (frozen)" : L"off");
-    wsprintfW(l3, L"Color balancing: R(%.3f) G(%.3f) B(%.3f)", c.gammaR, c.gammaG, c.gammaB);
+    // wsprintfW (user32) has no floating point support -> use the CRT here
+    _snwprintf_s(l2, 160, _TRUNCATE, L"Mode: %s   Snapshot: %s",
+                 nProj == 0 ? L"- (no projector assigned)"
+                            : (g_calibMode.load() == 1 ? L"Edge blending" : L"Geometrical correction"),
+                 snapshot ? L"ON (frozen)" : L"off");
+    _snwprintf_s(l3, 192, _TRUNCATE, L"Color balancing: R(%.3f) G(%.3f) B(%.3f)",
+                 c.gammaR, c.gammaG, c.gammaB);
     // human readable edge mask for the first enabled projector
     static const wchar_t* side[4] = { L"L", L"R", L"T", L"B" };
     wchar_t buf[32] = L"";

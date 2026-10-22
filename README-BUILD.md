@@ -31,6 +31,21 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
    - Esc 退出校准
 5. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载
 
+## 快捷键（全局，任何窗口有焦点都生效）
+
+| 键 | 作用 |
+|---|---|
+| F3 | 进入 / 退出校准（几何校正模式） |
+| F10 | 几何校正 ↔ 边缘融合模式切换 |
+| F12 | 切换参与融合的边：ALL → 左 → 右 → 上 → 下 → NONE → ALL（随配置保存） |
+| Ctrl+F3 | 截图校准：冻结当前捕获帧，在静止画面上对齐；再按恢复实时 |
+| D | 打开 RGB 高级对话框（亮度/对比度/Gamma R G B），仅在校准状态注册 |
+| Esc | 退出校准 |
+| 方向键 / Shift+方向键 | 微调选中的控制点（1px / 10px） |
+| 滚轮 | 融合模式下调该边 Gamma |
+
+状态栏（控制台底部）实时显示：`Projector: N [i]` / 模式 / Snapshot / `Color balancing: R() G() B()` / 当前融合边。
+
 ## 单屏模式（无投影仪也能用）
 
 - **图片源**："Load image..." 选择 PNG/JPG/BMP（系统 WIC 解码），勾选 "Image source" 后图片替代桌面捕获作为校正内容，几何/融合校准直接在真实图像上做。宽高比不同时自动信箱式适配（多余区域为黑）。
