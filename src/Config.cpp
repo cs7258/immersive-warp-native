@@ -138,18 +138,9 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "subdivide") c.subdivide = atoi(val.c_str());
         else if (key == "outputs") c.outputs.resize((size_t)atoi(val.c_str()));
         else if (key == "dev") {
-            // byte-level trace: file line vs parsed value
-            std::string hexLine;
-            for (unsigned char ch : line) { char hb[8]; sprintf_s(hb, "%02X ", ch); hexLine += hb; }
-            dbgLogLine("parse dev line: " + hexLine);
             cur = nullptr;
             for (auto& o : c.outputs) if (o.deviceName.empty()) { cur = &o; break; }
-            if (cur) {
-                cur->deviceName = fromUtf8(val);
-                std::string hexW;
-                for (wchar_t ch : cur->deviceName) { char hb[16]; sprintf_s(hb, "%04X ", (unsigned)ch); hexW += hb; }
-                dbgLogLine("parsed dev val(len=" + std::to_string(val.size()) + "): " + hexW);
-            }
+            if (cur) cur->deviceName = fromUtf8(val);
         }
         else if (!cur) { if (key == "enabled") c.enabled = val == "1"; }  // global keys
         else if (key == "enabled") cur->enabled = val == "1";             // per-output

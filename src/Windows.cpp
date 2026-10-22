@@ -238,17 +238,8 @@ void createOutputWindows() {
         for (auto& o : g_cfg.outputs)
             if (o.enabled && o.deviceName == displays[i].deviceName) { cfg = &o; break; }
         if (!cfg) {
-            // hex-dump both names: identical-looking strings may differ invisibly
-            std::string hexA, hexB;
-            for (wchar_t ch : g_cfg.outputs.empty() ? std::wstring() : g_cfg.outputs[0].deviceName) {
-                char hb[16]; sprintf_s(hb, "%04X ", (unsigned)ch); hexA += hb;
-            }
-            for (wchar_t ch : displays[i].deviceName) {
-                char hb[16]; sprintf_s(hb, "%04X ", (unsigned)ch); hexB += hb;
-            }
-            dbgLogLine("createOutputWindows: no match. cfg(len=" +
-                       std::to_string(g_cfg.outputs.empty() ? -1 : (long long)g_cfg.outputs[0].deviceName.size()) + ")=" + hexA +
-                       " | disp(len=" + std::to_string(displays[i].deviceName.size()) + ")=" + hexB);
+            dbgLogLine("createOutputWindows: no enabled cfg for " +
+                       std::string(displays[i].deviceName.begin(), displays[i].deviceName.end()));
             continue;
         }
         n++;
