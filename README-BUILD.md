@@ -65,6 +65,8 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `EDGES ALL;` / `EDGES L;` / `EDGES T+B;` | `OK edges=T+B` | 直接设置参与融合的边（ALL/L/R/T/B/NONE 及 `+` 组合） |
 | `SNAPSHOT ON;\|SNAPSHOT OFF;` | `OK snapshot=on` | 冻结/恢复捕获帧（同 Ctrl+F3） |
 | `SAVE;` | `OK saved` | 保存配置到 config.txt |
+| `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
+| `SET testpattern=off;` | `OK testpattern=off` | 切换测试图 |
 | 其他 | `ERR UNKNOWN` | 未知命令 |
 
 ## 工程结构

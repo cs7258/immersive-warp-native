@@ -127,6 +127,7 @@ void openColorDialogEx();      // global hotkey D: color adjustment dialog
 void notifyOutputRaised();     // output window raised itself; keep control window above
 void destroyOutputWindows();
 void setCalibrationMode(bool on);
+void refreshStatusBar();       // re-render the console status block
 void setBlendEdgesMask(int mask); // explicit edge set (CMDNET), complements cycleBlendEdges
 // CMDNET ASCII TCP show-control service: "<COMMAND> <PARAM>;\n", one request one reply
 void cmdnetStart(int port);       // loopback only

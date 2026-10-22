@@ -9,6 +9,8 @@
 #include <ws2tcpip.h>
 #include "Common.h"
 #include <thread>
+#include <cstdlib>
+#include <cctype>
 
 static std::atomic<bool> g_netRun{ false };
 static std::thread g_netThread;
@@ -97,6 +99,38 @@ static std::string dispatch(std::string line) {
     }
 
     if (cmd == "SAVE") return saveConfig(L"") ? "OK saved\n" : "ERR SAVE\n";
+
+    // SET <side>.<field>=<value>  e.g. "SET left.fade=0.2" / "SET testpattern=off"
+    if (cmd == "SET") {
+        size_t eq = arg.find('=');
+        if (eq == std::string::npos) return "ERR SET side.field=value\n";
+        std::string key = arg.substr(0, eq), val = arg.substr(eq + 1);
+        for (auto& c : key) c = (char)tolower((unsigned char)c);
+        static const char* sides[4] = { "left", "right", "top", "bottom" };
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            bool applied = false;
+            for (int s = 0; s < 4 && !applied; s++) {
+                std::string pfx = std::string(sides[s]) + ".";
+                if (key.compare(0, pfx.size(), pfx) != 0) continue;
+                std::string field = key.substr(pfx.size());
+                float v = (float)atof(val.c_str());
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled) continue;
+                    if (field == "fade")  { o.blend[s].fade  = clampf(v, 0.0f, 0.5f); applied = true; }
+                    if (field == "gamma") { o.blend[s].gamma = clampf(v, 0.1f, 5.0f); applied = true; }
+                }
+            }
+            if (!applied && key == "testpattern") {
+                g_cfg.testPattern = (val == "ON" || val == "1" || val == "true");
+                applied = true;
+            }
+            if (!applied) return "ERR SET " + key + "\n";
+            g_rev++;
+        }
+        refreshStatusBar();
+        return "OK " + key + "=" + val + "\n";
+    }
 
     return "ERR UNKNOWN\n";
 }
