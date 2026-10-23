@@ -59,7 +59,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 
 - **图片源**："Load image..." 选择 PNG/JPG/BMP（系统 WIC 解码），勾选 "Image source" 后图片替代桌面捕获作为校正内容，几何/融合校准直接在真实图像上做。宽高比不同时自动信箱式适配（多余区域为黑）。
 - **窗口化预览**：勾选 "Windowed preview (single screen)" 后输出变为 60% 大小的可拖动窗口，并通过 `WDA_EXCLUDEFROMCAPTURE` 将自身从桌面捕获中排除——因此单显示器也能实时扭曲桌面画面且不产生画面递归（捕获帧中该窗口区域为黑，属预期行为）。Win10 2004 之前系统无此 API 时自动禁用捕获，回退测试图/图片源。
-- **原位覆盖（in-place overlay）**：Displays 页勾选 "In-place overlay (fullscreen, click-through)"（或 CMDNET `INPLACE ON`）后，输出窗口无边框铺满整台显示器、鼠标点击直接穿透到下面的桌面、且从捕获中排除——扭曲结果视觉上就是桌面本身，这就是 **1x1 主屏异型校正** 的日常用法。控制台始终置顶可随时关掉；做几何校准时建议先关覆盖（穿透状态拖不了控制点），校完再开。
+- **原位覆盖（in-place overlay）**：Displays 页勾选 "In-place overlay (fullscreen, click-through)"（或 CMDNET `INPLACE ON`）后，输出窗口无边框铺满整台显示器、鼠标点击直接穿透到下面的桌面、且从捕获中排除——扭曲结果视觉上就是桌面本身，这就是 **1x1 主屏异型校正** 的日常用法。控制台始终置顶可随时关掉；**按 F3 进入校准时穿透自动旁路**（控制点直接在覆盖层上拖，Esc 退出后恢复穿透），状态栏显示 `In-place: CALIB (click-through bypassed)`；Ctrl+F9 随时急停开关。
 
 ## 控制台 UI（复刻原版交互）
 
