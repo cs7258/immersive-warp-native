@@ -452,6 +452,11 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
 bool Engine::createDuplication(OutputCtx& oc) {
     auto displays = enumerateDisplays();
     const DisplayInfo* src = nullptr;
+    auto isOutputDisplay = [](const DisplayInfo& d) {
+        for (auto& o : g_cfg.outputs)
+            if (o.enabled && o.deviceName == d.deviceName) return true;
+        return false;
+    };
     if (g_previewMode.load() && oc.displayIdx >= 0 && oc.displayIdx < (int)displays.size()) {
         // windowed preview: the output window is small and marked
         // WDA_EXCLUDEFROMCAPTURE, so capturing its own display does NOT recurse
@@ -461,36 +466,58 @@ bool Engine::createDuplication(OutputCtx& oc) {
         }
         src = &displays[oc.displayIdx];
     }
+    // explicit source from the console "Source:" combo / CMDNET SET source=
+    if (!src && !g_cfg.sourceDev.empty()) {
+        for (auto& d : displays) {
+            if (!sameDisplayName(d.deviceName, g_cfg.sourceDev)) continue;
+            if (isOutputDisplay(d)) {
+                // capturing a display that also shows an output would film
+                // ourselves -> fall back to auto instead of a feedback loop
+                dbgLog("dupl: requested source is an enabled output -> auto instead");
+                break;
+            }
+            src = &d;
+            dbgLog("dupl: explicit source accepted, display index " +
+                   std::to_string((int)(&d - displays.data())));
+            break;
+        }
+        if (!src) dbgLog("dupl: requested source not found (or rejected), falling back to auto");
+    }
     for (auto& d : displays) {
         if (src) break;
-        bool isOutput = false;
-        for (auto& o : g_cfg.outputs)
-            if (o.enabled && o.deviceName == d.deviceName) { isOutput = true; break; }
-        if (!isOutput) { src = &d; break; }
+        if (!isOutputDisplay(d)) { src = &d; break; }
     }
     if (!src) {
         dbgLog("dupl: no source display available (all displays are outputs)");
         return false;
     }
-    IDXGIAdapter1* adapter = nullptr;
-    if (FAILED(m_factory->EnumAdapters1(0, &adapter))) return false;
+    // The source may sit on any adapter (multi-GPU laptops): walk all of them
+    // instead of assuming adapter 0.
     IDXGIOutput* out = nullptr;
-    bool found = false;
-    for (UINT i = 0; adapter->EnumOutputs(i, &out) != DXGI_ERROR_NOT_FOUND; i++) {
-        DXGI_OUTPUT_DESC d{};
-        out->GetDesc(&d);
-        if (d.DeviceName == src->deviceName) { found = true; break; }
-        out->Release(); out = nullptr;
+    IDXGIAdapter1* srcAdapter = nullptr;
+    for (UINT a = 0; !out && a < 8; a++) {
+        IDXGIAdapter1* ad = nullptr;
+        if (m_factory->EnumAdapters1(a, &ad) == DXGI_ERROR_NOT_FOUND) break;
+        for (UINT i = 0;; i++) {
+            IDXGIOutput* o = nullptr;
+            if (ad->EnumOutputs(i, &o) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_OUTPUT_DESC d{};
+            o->GetDesc(&d);
+            if (d.DeviceName == src->deviceName) { out = o; srcAdapter = ad; break; }
+            o->Release();
+        }
+        if (!srcAdapter) ad->Release();
     }
-    adapter->Release();
-    if (!found || !out) return false;
+    if (!out) return false;
     IDXGIOutput1* o1 = nullptr;
-    if (FAILED(out->QueryInterface(__uuidof(IDXGIOutput1), (void**)&o1))) { out->Release(); return false; }
+    if (FAILED(out->QueryInterface(__uuidof(IDXGIOutput1), (void**)&o1))) {
+        out->Release(); srcAdapter->Release(); return false;
+    }
     HRESULT hr = o1->DuplicateOutput(m_dev, &oc.dupl);
     oc.output1 = o1;
     out->Release();
-    dbgLog(std::string("dupl: source=") + (found ? "ok" : "fail") +
-           " hr=0x" + std::to_string((unsigned long)hr));
+    srcAdapter->Release();
+    dbgLog("dupl: source ok hr=0x" + std::to_string((unsigned long)hr));
     return SUCCEEDED(hr);
 }
 

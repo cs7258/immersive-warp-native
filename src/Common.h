@@ -15,6 +15,7 @@
 void dbgLogLine(const std::string& line);
 #include <atomic>
 #include <cmath>
+#include <cwctype>
 #include <algorithm>
 
 #define APP_NAME L"ImmersiveWarpNative"
@@ -80,6 +81,10 @@ struct AppConfig {
     int cmdnetPort = 5252;            // CMDNET listen port (loopback only)
     int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x
     int autostart = 0;                // start with Windows (HKCU Run mirror)
+    // explicit capture source. empty = auto (first display that is not an
+    // output). A non-empty value pins the desktop that gets warped, which is
+    // what the original's Source page does on multi-screen rigs.
+    std::wstring sourceDev;
 
     OutputCfg* findByDevice(const std::wstring& dev) {
         for (auto& o : outputs) if (o.deviceName == dev) return &o;
@@ -137,5 +142,22 @@ void cmdnetStop();
 // start with Windows: HKCU\...\Run value "ImmersiveWarpNative" (no admin needed)
 void setAutostart(bool on);
 bool queryAutostart();
+// capture source ("Source:" combo / CMDNET SET source=). Empty string = auto.
+// The duplication is bound when an output is attached, so a change rebuilds
+// the output windows while running.
+void setSourceDisplay(const std::wstring& dev);
+std::wstring currentSourceDevice();   // "" when auto
 
 inline float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
+
+// "\\.\DISPLAY2" and "DISPLAY2" denote the same output (CMDNET / config files
+// may use either form, DXGI always reports the long one)
+inline bool sameDisplayName(const std::wstring& a, const std::wstring& b) {
+    auto norm = [](std::wstring s) {
+        size_t p = s.find(L"\\\\.\\");
+        if (p != std::wstring::npos) s = s.substr(p + 4);
+        for (auto& c : s) c = (wchar_t)towupper(c);
+        return s;
+    };
+    return !a.empty() && !b.empty() && norm(a) == norm(b);
+}

@@ -304,12 +304,20 @@ static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
 static HWND g_ckNet = nullptr;
 static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
+static HWND g_cbSrc = nullptr;
+// capture source combo: index 0 = auto, index i>0 = g_srcDevs[i]
+static std::vector<std::wstring> g_srcDevs;
 
 // tray ids must not collide with control ids 1001..1021
 #define IDM_TRAY_SHOW  2001
 #define IDM_TRAY_START 2002
 #define IDM_TRAY_STOP  2003
 #define IDM_TRAY_EXIT  2004
+
+// cross-thread capture-source change (CMDNET runs on the socket thread).
+// constexpr so it can be used as a switch case label.
+constexpr UINT WM_SRCSET = WM_APP + 9;
+static DWORD uiThreadId = 0;
 constexpr UINT WM_TRAYICON = WM_APP + 7;
 
 // ---------------- tray icon ----------------
@@ -397,6 +405,7 @@ void refreshStatusBar() {
     int nProj = 0, sel = g_list ? ListBox_GetCurSel(g_list) : -1;
     ColorAdj c;
     int edges = 15;
+    std::wstring srcDev;
     bool snapshot = g_snapshot.load();
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -405,8 +414,9 @@ void refreshStatusBar() {
             if (nProj == 0) { c = o.color; edges = o.edges; }
             nProj++;
         }
+        srcDev = g_cfg.sourceDev;
     }
-    wchar_t l1[128], l2[160], l3[192], l4[128];
+    wchar_t l1[128], l2[160], l3[192], l4[128], l5[160];
     // [n] = which projector is being edited (1-based). refreshList() resets the
     // listbox selection, so fall back to 1 instead of showing [0].
     int cur = (sel >= 0 && sel < nProj) ? sel + 1 : (nProj > 0 ? 1 : 0);
@@ -426,9 +436,13 @@ void refreshStatusBar() {
     else if (edges == 0) lstrcpyW(buf, L"NONE");
     else for (int i = 0; i < 4; i++) if (edges & (1 << i)) { lstrcatW(buf, side[i]); }
     wsprintfW(l4, L"Blend edges: %s", buf);
+    if (srcDev.empty())
+        lstrcpyW(l5, L"Capture source: auto (first non-output display)");
+    else
+        wsprintfW(l5, L"Capture source: %s (pinned)", srcDev.c_str());
 
-    wchar_t all[600];
-    wsprintfW(all, L"%s\r\n%s\r\n%s\r\n%s", l1, l2, l3, l4);
+    wchar_t all[800];
+    wsprintfW(all, L"%s\r\n%s\r\n%s\r\n%s\r\n%s", l1, l2, l3, l4, l5);
     SetWindowTextW(g_statusInfo, all);
 }
 
@@ -550,6 +564,7 @@ void notifyOutputRaised() {
 #define IDC_CKNET     1019   // CMDNET TCP show-control service on/off
 #define IDC_CKAUTO    1020   // start with Windows
 #define IDC_CBSAMP    1021   // sampling quality dropdown
+#define IDC_CBSRC     1022   // capture source display dropdown
 
 static void refreshList() {
     if (!g_list) return;
@@ -568,6 +583,84 @@ static void refreshList() {
         }
     }
     refreshStatusBar();
+}
+
+// ---- capture source selection (which desktop gets warped) ----
+static bool g_srcBusy = false;   // guards ComboBox_ResetContent reentrancy
+static void populateSourceCombo() {
+    if (!g_cbSrc) return;
+    g_srcBusy = true;
+    ComboBox_ResetContent(g_cbSrc);
+    g_srcDevs.clear();
+    g_srcDevs.push_back(L"");   // index 0 = auto
+    ComboBox_AddString(g_cbSrc, L"Auto (first non-output display)");
+    auto displays = enumerateDisplays();
+    for (auto& d : displays) {
+        wchar_t line[192];
+        wsprintfW(line, L"%s  %ldx%ld%s", d.label.c_str(),
+                  d.desktop.right - d.desktop.left, d.desktop.bottom - d.desktop.top,
+                  d.primary ? L" [Primary]" : L"");
+        ComboBox_AddString(g_cbSrc, line);
+        g_srcDevs.push_back(d.deviceName);
+    }
+    int sel = 0;
+    std::wstring want;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        want = g_cfg.sourceDev;
+    }
+    for (size_t i = 1; i < g_srcDevs.size(); i++)
+        if (sameDisplayName(g_srcDevs[i], want)) { sel = (int)i; break; }
+    ComboBox_SetCurSel(g_cbSrc, sel);
+    g_srcBusy = false;
+}
+
+std::wstring currentSourceDevice() {
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    return g_cfg.sourceDev;
+}
+
+// cfg-only update, any thread (returns true when the value actually changed)
+static bool applySourceValue(const std::wstring& dev) {
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    bool same = (g_cfg.sourceDev.empty() && dev.empty()) ||
+                sameDisplayName(g_cfg.sourceDev, dev);
+    if (same) return false;
+    g_cfg.sourceDev = dev;
+    g_rev++;
+    return true;
+}
+
+// window work, UI thread only: the duplication is bound at attach time, so a
+// source change has to rebuild the outputs
+static void rebuildForSource() {
+    bool running;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        running = g_cfg.enabled || g_cfg.previewMode;
+    }
+    if (running) {
+        destroyOutputWindows();
+        createOutputWindows();
+    }
+    if (g_cbSrc) populateSourceCombo();   // resync (normalises DISPLAY2 -> \\.\DISPLAY2)
+    refreshStatusBar();
+}
+
+static void applySourceDisplay(const std::wstring& dev) {   // UI thread
+    if (applySourceValue(dev)) rebuildForSource();
+    else refreshStatusBar();
+}
+
+void setSourceDisplay(const std::wstring& dev) {
+    // CMDNET runs on the socket thread. Update the value there (so the reply is
+    // accurate) and only marshal the window rebuild: a blocking SendMessage
+    // here would deadlock against cmdnetStop()'s join on the UI thread.
+    if (g_ctl && uiThreadId && GetCurrentThreadId() != uiThreadId) {
+        if (applySourceValue(dev)) PostMessageW(g_ctl, WM_SRCSET, 0, 0);
+        return;
+    }
+    applySourceDisplay(dev);
 }
 
 // ---- color adjustment dialog (brightness / contrast / gamma R G B) ----
@@ -756,20 +849,33 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             hwnd, nullptr, nullptr, nullptr);
         g_cbSamp = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            76, 420, 170, 200,
+            76, 420, 150, 200,
             hwnd, (HMENU)IDC_CBSAMP, nullptr, nullptr);
         ComboBox_AddString(g_cbSamp, L"Trilinear");
         ComboBox_AddString(g_cbSamp, L"Anisotropic 4x");
         ComboBox_AddString(g_cbSamp, L"Anisotropic 8x");
+        // NOTE: this used to be placed at (190,388) where it sat exactly on top
+        // of the "TCP control (CMDNET)" checkbox and was therefore invisible.
         CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 190, 388, 200, 28,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 240, 420, 200, 28,
             hwnd, (HMENU)IDC_EDGES, nullptr, nullptr);
+        // capture source: which desktop gets warped (auto = first non-output)
+        CreateWindowW(L"STATIC", L"Source:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 458, 54, 18,
+            hwnd, nullptr, nullptr, nullptr);
+        g_cbSrc = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            66, 454, 300, 220,
+            hwnd, (HMENU)IDC_CBSRC, nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"(auto = first display that is not an output)",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 374, 458, 200, 32,
+            hwnd, nullptr, nullptr, nullptr);
         // structured status block (Projector / Mode / Color balancing / edges)
         g_statusInfo = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 420, 545, 76,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 492, 545, 76,
             hwnd, nullptr, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 496, 545, 40,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 564, 545, 40,
             hwnd, nullptr, nullptr, nullptr);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -782,9 +888,14 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
             Engine::inst().setSampling(g_cfg.sampling);
             ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
-            trayInit(hwnd);
         }
+        populateSourceCombo();   // locks g_cfgMutex itself
+        trayInit(hwnd);
         refreshStatusBar();
+        return 0;
+    }
+    case WM_SRCSET: {   // capture source changed from the socket thread
+        rebuildForSource();
         return 0;
     }
     case WM_COMMAND: {
@@ -970,6 +1081,16 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 setStatus(sel == 0 ? L"Sampling: trilinear."
                                    : L"Sampling: anisotropic.");
             }
+        } else if (id == IDC_CBSRC && HIWORD(wp) == CBN_SELCHANGE) {
+            if (g_srcBusy) return 0;   // reentrancy guard (combo repopulation)
+            int sel = ComboBox_GetCurSel(g_cbSrc);
+            std::wstring dev;
+            if (sel > 0 && sel < (int)g_srcDevs.size()) dev = g_srcDevs[sel];
+            wchar_t msg[160];
+            if (dev.empty()) lstrcpyW(msg, L"Capture source: auto (first display that is not an output).");
+            else wsprintfW(msg, L"Capture source pinned to %s (outputs rebuilt).", dev.c_str());
+            setStatus(msg);
+            setSourceDisplay(dev);
         } else if (id == IDM_TRAY_SHOW) {
             if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
             else { ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); }
@@ -1031,8 +1152,9 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
+    uiThreadId = GetCurrentThreadId();
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 580, 600,
+        WS_OVERLAPPEDWINDOW, 100, 100, 580, 660,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);

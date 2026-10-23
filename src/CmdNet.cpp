@@ -17,6 +17,22 @@ static std::atomic<bool> g_netRun{ false };
 static std::thread g_netThread;
 static SOCKET g_listenSock = INVALID_SOCKET;
 
+static std::string toNarrow(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s((size_t)n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// short form used on the wire: "\\.\DISPLAY2" -> "DISPLAY2"
+static std::string shortDev(const std::wstring& w) {
+    std::string s = toNarrow(w);
+    size_t p = s.find("\\\\.\\");
+    if (p != std::string::npos) s = s.substr(p + 4);
+    return s;
+}
+
 static std::string edgesName(int m) {
     if (m == 15) return "ALL";
     if (m == 0)  return "NONE";
@@ -68,6 +84,23 @@ static std::string dispatch(std::string line) {
         if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
         if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
         if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
+        if (k == "source") {
+            std::wstring cur = currentSourceDevice();
+            return "OK source=" + (cur.empty() ? std::string("auto") : shortDev(cur)) + "\n";
+        }
+        if (k == "displays") {
+            // topology listing so a show controller can pick a source:
+            // OK displays=2;DISPLAY1=1920x1080*;DISPLAY2=1920x1080;
+            auto ds = enumerateDisplays();
+            std::string s = "OK displays=" + std::to_string(ds.size()) + ";";
+            for (auto& d : ds) {
+                s += shortDev(d.deviceName) + "=" +
+                     std::to_string(d.desktop.right - d.desktop.left) + "x" +
+                     std::to_string(d.desktop.bottom - d.desktop.top) +
+                     (d.primary ? "*" : "") + ";";
+            }
+            return s + "\n";
+        }
         if (k == "testpattern") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return std::string("OK testpattern=") + (g_cfg.testPattern ? "on" : "off") + "\n";
@@ -154,6 +187,18 @@ static std::string dispatch(std::string line) {
         if (eq == std::string::npos) return "ERR SET side.field=value\n";
         std::string key = arg.substr(0, eq), val = arg.substr(eq + 1);
         for (auto& c : key) c = (char)tolower((unsigned char)c);
+        // Set the capture source: rebuilds the outputs, so it must run without
+        // holding g_cfgMutex (setSourceDisplay locks internally).
+        if (key == "source") {
+            std::wstring dev;
+            if (val != "AUTO" && !val.empty()) {
+                dev.assign(val.begin(), val.end());
+                if (dev.compare(0, 4, L"\\\\.\\") != 0) dev = L"\\\\.\\" + dev;
+            }
+            setSourceDisplay(dev);
+            std::wstring cur = currentSourceDevice();
+            return "OK source=" + (cur.empty() ? std::string("auto") : shortDev(cur)) + "\n";
+        }
         static const char* sides[4] = { "left", "right", "top", "bottom" };
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
