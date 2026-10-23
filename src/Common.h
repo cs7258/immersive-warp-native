@@ -168,6 +168,7 @@ void toggleCalibration();      // global hotkey F3: enter/exit calibration
 void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all outputs
 void cycleBlendEdges();        // global hotkey F12: cycle blended edges
 void toggleSnapshot();         // global hotkey Ctrl+F3: freeze / resume capture
+void toggleInplaceOverlay();   // global hotkey Ctrl+F9: in-place overlay safety switch
 void openColorDialogEx();      // global hotkey D: color adjustment dialog
 // per-projector "Configure display" dialog (Bezels/Align/Geometry/Blending/
 // Color/Masking/Help tabs, edits the output selected in the console list)

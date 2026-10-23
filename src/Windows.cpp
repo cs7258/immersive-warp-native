@@ -443,7 +443,8 @@ static bool g_tgtBusy = false;      // suppress CBN_SELCHANGE during programmati
 #define IDM_FILE_SAVE  2102
 #define IDM_FILE_EXIT  2103
 #define IDM_VIEW_DISP  2111   // +0..3 = the four pages
-#define IDM_VIEW_HIDE  2115
+#define IDM_VIEW_INPLACE 2115 // in-place overlay toggle (checkable)
+#define IDM_VIEW_HIDE  2116
 #define IDM_WARP_ALIGN 2121
 #define IDM_WARP_EDGES 2122
 #define IDM_WARP_SNAP  2123
@@ -472,6 +473,7 @@ static void showTab(int pg) {
 #define IDM_TRAY_SHOW  2001
 #define IDM_TRAY_START 2002
 #define IDM_TRAY_STOP  2003
+#define IDM_TRAY_INPLACE 2005  // in-place overlay toggle (checkable)
 #define IDM_TRAY_EXIT  2004
 #define IDM_TRAY_PRESET 2200   // +0..31: dynamic preset submenu (not used by dialog ids)
 #define TRAY_PRESET_MAX 32
@@ -539,6 +541,8 @@ static void showTrayMenu(HWND hwnd) {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_TRAY_START, L"Start Output");
     AppendMenuW(m, MF_STRING, IDM_TRAY_STOP, L"Stop Output");
+    AppendMenuW(m, MF_STRING | (g_inplace.load() ? MF_CHECKED : 0),
+                IDM_TRAY_INPLACE, L"In-place overlay (Ctrl+F9)");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     // named presets: one-click scene switching (same files as CMDNET SAVEAS/LOADAS)
     {
@@ -735,6 +739,39 @@ void toggleSnapshot() {
     setStatus(on ? L"Snapshot ON: captured frame frozen. Align on the still image, Ctrl+F3 to resume live."
                  : L"Snapshot OFF: live desktop capture resumed.");
     refreshStatusBar();
+}
+
+// In-place overlay safety switch, shared by the global Ctrl+F9 hotkey, the
+// View menu item and the tray menu. Click-through output windows cannot be
+// clicked themselves, so an always-reachable off switch matters (the console
+// is topmost anyway, this is the extra "get me out" path).
+void toggleInplaceOverlay() {
+    bool on = !g_inplace.load();
+    g_inplace.store(on);
+    if (!on) g_previewNoCapture.store(false);
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        g_cfg.inplace = on;
+        g_rev++;
+    }
+    // rebuild via the same queue entry the checkbox uses (UI + socket thread)
+    if (g_ctl) PostMessageW(g_ctl, WM_INPLACESET, 0, 0);
+    setStatus(on ? L"In-place overlay ON: click-through enabled. Ctrl+F9 turns it off."
+                 : L"In-place overlay off: normal output windows.");
+    refreshStatusBar();
+}
+
+// keep every in-place affordance in step: checkbox, View menu check mark
+// (the tray menu is rebuilt on every right-click, so it reads g_inplace live)
+static void syncInplaceUI(HWND hwnd) {
+    bool on = g_inplace.load();
+    if (g_ckInplace)
+        Button_SetCheck(g_ckInplace, on ? BST_CHECKED : BST_UNCHECKED);
+    if (!hwnd && g_ctl) hwnd = g_ctl;
+    if (hwnd)
+        if (HMENU m = GetMenu(hwnd))
+            CheckMenuItem(m, IDM_VIEW_INPLACE, MF_BYCOMMAND |
+                          (on ? MF_CHECKED : MF_UNCHECKED));
 }
 
 void notifyOutputRaised() {
@@ -1779,6 +1816,8 @@ static HMENU buildMenuBar() {
     for (int i = 0; i < PAGE_COUNT; i++)
         AppendMenuW(mView, MF_STRING, IDM_VIEW_DISP + i, pageNames[i]);
     AppendMenuW(mView, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(mView, MF_STRING, IDM_VIEW_INPLACE, L"In-place overlay (click-through)\tCtrl+F9");
+    AppendMenuW(mView, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(mView, MF_STRING, IDM_VIEW_HIDE, L"Hide console to tray");
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)mView, L"&View");
 
@@ -2074,6 +2113,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 514, 612, 32,
             hwnd, nullptr, nullptr, nullptr);
         applyDarkThemeRecursive(hwnd);   // DarkMode_Explorer on every child
+        syncInplaceUI(hwnd);             // initial View-menu check state
         showTab(PAGE_DISPLAYS);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -2105,9 +2145,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         // only the window style changes, but CreateWindowExW takes the full
         // ex-style, so rebuild the output windows (idempotent)
         if (!g_outWins.empty()) { destroyOutputWindows(); createOutputWindows(); }
-        // socket-thread SET must move the checkbox too (UI <-> CMDNET sync)
-        if (g_ckInplace)
-            Button_SetCheck(g_ckInplace, g_inplace.load() ? BST_CHECKED : BST_UNCHECKED);
+        // checkbox + View menu follow whichever entry point toggled it
+        syncInplaceUI(hwnd);
         return 0;
     }    case WM_LAYSET: {   // tiled layout changed from the socket thread
         LayMsg m;
@@ -2134,6 +2173,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 int pg = id - IDM_VIEW_DISP;
                 TabCtrl_SetCurSel(g_tab, pg);
                 showTab(pg);
+            } else if (id == IDM_VIEW_INPLACE) {
+                toggleInplaceOverlay();
             } else if (id == IDM_VIEW_HIDE) {
                 ShowWindow(hwnd, SW_HIDE);
             } else if (id == IDM_WARP_ALIGN) {
@@ -2161,7 +2202,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                     L"Desktop Duplication capture, mesh warp, edge blending,\n"
                     L"masks, CMDNET show control on 127.0.0.1:5252.\n\n"
                     L"Hotkeys: F3 alignment, F10 warp/blend, Ctrl+F12 edges,\n"
-                    L"Ctrl+F3 snapshot, Esc exit calibration.",
+                    L"Ctrl+F3 snapshot, Ctrl+F9 in-place overlay, Esc exit calibration.",
                     L"About Immersive Warp Native", MB_OK);
             }
             return 0;
@@ -2266,19 +2307,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             setStatus(on ? L"Preview: 60% window, live desktop warp on a single screen. Drag the window to move it."
                          : L"Preview off: fullscreen output.");
         } else if (id == IDC_CKINPLACE && HIWORD(wp) == BN_CLICKED) {
+            // single source of truth: the checkbox click feeds the same
+            // toggle the Ctrl+F9 hotkey / menus use (no-op when already there)
             bool on = Button_GetCheck(g_ckInplace) == BST_CHECKED;
-            g_inplace.store(on);
-            if (!on) g_previewNoCapture.store(false);
-            {
-                std::lock_guard<std::mutex> lk(g_cfgMutex);
-                g_cfg.inplace = on;
-                g_rev++;
-            }
-            // rebuild through the message queue so the socket-thread path
-            // (SET inplace=) and the UI path share one rebuild entry point
-            PostMessageW(hwnd, WM_INPLACESET, 0, 0);
-            setStatus(on ? L"In-place overlay: output covers the monitor, mouse clicks pass through. Toggle off here (console stays on top) or via CMDNET."
-                         : L"In-place overlay off: normal output windows.");
+            if (g_inplace.load() != on) toggleInplaceOverlay();
         } else if (id == IDC_CKIMAGE && HIWORD(wp) == BN_CLICKED) {
             bool on = Button_GetCheck(g_ckImage) == BST_CHECKED;
             if (on && !engineHasImage()) {
@@ -2449,6 +2481,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             createOutputWindows();
         } else if (id == IDM_TRAY_STOP) {
             destroyOutputWindows();
+        } else if (id == IDM_TRAY_INPLACE) {
+            toggleInplaceOverlay();
         } else if (id == IDM_TRAY_EXIT) {
             DestroyWindow(hwnd);
         }
@@ -2519,6 +2553,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         UnregisterHotKey(nullptr, 4);
         UnregisterHotKey(nullptr, 5);
         UnregisterHotKey(nullptr, 6);
+        UnregisterHotKey(nullptr, 7);
         PostQuitMessage(0);
         return 0;
     }
@@ -2551,6 +2586,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     // ControlWndProc::WM_KEYDOWN when the console has focus.
     RegisterHotKey(nullptr, 4, MOD_CONTROL, VK_F12);  // cycle blended edges
     RegisterHotKey(nullptr, 5, MOD_CONTROL, VK_F3);   // snapshot (freeze capture)
+    RegisterHotKey(nullptr, 7, MOD_CONTROL, VK_F9);   // in-place overlay switch
 }
 
 // GET_X_LPARAM / GET_Y_LPARAM come from windowsx.h (included above)

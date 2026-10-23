@@ -94,6 +94,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             else if (msg.wParam == 4) cycleBlendEdges();    // F12
             else if (msg.wParam == 5) toggleSnapshot();     // Ctrl+F3
             else if (msg.wParam == 6) openColorDialogEx();  // D (registered while calibrating)
+            else if (msg.wParam == 7) toggleInplaceOverlay(); // Ctrl+F9: overlay safety switch
             continue;
         }
         TranslateMessage(&msg);
