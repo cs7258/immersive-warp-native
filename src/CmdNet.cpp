@@ -284,7 +284,7 @@ static std::string dispatch(std::string line) {
         if (!loadConfig(L"")) return "ERR LOAD (no config file)\n";
         return finishLoad("default");
     }
-    if (cmd == "SAVEAS" || cmd == "LOADAS") {
+    if (cmd == "SAVEAS" || cmd == "LOADAS" || cmd == "DELPRESET") {
         // preset name: A-Z 0-9 '_' '-' only (dispatch uppercases the whole
         // line), max 32 chars -> no path traversal possible
         bool okName = !arg.empty() && arg.size() <= 32;
@@ -295,6 +295,10 @@ static std::string dispatch(std::string line) {
         if (cmd == "SAVEAS") {
             if (!saveConfig(presetPath(arg))) return "ERR SAVEAS (write failed)\n";
             return "OK saved preset=" + arg + "\n";
+        }
+        if (cmd == "DELPRESET") {
+            if (!DeleteFileW(presetPath(arg).c_str())) return "ERR DELPRESET (no such preset)\n";
+            return "OK deleted preset=" + arg + "\n";
         }
         if (!loadConfig(presetPath(arg))) return "ERR LOADAS (no such preset)\n";
         return finishLoad("preset=" + arg);

@@ -76,6 +76,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `LOAD;` | `OK loaded default;outputs=1` | 从 config.txt 重新加载配置（等效 UI 的 Load 按钮；同时恢复预览/采样/测试图/图像源） |
 | `SAVEAS name;` | `OK saved preset=NAME` | 把当前配置存为命名预设（`%APPDATA%\ImmersiveWarpNative\presets\NAME.cfg`；名称仅 A-Z 0-9 `_` `-`，最长 32，命令会整体转大写） |
 | `LOADAS name;` | `OK loaded preset=NAME;outputs=1` | 加载命名预设（演出场景切换）；预设不存在报 ERR |
+| `DELPRESET name;` | `OK deleted preset=NAME` | 删除命名预设；预设不存在或名称非法报 ERR |
 | `GET presets;` | `OK presets=NAME1;NAME2` / `OK presets=none` | 列出全部已保存预设 |
 | `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
 | `SET left.gain=0.8;` / `SET left.slope=0.3;` | `OK left.gain=0.8` | 融合曲线增益/陡度（gain 0–2、slope 0–1；0/0 = 线性斜坡，slope=1 为硬切换） |
