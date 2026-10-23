@@ -90,6 +90,33 @@ static std::string listPresets() {
     return out + "\n";
 }
 
+// ---- per-output command target ------------------------------------------
+// "SET out=DISPLAY2" points the following per-output commands (masks, blend
+// sides, rows/cols, flip/rotate, edges) at that one output instead of the
+// defaults. Empty target = legacy behavior (masks/fade read/write the first
+// enabled output, grid ops apply to every enabled output).
+static std::string g_cmdTarget;               // empty = auto
+static std::mutex  g_cmdTargetMutex;
+
+static std::string currentTarget() {
+    std::lock_guard<std::mutex> lk(g_cmdTargetMutex);
+    return g_cmdTarget;
+}
+
+// resolve the target under g_cfgMutex (caller holds it). Matches the short
+// device name ("DISPLAY2") or the label text, case-insensitive.
+static OutputCfg* targetOutputLocked() {
+    std::string t = currentTarget();
+    for (auto& o : g_cfg.outputs) {
+        if (!o.enabled) continue;
+        if (t.empty()) return &o;   // legacy: first enabled
+        if (_stricmp(shortDev(o.deviceName).c_str(), t.c_str()) == 0 ||
+            _stricmp(toNarrow(o.label).c_str(), t.c_str()) == 0)
+            return &o;
+    }
+    return nullptr;
+}
+
 static std::string dispatch(std::string line) {
     // trim + uppercase
     while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(line.begin());
@@ -127,31 +154,31 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return std::string("OK curved=") + (g_cfg.curved ? "on" : "off") + "\n";
         }
-        // mask rectangles of the first enabled output, normalized 0..1:
+        if (k == "out") {
+            std::string t = currentTarget();
+            return "OK out=" + (t.empty() ? std::string("auto") : t) + "\n";
+        }
+        // mask rectangles of the command-target output, normalized 0..1:
         // "OK masks=2;0.000,0.000,0.100,0.100;0.500,0.500,0.200,0.200;"
         if (k == "masks") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
-            for (auto& o : g_cfg.outputs) {
-                if (!o.enabled) continue;
-                char b[40];
-                sprintf_s(b, "OK masks=%d;", (int)(std::min)(o.masks.size(), (size_t)MAX_MASKS));
-                std::string s = b;
-                for (auto& m : o.masks) {
-                    sprintf_s(b, "%.3f,%.3f,%.3f,%.3f;", m.x, m.y, m.w, m.h);
-                    s += b;
-                }
-                return s + "\n";
+            OutputCfg* o = targetOutputLocked();
+            if (!o) return "ERR no output (SET out=<name>?)\n";
+            char b[40];
+            sprintf_s(b, "OK masks=%d;", (int)(std::min)(o->masks.size(), (size_t)MAX_MASKS));
+            std::string s = b;
+            for (auto& m : o->masks) {
+                sprintf_s(b, "%.3f,%.3f,%.3f,%.3f;", m.x, m.y, m.w, m.h);
+                s += b;
             }
-            return "ERR no output\n";
+            return s + "\n";
         }
         if (k == "presets") return listPresets();
         if (k == "rows" || k == "cols") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
-            for (auto& o : g_cfg.outputs)
-                if (o.enabled)
-                    return "OK " + k + "=" +
-                           std::to_string(k == "rows" ? o.rows : o.cols) + "\n";
-            return "ERR no output\n";
+            OutputCfg* o = targetOutputLocked();
+            if (!o) return "ERR no output (SET out=<name>?)\n";
+            return "OK " + k + "=" + std::to_string(k == "rows" ? o->rows : o->cols) + "\n";
         }
         if (k == "source") {
             std::wstring cur = currentSourceDevice();
@@ -175,14 +202,23 @@ static std::string dispatch(std::string line) {
             return std::string("OK testpattern=") + (g_cfg.testPattern ? "on" : "off") + "\n";
         }
         if (k == "outputs") {
+            // topology of the enabled outputs: the count first (old parsers
+            // read just that), then each output's short device name:
+            // OK outputs=2;DISPLAY1;DISPLAY2;
             std::lock_guard<std::mutex> lk(g_cfgMutex);
-            int n = 0; for (auto& o : g_cfg.outputs) if (o.enabled) n++;
-            return "OK outputs=" + std::to_string(n) + "\n";
+            int n = 0;
+            std::string s;
+            for (auto& o : g_cfg.outputs) if (o.enabled) {
+                n++;
+                s += shortDev(o.deviceName) + ";";
+            }
+            return "OK outputs=" + std::to_string(n) + ";" + s + "\n";
         }
         if (k == "edges") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
-            for (auto& o : g_cfg.outputs) if (o.enabled) return "OK edges=" + edgesName(o.edges) + "\n";
-            return "ERR no output\n";
+            OutputCfg* o = targetOutputLocked();
+            if (!o) return "ERR no output (SET out=<name>?)\n";
+            return "OK edges=" + edgesName(o->edges) + "\n";
         }
         static const char* sides[4] = { "left", "right", "top", "bottom" };
         for (int s = 0; s < 4; s++) {
@@ -190,14 +226,13 @@ static std::string dispatch(std::string line) {
             if (k.compare(0, pfx.size(), pfx) == 0) {
                 std::string field = k.substr(pfx.size());
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
-                for (auto& o : g_cfg.outputs) {
-                    if (!o.enabled) continue;
-                    char b[64];
-                    if (field == "fade")  { sprintf_s(b, "OK %s.fade=%.3f\n",  sides[s], o.blend[s].fade);  return b; }
-                    if (field == "gamma") { sprintf_s(b, "OK %s.gamma=%.3f\n", sides[s], o.blend[s].gamma); return b; }
-                    if (field == "gain")  { sprintf_s(b, "OK %s.gain=%.3f\n",  sides[s], o.blend[s].gain);  return b; }
-                    if (field == "slope") { sprintf_s(b, "OK %s.slope=%.3f\n", sides[s], o.blend[s].slope); return b; }
-                }
+                OutputCfg* o = targetOutputLocked();
+                if (!o) return "ERR no output (SET out=<name>?)\n";
+                char b[64];
+                if (field == "fade")  { sprintf_s(b, "OK %s.fade=%.3f\n",  sides[s], o->blend[s].fade);  return b; }
+                if (field == "gamma") { sprintf_s(b, "OK %s.gamma=%.3f\n", sides[s], o->blend[s].gamma); return b; }
+                if (field == "gain")  { sprintf_s(b, "OK %s.gain=%.3f\n",  sides[s], o->blend[s].gain);  return b; }
+                if (field == "slope") { sprintf_s(b, "OK %s.slope=%.3f\n", sides[s], o->blend[s].slope); return b; }
                 return "ERR GET " + k + "\n";
             }
         }
@@ -221,6 +256,7 @@ static std::string dispatch(std::string line) {
             }
         }
         std::wstring src = currentSourceDevice();   // locks g_cfgMutex itself
+        std::string tgt = currentTarget();          // independent small mutex
         return "calib=" + std::string(g_calib.load() ? "on" : "off") +
                ";mode=" + std::string(g_calibMode.load() == 1 ? "blend" : "warp") +
                ";edges=" + edgesName(edges) +
@@ -231,7 +267,8 @@ static std::string dispatch(std::string line) {
                ";curved=" + std::string(curved ? "on" : "off") +
                ";masks=" + std::to_string(masks) +
                ";testpattern=" + std::string(tp ? "on" : "off") +
-               ";source=" + (src.empty() ? std::string("auto") : shortDev(src)) + "\n";
+               ";source=" + (src.empty() ? std::string("auto") : shortDev(src)) +
+               ";out=" + (tgt.empty() ? std::string("auto") : tgt) + "\n";
     }
 
     if (cmd == "CALIB") {
@@ -331,6 +368,30 @@ static std::string dispatch(std::string line) {
             std::wstring cur = currentSourceDevice();
             return "OK source=" + (cur.empty() ? std::string("auto") : shortDev(cur)) + "\n";
         }
+        // Point the following per-output commands at one output. AUTO (or an
+        // empty value) restores the legacy defaults. The name is validated so
+        // a typo fails here instead of on the next command.
+        if (key == "out") {
+            if (val == "AUTO" || val.empty()) {
+                std::lock_guard<std::mutex> lk(g_cmdTargetMutex);
+                g_cmdTarget.clear();
+                return "OK out=auto\n";
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                bool found = false;
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled) continue;
+                    if (_stricmp(shortDev(o.deviceName).c_str(), val.c_str()) == 0 ||
+                        _stricmp(toNarrow(o.label).c_str(), val.c_str()) == 0)
+                        { found = true; break; }
+                }
+                if (!found) return "ERR SET out (no such output: " + val + ")\n";
+            }
+            std::lock_guard<std::mutex> lk(g_cmdTargetMutex);
+            g_cmdTarget = val;
+            return "OK out=" + val + "\n";
+        }
         // NxN tiled layout, e.g. "SET layout=2x2" / "SET overlap=15"
         // (setLayout locks g_cfgMutex itself; the grid rebuild bumps g_rev so
         // the render thread rebuilds every mesh on the next frame).
@@ -379,12 +440,10 @@ static std::string dispatch(std::string line) {
             int idx;
             if (sub == "clear") {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
-                for (auto& o : g_cfg.outputs) {
-                    if (!o.enabled) continue;
-                    o.masks.clear();
-                    return "OK masks=0\n";
-                }
-                return "ERR no output\n";
+                OutputCfg* o = targetOutputLocked();
+                if (!o) return "ERR no output (SET out=<name>?)\n";
+                o->masks.clear();
+                return "OK masks=0\n";
             }
             if (sub == "add" || sub == "set") {
                 bool ok = sub == "add"
@@ -398,24 +457,21 @@ static std::string dispatch(std::string line) {
                 std::string rep;
                 {
                     std::lock_guard<std::mutex> lk(g_cfgMutex);
-                    for (auto& o : g_cfg.outputs) {
-                        if (!o.enabled) continue;
-                        // fit the rectangle so it stays on screen
-                        w = (std::min)(w, 1.0f - x); h = (std::min)(h, 1.0f - y);
-                        if (sub == "add") {
-                            if (o.masks.size() >= MAX_MASKS)
-                                return "ERR SET mask.add (max 8 masks)\n";
-                            o.masks.push_back(MaskRect{ x, y, w, h });
-                        } else {
-                            if (idx < 0 || idx >= (int)o.masks.size())
-                                return "ERR SET mask.set (bad index)\n";
-                            o.masks[idx] = MaskRect{ x, y, w, h };
-                        }
-                        rep = "OK masks=" + std::to_string(o.masks.size()) + "\n";
-                        break;
+                    OutputCfg* o = targetOutputLocked();
+                    if (!o) return "ERR no output (SET out=<name>?)\n";
+                    // fit the rectangle so it stays on screen
+                    w = (std::min)(w, 1.0f - x); h = (std::min)(h, 1.0f - y);
+                    if (sub == "add") {
+                        if (o->masks.size() >= MAX_MASKS)
+                            return "ERR SET mask.add (max 8 masks)\n";
+                        o->masks.push_back(MaskRect{ x, y, w, h });
+                    } else {
+                        if (idx < 0 || idx >= (int)o->masks.size())
+                            return "ERR SET mask.set (bad index)\n";
+                        o->masks[idx] = MaskRect{ x, y, w, h };
                     }
+                    rep = "OK masks=" + std::to_string(o->masks.size()) + "\n";
                 }
-                if (rep.empty()) return "ERR no output\n";
                 refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
                 return rep;
             }
@@ -443,14 +499,11 @@ static std::string dispatch(std::string line) {
                 std::string rep;
                 {
                     std::lock_guard<std::mutex> lk(g_cfgMutex);
-                    for (auto& o : g_cfg.outputs) {
-                        if (!o.enabled) continue;
-                        o.masks = add;
-                        rep = "OK masks=" + std::to_string(o.masks.size()) + "\n";
-                        break;
-                    }
+                    OutputCfg* o = targetOutputLocked();
+                    if (!o) return "ERR no output (SET out=<name>?)\n";
+                    o->masks = add;
+                    rep = "OK masks=" + std::to_string(o->masks.size()) + "\n";
                 }
-                if (rep.empty()) return "ERR no output\n";
                 refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
                 return rep;
             }
@@ -460,33 +513,39 @@ static std::string dispatch(std::string line) {
                 std::string rep;
                 {
                     std::lock_guard<std::mutex> lk(g_cfgMutex);
-                    for (auto& o : g_cfg.outputs) {
-                        if (!o.enabled) continue;
-                        if (idx < 0 || idx >= (int)o.masks.size())
-                            return "ERR SET mask.del (bad index)\n";
-                        o.masks.erase(o.masks.begin() + idx);
-                        rep = "OK masks=" + std::to_string(o.masks.size()) + "\n";
-                        break;
-                    }
+                    OutputCfg* o = targetOutputLocked();
+                    if (!o) return "ERR no output (SET out=<name>?)\n";
+                    if (idx < 0 || idx >= (int)o->masks.size())
+                        return "ERR SET mask.del (bad index)\n";
+                    o->masks.erase(o->masks.begin() + idx);
+                    rep = "OK masks=" + std::to_string(o->masks.size()) + "\n";
                 }
-                if (rep.empty()) return "ERR no output\n";
                 refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
                 return rep;
             }
             return "ERR SET mask (add|set|load|del|clear)\n";
         }
-        // grid density for every enabled output (REBUILDS each warp grid,
-        // dropping manual point edits, same as the Configure dialog's Apply)
+        // grid density (REBUILDS each warp grid, dropping manual point edits,
+        // same as the Configure dialog's Apply). Targets the selected output
+        // when one is set, else every enabled output (legacy).
         if (key == "rows" || key == "cols") {
             int n = atoi(val.c_str());
             if (n < 3 || n > 24) return "ERR SET " + key + " (3..24)\n";
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
+                std::string t = currentTarget();
+                bool found = false;
                 for (auto& o : g_cfg.outputs) {
                     if (!o.enabled) continue;
+                    if (!t.empty() &&
+                        _stricmp(shortDev(o.deviceName).c_str(), t.c_str()) != 0 &&
+                        _stricmp(toNarrow(o.label).c_str(), t.c_str()) != 0)
+                        continue;
+                    found = true;
                     if (key == "rows") o.rows = n; else o.cols = n;
                     o.initIdentity();
                 }
+                if (!found) return "ERR no output (SET out=<name>?)\n";
                 g_rev++;
             }
             refreshStatusBar();
@@ -498,8 +557,13 @@ static std::string dispatch(std::string line) {
             bool found = false;
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
+                std::string t = currentTarget();
                 for (auto& o : g_cfg.outputs) {
                     if (!o.enabled) continue;
+                    if (!t.empty() &&
+                        _stricmp(shortDev(o.deviceName).c_str(), t.c_str()) != 0 &&
+                        _stricmp(toNarrow(o.label).c_str(), t.c_str()) != 0)
+                        continue;
                     found = true;
                     for (size_t i = 0; i < o.points.size(); i += 2) {
                         if (val == "H") o.points[i] = 1.0f - o.points[i];
@@ -508,25 +572,33 @@ static std::string dispatch(std::string line) {
                 }
                 if (found) g_rev++;
             }
-            if (!found) return "ERR no output\n";
+            if (!found) return "ERR no output (SET out=<name>?)\n";
             refreshStatusBar();
             return "OK flip=" + val + "\n";
         }
         if (key == "rotate") {
             if (val != "90" && val != "-90" && val != "270")
                 return "ERR SET rotate (90, -90 or 270)\n";
+            bool found = false;
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
+                std::string t = currentTarget();
                 for (auto& o : g_cfg.outputs) {
                     if (!o.enabled) continue;
+                    if (!t.empty() &&
+                        _stricmp(shortDev(o.deviceName).c_str(), t.c_str()) != 0 &&
+                        _stricmp(toNarrow(o.label).c_str(), t.c_str()) != 0)
+                        continue;
+                    found = true;
                     for (size_t i = 0; i < o.points.size(); i += 2) {
                         float x = o.points[i], y = o.points[i + 1];
                         if (val == "90")  { o.points[i] = 1.0f - y; o.points[i + 1] = x; }
                         else              { o.points[i] = y; o.points[i + 1] = 1.0f - x; }
                     }
                 }
-                g_rev++;
+                if (found) g_rev++;
             }
+            if (!found) return "ERR no output (SET out=<name>?)\n";
             refreshStatusBar();
             return "OK rotate=" + val + "\n";
         }
@@ -534,6 +606,7 @@ static std::string dispatch(std::string line) {
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             bool applied = false;
+            std::string t = currentTarget();
             for (int s = 0; s < 4 && !applied; s++) {
                 std::string pfx = std::string(sides[s]) + ".";
                 if (key.compare(0, pfx.size(), pfx) != 0) continue;
@@ -541,6 +614,11 @@ static std::string dispatch(std::string line) {
                 float v = (float)atof(val.c_str());
                 for (auto& o : g_cfg.outputs) {
                     if (!o.enabled) continue;
+                    // targeted: only the selected output; auto: every output
+                    if (!t.empty() &&
+                        _stricmp(shortDev(o.deviceName).c_str(), t.c_str()) != 0 &&
+                        _stricmp(toNarrow(o.label).c_str(), t.c_str()) != 0)
+                        continue;
                     if (field == "fade")  { o.blend[s].fade  = clampf(v, 0.0f, 0.5f); applied = true; }
                     if (field == "gamma") { o.blend[s].gamma = clampf(v, 0.1f, 5.0f); applied = true; }
                     if (field == "gain")  { o.blend[s].gain  = clampf(v, 0.0f, 2.0f); applied = true; }

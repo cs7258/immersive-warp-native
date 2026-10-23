@@ -67,7 +67,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | 命令 | 应答 | 说明 |
 |---|---|---|
 | `PING;` | `OK` | 连通性 |
-| `STATUS;` | `calib=off;mode=warp;edges=ALL;snapshot=off;outputs=1;layout=1x1;overlap=0;curved=off;masks=0;testpattern=on;source=auto` | 一次性状态摘要（后 6 项为扩展字段，追加在末尾，旧解析端按 `key=value;` 配对读取不受影响） |
+| `STATUS;` | `calib=off;mode=warp;edges=ALL;snapshot=off;outputs=1;layout=1x1;overlap=0;curved=off;masks=0;testpattern=on;source=auto;out=auto` | 一次性状态摘要（后 7 项为扩展字段，追加在末尾，旧解析端按 `key=value;` 配对读取不受影响） |
 | `CALIB ON;\|CALIB OFF;` | `OK calib=on` | 进入/退出校准（同 F3） |
 | `MODE WARP;\|MODE BLEND;` | `OK mode=blend` | 校准模式切换（同 F10，未校准时自动进入校准） |
 | `EDGES ALL;` / `EDGES L;` / `EDGES T+B;` | `OK edges=T+B` | 直接设置参与融合的边（ALL/L/R/T/B/NONE 及 `+` 组合） |
@@ -84,6 +84,8 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/各边 fade·gamma·gain·slope） |
 | `GET displays;` | `OK displays=2;DISPLAY1=1920x1080*;DISPLAY2=1920x1080;` | 列出显示器拓扑（`*` = 主显示器），便于节目控制端挑捕获源 |
 | `SET source=DISPLAY2;` / `SET source=auto;` | `OK source=DISPLAY2` | 指定捕获源桌面（auto = 第一个非输出的显示器）。改动会重建输出窗口；若指定的显示器本身是输出，引擎按防递归规则回退自动选择 |
+| `GET out;` / `SET out=DISPLAY2;` / `SET out=auto;` | `OK out=DISPLAY2` | **per-output 定向**：设定后续 per-output 命令（masks、各边 fade/gamma/gain/slope、rows/cols、flip/rotate、edges 的 GET/SET）只作用于该输出（按显示器名或 label 匹配，名字须存在否则 ERR）。auto = 旧默认（掩码/融合写第一台启用输出，网格操作写全部） |
+| `GET outputs;` | `OK outputs=2;DISPLAY1;DISPLAY2;` | 列出启用输出的短设备名（旧解析端只读首个数字不受影响） |
 | `GET layout;` / `SET layout=2x2;` | `OK layout=2x2` | NxN 平铺布局：按物理位置（先上后下、先左后右）把启用的输出排进网格，第 (r,c) 格只显示源桌面对应窗口，出界部分被裁掉。会重建所有 warp 网格并把内部边界设为融合边 |
 | `GET overlap;` / `SET overlap=15;` | `OK overlap=15` | 相邻投影仪的重叠带宽（单台投影画面的百分比，0–40）。改变时重建 warp 网格，与 layout 配合使用 |
 | `GET engine;` / `SET engine=dxgi;` | `OK engine=desktopduplication` | 查询/选择 warp 引擎；当前构建只有 Desktop Duplication，其余为占位 |
@@ -92,7 +94,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET flip=H;` / `SET flip=V;` | `OK flip=H` | 所有启用输出水平/垂直镜像（对已校正的点阵做变换） |
 | `SET rotate=90;` / `SET rotate=-90;` | `OK rotate=90` | 所有启用输出旋转 90°（顺/逆时针） |
 | `GET curved;` / `SET curved=on;` | `OK curved=on` | 弯曲网格：控制点间 Catmull-Rom 插值（需 Horiz/Vert ≥ 4，否则自动回退双线性）。off = 双线性（默认） |
-| `GET masks;` | `OK masks=2;0.100,0.200,0.300,0.400;…` | 列出第一个启用输出的黑位掩码矩形（归一化 0..1，x,y,w,h） |
+| `GET masks;` | `OK masks=2;0.100,0.200,0.300,0.400;…` | 列出命令目标输出（默认第一个启用输出）的黑位掩码矩形（归一化 0..1，x,y,w,h） |
 | `SET mask.add=x,y,w,h;` / `SET mask.set=i,x,y,w,h;` | `OK masks=2` | 新增 / 按索引（0 基）改写掩码矩形；值域 0..1 越界报 ERR，w/h 自动限幅保证矩形不出屏；上限 8 个；下一帧生效并随 Save Config 持久化 |
 | `SET mask.del=i;` / `SET mask.clear;` | `OK masks=1` / `OK masks=0` | 删除指定索引 / 清空全部掩码 |
 | `SET mask.load=x,y,w,h x,y,w,h …;` | `OK masks=3` | 批量导入并整体替换掩码列表（矩形间用空格分隔——分号是协议终结符；校验与限幅规则同 mask.add，超过 8 个报 ERR） |
