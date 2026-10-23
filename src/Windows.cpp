@@ -108,6 +108,7 @@ static LRESULT CALLBACK MagWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
 static std::vector<HWND> g_magTests;    // MAG test-pattern overlays (UI thread)
+static std::vector<HWND> g_magBlends;   // MAG edge-blend overlays (UI thread)
 constexpr UINT WM_MAGBLEND = WM_APP + 13;   // MAG blend overlays resync (defined
                                             // before requestMagBlendSync uses it)
 
@@ -640,7 +641,6 @@ static void syncMagTestOverlays(bool on) {
 // rides on top of the feed - same edge mask / fade semantics as the DXGI
 // shader (edges bits L/R/T/B = 1/2/4/8, fade = fraction of the dimension).
 static const wchar_t* MAGBLEND_CLASS = L"IWN_MagBlendWnd";
-static std::vector<HWND> g_magBlends;   // MAG edge-blend overlays (UI thread)
 
 static LRESULT CALLBACK MagBlendWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);   // painted at creation/sync
@@ -765,6 +765,12 @@ static void syncMagBlendOverlays() {
     }
 }
 
+// ------------------------------------------------------------------
+// Control window
+// ------------------------------------------------------------------
+static const wchar_t* CTL_CLASS = L"IWN_ControlWnd";
+static HWND g_ctl = nullptr;
+
 void requestMagBlendSync() {
     // any thread: the sync itself touches windows, so always marshal to the
     // UI thread even when already on it (PostMessage defers past the caller's
@@ -772,11 +778,6 @@ void requestMagBlendSync() {
     if (g_ctl) PostMessageW(g_ctl, WM_MAGBLEND, 0, 0);
 }
 
-// ------------------------------------------------------------------
-// Control window
-// ------------------------------------------------------------------
-static const wchar_t* CTL_CLASS = L"IWN_ControlWnd";
-static HWND g_ctl = nullptr;
 static HWND g_list = nullptr, g_status = nullptr, g_statusInfo = nullptr;
 static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
