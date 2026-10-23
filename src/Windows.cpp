@@ -634,11 +634,16 @@ static void syncMagTestOverlays(bool on) {
             r.left, r.top, r.right - r.left, r.bottom - r.top,
             p.first, nullptr, GetModuleHandleW(nullptr), nullptr);
         if (!ov) continue;
-        // sink below the mask/blend overlays (shader order: pattern, then
-        // mask zeroes it, then blend weights multiply) whenever it is
-        // (re)created mid-session while they already exist
-        SetWindowPos(ov, HWND_BOTTOM, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // slot the test pattern below the mask/blend overlays (shader order:
+        // pattern, then mask zeroes it, then blend weights multiply) WITHOUT
+        // HWND_BOTTOM - leaving the topmost band would clear WS_EX_TOPMOST.
+        // If neither overlay exists yet, later creation lands above anyway.
+        HWND above = g_magMasks.empty() ?
+            (g_magBlends.empty() ? nullptr : g_magBlends.back()) :
+            g_magMasks.back();
+        if (above)
+            SetWindowPos(ov, above, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
         auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
                                            "SetWindowDisplayAffinity");
