@@ -378,10 +378,12 @@ void createOutputWindows() {
         }
         // WS_EX_NOACTIVATE: clicking the output never raises it above the
         // console and never steals keyboard focus (hotkeys handle F3/F10/Esc).
-        // In-place overlay adds WS_EX_LAYERED|WS_EX_TRANSPARENT so the mouse
-        // falls through to the desktop underneath the warped picture.
+        // In-place overlay adds WS_EX_LAYERED always; WS_EX_TRANSPARENT only
+        // when NOT calibrating (the bypass in refreshInplaceStyles - points
+        // must be draggable during calibration even with the overlay on).
         HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE |
-                                    (inplace ? (WS_EX_LAYERED | WS_EX_TRANSPARENT) : 0),
+                                    (inplace ? WS_EX_LAYERED : 0) |
+                                    ((inplace && !g_calib.load()) ? WS_EX_TRANSPARENT : 0),
             OUT_CLASS,
             title.c_str(), WS_POPUP | WS_VISIBLE,
             r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
@@ -625,7 +627,8 @@ void refreshStatusBar() {
     int cur = (sel >= 0 && sel < nProj) ? sel + 1 : (nProj > 0 ? 1 : 0);
     wsprintfW(l1, L"Projector: %d [%d]%s%s", nProj, cur,
               g_previewMode.load() ? L"   Preview: ON" : L"",
-              g_inplace.load() ? L"   In-place: ON" : L"");
+              g_inplace.load() ? (g_calib.load() ? L"   In-place: CALIB (click-through bypassed)"
+                                                 : L"   In-place: ON") : L"");
     // wsprintfW (user32) has no floating point support -> use the CRT here
     _snwprintf_s(l2, 160, _TRUNCATE, L"Mode: %s   Snapshot: %s",
                  nProj == 0 ? L"- (no projector assigned)"
@@ -650,6 +653,20 @@ void refreshStatusBar() {
     SetWindowTextW(g_statusInfo, all);
 }
 
+// Click-through bypass: while calibration is active, the in-place overlay
+// windows drop WS_EX_TRANSPARENT so the user can drag warp/blend handles
+// directly on the overlay (1x1 main-screen correction without toggling the
+// overlay off first). Leaving calibration restores the pass-through.
+static void refreshInplaceStyles() {
+    bool transparent = g_inplace.load() && !g_calib.load();
+    for (auto& w : g_outWins) {
+        LONG_PTR ex = GetWindowLongPtrW(w.first, GWL_EXSTYLE);
+        LONG_PTR want = transparent ? (ex | WS_EX_TRANSPARENT)
+                                    : (ex & ~WS_EX_TRANSPARENT);
+        if (want != ex) SetWindowLongPtrW(w.first, GWL_EXSTYLE, want);
+    }
+}
+
 void setCalibrationMode(bool on) {
     bool was = g_calib.exchange(on);
     if (was == on) return;
@@ -664,6 +681,7 @@ void setCalibrationMode(bool on) {
         UnregisterHotKey(nullptr, 3);
         UnregisterHotKey(nullptr, 6);
     }
+    refreshInplaceStyles();   // drop / restore click-through (no-op if off)
     refreshStatusBar();
 }
 
@@ -674,7 +692,9 @@ void toggleCalibration() {
     } else {
         if (g_outWins.empty()) createOutputWindows();
         setCalibrationMode(true);
-        setStatus(L"Calibration ON: drag green points (warp), F10 = blend mode, Esc = exit.");
+        setStatus(g_inplace.load()
+            ? L"Calibration ON: click-through bypassed, drag the points directly. Esc to exit."
+            : L"Calibration ON: drag green points (warp), F10 = blend mode, Esc = exit.");
     }
 }
 
@@ -2178,9 +2198,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             } else if (id == IDM_VIEW_HIDE) {
                 ShowWindow(hwnd, SW_HIDE);
             } else if (id == IDM_WARP_ALIGN) {
-                if (g_outWins.empty()) createOutputWindows();
-                setCalibrationMode(true);
-                setStatus(L"Calibration ON: drag green points (warp), F10 = blend mode, Esc = exit.");
+                // toggle (F3 semantics): enter AND leave calibration; with the
+                // in-place overlay on, leaving restores the click-through
+                toggleCalibration();
             } else if (id == IDM_WARP_EDGES) {
                 cycleBlendEdges();
             } else if (id == IDM_WARP_SNAP) {
