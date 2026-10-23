@@ -752,17 +752,33 @@ void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
             idx.insert(idx.end(), tri, tri + 6);
         }
 
-    if (!oc.meshVB) {
+    // The vertex/index buffers must be sized for THIS grid. They used to be
+    // created once and reused: growing the grid later (SET rows/cols, the
+    // layout editor) then memcpy'd MORE vertices than the buffer held -
+    // an out-of-bounds write into driver memory that killed the render
+    // thread with an access violation right after the rebuild.
+    if (oc.meshVB) { oc.meshVB->Release(); oc.meshVB = nullptr; }
+    if (oc.meshIB) { oc.meshIB->Release(); oc.meshIB = nullptr; }
+    {
         D3D11_BUFFER_DESC bd{};
         bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         bd.ByteWidth = (UINT)(vtx.size() * sizeof(MeshVtx));
-        m_dev->CreateBuffer(&bd, nullptr, &oc.meshVB);
+        if (FAILED(m_dev->CreateBuffer(&bd, nullptr, &oc.meshVB))) {
+            dbgLog("mesh: CreateBuffer(VB) FAILED");
+            oc.indexCount = 0;
+            return;
+        }
         D3D11_BUFFER_DESC ibd = bd;
         ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
         ibd.ByteWidth = (UINT)(idx.size() * sizeof(uint32_t));
-        m_dev->CreateBuffer(&ibd, nullptr, &oc.meshIB);
+        if (FAILED(m_dev->CreateBuffer(&ibd, nullptr, &oc.meshIB))) {
+            dbgLog("mesh: CreateBuffer(IB) FAILED");
+            oc.meshVB->Release(); oc.meshVB = nullptr;
+            oc.indexCount = 0;
+            return;
+        }
     }
     D3D11_MAPPED_SUBRESOURCE mp{};
     m_ctx->Map(oc.meshVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp);
