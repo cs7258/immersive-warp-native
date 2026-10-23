@@ -1018,7 +1018,7 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
         m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         m_ctx->DrawIndexed(oc.indexCount, 0, 0);
     }
-    if (g_calib.load() && (oc.overlayLineVtx || oc.overlayTriVtx)) {
+    if ((g_calib.load() || g_probe.load()) && (oc.overlayLineVtx || oc.overlayTriVtx)) {
         m_ctx->VSSetShader(m_vsOv, nullptr, 0);
         m_ctx->PSSetShader(m_psOv, nullptr, 0);
         UINT stride = sizeof(OvVtx), off = 0;
