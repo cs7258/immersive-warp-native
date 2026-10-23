@@ -81,6 +81,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
 | `SET left.gain=0.8;` / `SET left.slope=0.3;` | `OK left.gain=0.8` | 融合曲线增益/陡度（gain 0–2、slope 0–1；0/0 = 线性斜坡，slope=1 为硬切换） |
 | `SET testpattern=off;` | `OK testpattern=off` | 切换测试图 |
+| `GET color;` / `SET color=1.2,1.0,0.8,1.5,0.9;` | `OK color=1.200,1.000,0.800,1.500,0.900` | 命令目标输出的色彩调节：gammaR,gammaG,gammaB（0.2–3.0）+ bright,contrast（0.2–2.0），越界自动限幅到滑杆范围；遵循 `SET out=` 定向 |
 | `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/out/各边 fade·gamma·gain·slope） |
 | `GET config;` | `OK sampling=8;…;out0.dev=DISPLAY1;out0.rows=10;out0.left.fade=0.150;out0.masks=1 0.1,0.2,0.3,0.4;…;calib=off;out=auto` | **全量状态导出**：全局键 + 每输出一个 `outN.*` 块（网格密度、edges、四边融合参数、颜色调节、掩码列表——矩形间用空格分隔），与 STATUS 同为 `key=value;` 配对格式，一次往返镜像全部 UI 状态 |
 | `GET displays;` | `OK displays=2;DISPLAY1=1920x1080*;DISPLAY2=1920x1080;` | 列出显示器拓扑（`*` = 主显示器），便于节目控制端挑捕获源 |

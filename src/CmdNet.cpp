@@ -227,6 +227,16 @@ static std::string dispatch(std::string line) {
             }
             return s + "\n";
         }
+        if (k == "color") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            OutputCfg* o = targetOutputLocked();
+            if (!o) return "ERR no output (SET out=<name>?)\n";
+            char b[80];
+            sprintf_s(b, "OK color=%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                      o->color.gammaR, o->color.gammaG, o->color.gammaB,
+                      o->color.bright, o->color.contrast);
+            return b;
+        }
         if (k == "presets") return listPresets();
         if (k == "rows" || k == "cols") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -578,6 +588,27 @@ static std::string dispatch(std::string line) {
                 return rep;
             }
             return "ERR SET mask (add|set|load|del|clear)\n";
+        }
+        // per-output color adjustment (gamma RGB + brightness/contrast).
+        // Same clamps as the color dialog's sliders: bright/contrast 0.2..2.0,
+        // gamma 0.2..3.0. Targets the selected output, else the first enabled.
+        if (key == "color") {
+            float gr, gg, gb, br, ct;
+            if (sscanf_s(val.c_str(), "%f,%f,%f,%f,%f", &gr, &gg, &gb, &br, &ct) != 5)
+                return "ERR SET color (gammaR,gammaG,gammaB,bright,contrast)\n";
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                OutputCfg* o = targetOutputLocked();
+                if (!o) return "ERR no output (SET out=<name>?)\n";
+                o->color.gammaR  = clampf(gr, 0.2f, 3.0f);
+                o->color.gammaG  = clampf(gg, 0.2f, 3.0f);
+                o->color.gammaB  = clampf(gb, 0.2f, 3.0f);
+                o->color.bright  = clampf(br, 0.2f, 2.0f);
+                o->color.contrast = clampf(ct, 0.2f, 2.0f);
+                g_rev++;
+            }
+            refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
+            return "OK color=" + val + "\n";
         }
         // grid density (REBUILDS each warp grid, dropping manual point edits,
         // same as the Configure dialog's Apply). Targets the selected output
