@@ -58,6 +58,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 
 - **图片源**："Load image..." 选择 PNG/JPG/BMP（系统 WIC 解码），勾选 "Image source" 后图片替代桌面捕获作为校正内容，几何/融合校准直接在真实图像上做。宽高比不同时自动信箱式适配（多余区域为黑）。
 - **窗口化预览**：勾选 "Windowed preview (single screen)" 后输出变为 60% 大小的可拖动窗口，并通过 `WDA_EXCLUDEFROMCAPTURE` 将自身从桌面捕获中排除——因此单显示器也能实时扭曲桌面画面且不产生画面递归（捕获帧中该窗口区域为黑，属预期行为）。Win10 2004 之前系统无此 API 时自动禁用捕获，回退测试图/图片源。
+- **原位覆盖（in-place overlay）**：Displays 页勾选 "In-place overlay (fullscreen, click-through)"（或 CMDNET `INPLACE ON`）后，输出窗口无边框铺满整台显示器、鼠标点击直接穿透到下面的桌面、且从捕获中排除——扭曲结果视觉上就是桌面本身，这就是 **1x1 主屏异型校正** 的日常用法。控制台始终置顶可随时关掉；做几何校准时建议先关覆盖（穿透状态拖不了控制点），校完再开。
 
 ## CMDNET TCP 控制服务（演出集成）
 
@@ -82,6 +83,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET left.gain=0.8;` / `SET left.slope=0.3;` | `OK left.gain=0.8` | 融合曲线增益/陡度（gain 0–2、slope 0–1；0/0 = 线性斜坡，slope=1 为硬切换） |
 | `GET perf;` | `OK perf=uptime=123;frames=4567;fps=59.9;outputs=1;running=1` | 运行健康诊断：进程运行秒数、累计渲染帧数、滚动 1 秒平均帧率（空闲/无输出时 0.0）、启用输出数、是否运行中（enabled 或 preview） |
 | `PROBE ON;` / `PROBE OFF;` / `PROBE;` / `GET probe;` / `SET probe=on;` | `OK probe=on` | **相机对位探针**：在每个 warp 目标点画白色十字标记（含中心块，约 24px），校准相机检测十字实际落点后经 `SET warp.load=` 回灌修正。独立于校准模式（calib 关着也显示）；无参数 PROBE 为切换 |
+| `INPLACE ON;` / `INPLACE OFF;` / `INPLACE;` / `GET inplace;` / `SET inplace=on;` | `OK inplace=on` | **原位覆盖（主屏异型校正输出）**：输出窗口无边框覆盖整台显示器 + `WS_EX_TRANSPARENT` 鼠标穿透 + `WDA_EXCLUDEFROMCAPTURE` 捕获排除——扭曲后的桌面看起来就是桌面本身（用户态复刻原版 DWM 桌面扭曲的视觉效果）。切换会重建输出窗口；校准时先关掉（穿透模式下无法拖控制点），控制台窗口置顶可随时操作；随配置持久化 |
 | `SET testpattern=off;` | `OK testpattern=off` | 切换测试图 |
 | `GET color;` / `SET color=1.2,1.0,0.8,1.5,0.9;` | `OK color=1.200,1.000,0.800,1.500,0.900` | 命令目标输出的色彩调节：gammaR,gammaG,gammaB（0.2–3.0）+ bright,contrast（0.2–2.0），越界自动限幅到滑杆范围；遵循 `SET out=` 定向 |
 | `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/out/各边 fade·gamma·gain·slope） |

@@ -9,6 +9,7 @@ std::atomic<int> g_rev{ 1 };
 std::atomic<bool> g_calib{ false };
 std::atomic<int> g_calibMode{ 0 };     // 0 = warp, 1 = blend
 std::atomic<bool> g_previewMode{ false };
+std::atomic<bool> g_inplace{ false };
 std::atomic<bool> g_previewNoCapture{ false };
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_snapshot{ false };
@@ -94,6 +95,7 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "advancedBlend=" << (g_cfg.advancedBlend ? 1 : 0) << "\n";
     os << "enabled=" << (g_cfg.enabled ? 1 : 0) << "\n";
     os << "preview=" << (g_cfg.previewMode ? 1 : 0) << "\n";
+    os << "inplace=" << (g_cfg.inplace ? 1 : 0) << "\n";
     os << "useImage=" << (g_cfg.useImage ? 1 : 0) << "\n";
     os << "image=" << toUtf8(g_cfg.imagePath) << "\n";
     os << "testImg=" << g_cfg.testImg << "\n";
@@ -160,6 +162,7 @@ bool loadConfig(const std::wstring& pathIn) {
         if (key == "testPattern") c.testPattern = val == "1";
         else if (key == "advancedBlend") c.advancedBlend = val == "1";
         else if (key == "preview") c.previewMode = val == "1";
+        else if (key == "inplace") c.inplace = val == "1";
         else if (key == "useImage") c.useImage = val == "1";
         else if (key == "image") c.imagePath = fromUtf8(val);
         else if (key == "testImg") c.testImg = atoi(val.c_str());

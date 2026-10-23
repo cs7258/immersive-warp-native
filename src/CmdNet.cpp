@@ -147,6 +147,7 @@ static std::string dispatch(std::string line) {
         if (k == "mode")     return std::string("OK mode=")     + (g_calibMode.load() == 1 ? "blend" : "warp") + "\n";
         if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
         if (k == "probe")    return std::string("OK probe=")    + (g_probe.load() ? "on" : "off") + "\n";
+        if (k == "inplace")  return std::string("OK inplace=")  + (g_inplace.load() ? "on" : "off") + "\n";
         // remote health monitoring: one line, key=value; pairs (STATUS style)
         if (k == "perf") {
             int nOut = 0;
@@ -234,6 +235,7 @@ static std::string dispatch(std::string line) {
             s += "mode=" + std::string(g_calibMode.load() == 1 ? "blend" : "warp") + ";";
             s += std::string("snapshot=") + (g_snapshot.load() ? "on" : "off") + ";";
             s += std::string("probe=") + (g_probe.load() ? "on" : "off") + ";";
+            s += std::string("inplace=") + (g_inplace.load() ? "on" : "off") + ";";
             s += std::string("autostart=") + (queryAutostart() ? "on" : "off") + ";";
             std::wstring src = currentSourceDevice();   // locks g_cfgMutex itself
             s += "source=" + (src.empty() ? std::string("auto") : shortDev(src)) + ";";
@@ -387,7 +389,23 @@ static std::string dispatch(std::string line) {
                ";testpattern=" + std::string(tp ? "on" : "off") +
                ";source=" + (src.empty() ? std::string("auto") : shortDev(src)) +
                ";out=" + (tgt.empty() ? std::string("auto") : tgt) +
-               ";probe=" + std::string(g_probe.load() ? "on" : "off") + "\n";
+               ";probe=" + std::string(g_probe.load() ? "on" : "off") +
+               ";inplace=" + std::string(g_inplace.load() ? "on" : "off") + "\n";
+    }
+
+    // in-place overlay: fullscreen click-through output over the desktop (the
+    // user-mode stand-in for DWM desktop warping). Toggling rebuilds the
+    // output windows on the UI thread (WM_INPLACESET).
+    if (cmd == "INPLACE") {
+        bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_inplace.load();
+        g_inplace.store(want);
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            g_cfg.inplace = want;
+            g_rev++;
+        }
+        requestInplaceRestyle();
+        return std::string("OK inplace=") + (g_inplace.load() ? "on" : "off") + "\n";
     }
 
     if (cmd == "CALIB") {
@@ -432,6 +450,8 @@ static std::string dispatch(std::string line) {
     // runs, and refreshStatusBar locks it itself -> call it unlocked.
     auto finishLoad = [&](const std::string& what) -> std::string {
         g_previewMode.store(g_cfg.previewMode);
+        g_inplace.store(g_cfg.inplace);
+        requestInplaceRestyle();   // restyle outputs
         Engine::inst().setSampling(g_cfg.sampling);
         Engine::inst().setTestImage(g_cfg.testImg);   // <0 clears the overlay
         if (!g_cfg.imagePath.empty()) engineLoadImage(g_cfg.imagePath);
@@ -837,6 +857,13 @@ static std::string dispatch(std::string line) {
             }
             if (!applied && key == "probe") {
                 g_probe.store(val == "ON" || val == "1" || val == "true");
+                applied = true;
+            }
+            if (!applied && key == "inplace") {
+                g_inplace.store(val == "ON" || val == "1" || val == "true");
+                // mirror into the persisted config so the style survives a restart
+                g_cfg.inplace = g_inplace.load();
+                requestInplaceRestyle();
                 applied = true;
             }
             if (!applied) return "ERR SET " + key + "\n";

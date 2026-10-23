@@ -79,6 +79,7 @@ struct AppConfig {
     bool advancedBlend = false;
     bool enabled = false;             // Enable Desktop warping
     bool previewMode = false;         // windowed preview (single screen live warp)
+    bool inplace = false;             // in-place overlay: fullscreen click-through output
     bool useImage = false;            // image source instead of pattern/capture
     std::wstring imagePath;
     int testImg = -1;                 // built-in test image library (0..3), -1 = none
@@ -111,6 +112,14 @@ struct AppConfig {
 // ---- global shared state ----
 extern std::atomic<int> g_calibMode;   // 0 = geometrical correction, 1 = edge blending
 extern std::atomic<bool> g_previewMode; // windowed preview (single-screen live warp)
+// in-place overlay: output windows cover their monitor edge-to-edge with
+// WS_EX_TRANSPARENT (mouse clicks fall through to the desktop) and are
+// excluded from capture, so the warped result appears to be the desktop
+// itself - the user-mode stand-in for the original's DWM desktop warping
+extern std::atomic<bool> g_inplace;
+// post WM_INPLACESET to the console so it restyles the output windows
+// (implemented in Windows.cpp; safe from any thread)
+void requestInplaceRestyle();
 // set when WDA_EXCLUDEFROMCAPTURE is unavailable: capturing our own display
 // would recursively film the output window, so capture is disabled instead
 extern std::atomic<bool> g_previewNoCapture;

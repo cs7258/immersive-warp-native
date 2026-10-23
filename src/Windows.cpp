@@ -364,6 +364,7 @@ void createOutputWindows() {
         }
         RECT r = displays[i].desktop;
         bool preview = g_previewMode.load();
+        bool inplace = g_inplace.load();
         if (preview) {
             // windowed preview: 60% of the monitor, centered. Combined with
             // WDA_EXCLUDEFROMCAPTURE this allows live desktop warping on a
@@ -374,19 +375,24 @@ void createOutputWindows() {
             r.right = r.left + pw; r.bottom = r.top + ph;
         }
         // WS_EX_NOACTIVATE: clicking the output never raises it above the
-        // console and never steals keyboard focus (hotkeys handle F3/F10/Esc)
-        HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, OUT_CLASS,
+        // console and never steals keyboard focus (hotkeys handle F3/F10/Esc).
+        // In-place overlay adds WS_EX_LAYERED|WS_EX_TRANSPARENT so the mouse
+        // falls through to the desktop underneath the warped picture.
+        HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+                                    (inplace ? (WS_EX_LAYERED | WS_EX_TRANSPARENT) : 0),
+            OUT_CLASS,
             title.c_str(), WS_POPUP | WS_VISIBLE,
             r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
             GetModuleHandleW(nullptr), nullptr);
-        if (preview) {
+        if (preview || inplace) {
             // 0x11 = WDA_EXCLUDEFROMCAPTURE (Win10 2004+), 0x01 = WDA_MONITOR
             typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
             auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity");
             BOOL ok = fn ? fn(hwnd, 0x11) : FALSE;
             if (!ok && fn) ok = fn(hwnd, 0x01);
             g_previewNoCapture.store(!ok);
-            dbgLogLine(std::string("preview: window ") + (ok ? "excluded" : "NOT excluded") +
+            dbgLogLine(std::string(preview ? "preview" : "inplace") + std::string(": window ") +
+                       (ok ? "excluded" : "NOT excluded") +
                        " from capture, rect=" + std::to_string(r.left) + "," + std::to_string(r.top) +
                        " " + std::to_string(r.right - r.left) + "x" + std::to_string(r.bottom - r.top));
         }
@@ -413,6 +419,7 @@ static HWND g_ctl = nullptr;
 static HWND g_list = nullptr, g_status = nullptr, g_statusInfo = nullptr;
 static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
+static HWND g_ckInplace = nullptr;  // in-place overlay (fullscreen click-through)
 static HWND g_ckNet = nullptr;
 static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
 static HWND g_cbLayout = nullptr, g_cbOvl = nullptr, g_cbEng = nullptr;
@@ -450,6 +457,7 @@ static void showTab(int pg) {
 // constexpr so it can be used as a switch case label.
 constexpr UINT WM_SRCSET = WM_APP + 9;
 constexpr UINT WM_LAYSET = WM_APP + 10;
+constexpr UINT WM_INPLACESET = WM_APP + 11;   // in-place overlay toggled off-thread
 static DWORD uiThreadId = 0;
 constexpr UINT WM_TRAYICON = WM_APP + 7;
 static std::mutex g_layMsgMutex;
@@ -588,8 +596,9 @@ void refreshStatusBar() {
     // [n] = which projector is being edited (1-based). refreshList() resets the
     // listbox selection, so fall back to 1 instead of showing [0].
     int cur = (sel >= 0 && sel < nProj) ? sel + 1 : (nProj > 0 ? 1 : 0);
-    wsprintfW(l1, L"Projector: %d [%d]%s", nProj, cur,
-              g_previewMode.load() ? L"   Preview: ON" : L"");
+    wsprintfW(l1, L"Projector: %d [%d]%s%s", nProj, cur,
+              g_previewMode.load() ? L"   Preview: ON" : L"",
+              g_inplace.load() ? L"   In-place: ON" : L"");
     // wsprintfW (user32) has no floating point support -> use the CRT here
     _snwprintf_s(l2, 160, _TRUNCATE, L"Mode: %s   Snapshot: %s",
                  nProj == 0 ? L"- (no projector assigned)"
@@ -840,6 +849,11 @@ void setSourceDisplay(const std::wstring& dev) {
         return;
     }
     applySourceDisplay(dev);
+}
+
+void requestInplaceRestyle() {
+    // post from any thread; the console handles WM_INPLACESET on the UI thread
+    if (g_ctl) PostMessageW(g_ctl, WM_INPLACESET, 0, 0);
 }
 
 // ---- NxN tiled layout -------------------------------------------------------
@@ -1699,7 +1713,10 @@ void refreshTargetComboUI() {
 static void applyLoadedConfig() {
     refreshList();
     g_previewMode.store(g_cfg.previewMode);
+    g_inplace.store(g_cfg.inplace);
     Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(g_ckInplace, g_cfg.inplace ? BST_CHECKED : BST_UNCHECKED);
+    PostMessageW(g_ctl, WM_INPLACESET, 0, 0);   // style change needs a rebuild
     Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
     Engine::inst().setSampling(g_cfg.sampling);
@@ -1765,6 +1782,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         add(PAGE_DISPLAYS, g_ckPreview = CreateWindowW(L"BUTTON", L"Windowed preview (single screen)",
             WS_CHILD | BS_AUTOCHECKBOX, 380, 236, 232, 24,
             hwnd, (HMENU)IDC_CKPREVIEW, nullptr, nullptr));
+        add(PAGE_DISPLAYS, g_ckInplace = CreateWindowW(L"BUTTON",
+            L"In-place overlay (fullscreen, click-through)",
+            WS_CHILD | BS_AUTOCHECKBOX, 16, 296, 320, 24,
+            hwnd, (HMENU)IDC_CKINPLACE, nullptr, nullptr));
 
         // --- Warp & Blend page
         add(PAGE_WARP, CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
@@ -1920,6 +1941,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             Button_SetCheck(g_ckAdv, g_cfg.advancedBlend ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckEnable, g_cfg.enabled ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckInplace, g_cfg.inplace ? BST_CHECKED : BST_UNCHECKED);
+            g_inplace.store(g_cfg.inplace);
             Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckNet, g_cfg.cmdnet ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
@@ -1938,7 +1961,15 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         rebuildForSource();
         return 0;
     }
-    case WM_LAYSET: {   // tiled layout changed from the socket thread
+    case WM_INPLACESET: {   // in-place overlay toggled (UI or socket thread):
+        // only the window style changes, but CreateWindowExW takes the full
+        // ex-style, so rebuild the output windows (idempotent)
+        if (!g_outWins.empty()) { destroyOutputWindows(); createOutputWindows(); }
+        // socket-thread SET must move the checkbox too (UI <-> CMDNET sync)
+        if (g_ckInplace)
+            Button_SetCheck(g_ckInplace, g_inplace.load() ? BST_CHECKED : BST_UNCHECKED);
+        return 0;
+    }    case WM_LAYSET: {   // tiled layout changed from the socket thread
         LayMsg m;
         {
             std::lock_guard<std::mutex> lk(g_layMsgMutex);
@@ -2048,6 +2079,20 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             if (running) { destroyOutputWindows(); createOutputWindows(); }
             setStatus(on ? L"Preview: 60% window, live desktop warp on a single screen. Drag the window to move it."
                          : L"Preview off: fullscreen output.");
+        } else if (id == IDC_CKINPLACE && HIWORD(wp) == BN_CLICKED) {
+            bool on = Button_GetCheck(g_ckInplace) == BST_CHECKED;
+            g_inplace.store(on);
+            if (!on) g_previewNoCapture.store(false);
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.inplace = on;
+                g_rev++;
+            }
+            // rebuild through the message queue so the socket-thread path
+            // (SET inplace=) and the UI path share one rebuild entry point
+            PostMessageW(hwnd, WM_INPLACESET, 0, 0);
+            setStatus(on ? L"In-place overlay: output covers the monitor, mouse clicks pass through. Toggle off here (console stays on top) or via CMDNET."
+                         : L"In-place overlay off: normal output windows.");
         } else if (id == IDC_CKIMAGE && HIWORD(wp) == BN_CLICKED) {
             bool on = Button_GetCheck(g_ckImage) == BST_CHECKED;
             if (on && !engineHasImage()) {
