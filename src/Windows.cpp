@@ -33,6 +33,7 @@ static const wchar_t* OUT_CLASS = L"IWN_OutputWnd";
 static const wchar_t* MAG_CLASS = L"IWN_MagWnd";   // engine=1 magnifier host
 static const wchar_t* MAGTEST_CLASS = L"IWN_MagTestWnd"; // engine=1 test pattern
 static void syncMagTestOverlays(bool on);   // fwd: createOutputWindows calls it
+static void syncMagMaskOverlays();          // fwd: createOutputWindows calls it
 
 // GDI replica of the DXGI test pattern (Engine.cpp testPattern shader):
 // 24x16 checker, 12x8 grid lines, red border, green center cross. Drawn in
@@ -108,6 +109,7 @@ static LRESULT CALLBACK MagWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
 static std::vector<HWND> g_magTests;    // MAG test-pattern overlays (UI thread)
+static std::vector<HWND> g_magMasks;    // MAG black-mask overlays (UI thread)
 static std::vector<HWND> g_magBlends;   // MAG edge-blend overlays (UI thread)
 constexpr UINT WM_MAGBLEND = WM_APP + 13;   // MAG blend overlays resync (defined
                                             // before requestMagBlendSync uses it)
@@ -576,6 +578,10 @@ void createOutputWindows() {
     // MAG test pattern overlays (g_cfgMutex already held; no lock inside)
     if (g_cfg.engine == 1 && g_cfg.testPattern != 0)
         syncMagTestOverlays(true);
+    // MAG black-mask overlays: below the blend overlays (created first),
+    // repaint on their own 250 ms timer after the lock is released
+    if (g_cfg.engine == 1)
+        syncMagMaskOverlays();
     // MAG edge-blend overlays: marshalled so they paint after the lock
     requestMagBlendSync();
     // console always stays on top of the output windows (like the original)
@@ -592,6 +598,9 @@ void destroyOutputWindows() {
     for (HWND t : g_magBlends) magRemoveFilter(t);
     for (HWND t : g_magBlends) DestroyWindow(t);
     g_magBlends.clear();
+    for (HWND t : g_magMasks) magRemoveFilter(t);
+    for (HWND t : g_magMasks) DestroyWindow(t);   // WM_DESTROY kills the timer
+    g_magMasks.clear();
     for (auto& p : g_outWins) DestroyWindow(p.first);
     g_outWins.clear();
     Engine::inst().detachAll();
@@ -625,6 +634,11 @@ static void syncMagTestOverlays(bool on) {
             r.left, r.top, r.right - r.left, r.bottom - r.top,
             p.first, nullptr, GetModuleHandleW(nullptr), nullptr);
         if (!ov) continue;
+        // sink below the mask/blend overlays (shader order: pattern, then
+        // mask zeroes it, then blend weights multiply) whenever it is
+        // (re)created mid-session while they already exist
+        SetWindowPos(ov, HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
         auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
                                            "SetWindowDisplayAffinity");
@@ -633,6 +647,128 @@ static void syncMagTestOverlays(bool on) {
         magAddFilter(ov);
     }
     dbgLogLine("syncMagTestOverlays: " + std::to_string(g_magTests.size()) + " overlay(s)");
+}
+
+// ------------------------------------------------------------------
+// MAG mask overlays: per-host layered windows painting the OutputCfg black
+// rectangles (same semantics as the DXGI shader: region forced to black,
+// premultiplied alpha). The overlay lives as long as its host and repaints
+// from a 250 ms timer only when the mask list actually changed - the change
+// entry points (SET mask.*, config load) are numerous, so a poll beats
+// instrumenting each one. Created BEFORE the blend overlays so blending
+// stays on top (shader order: mask zeroes the texel, blend weights multiply).
+static const wchar_t* MAGMASK_CLASS = L"IWN_MagMaskWnd";
+
+static bool paintMagMask(HWND ov, HWND host);   // fwd: WM_TIMER handler calls it
+
+static LRESULT CALLBACK MagMaskWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_TIMER && wp == 1) {
+        paintMagMask(hwnd, GetWindow(hwnd, GW_OWNER));
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// paint the host's cfg.masks as opaque black over a fully transparent layer.
+// Returns true when something was repainted; the FNV-1a hash of the rect
+// list is cached in the overlay's GWLP_USERDATA to skip identical frames.
+bool paintMagMask(HWND ov, HWND host) {
+    if (!ov || !host) return false;
+    OutWinState* st = (OutWinState*)GetWindowLongPtrW(host, GWLP_USERDATA);
+    if (!st) return false;
+    auto displays = enumerateDisplays();
+    if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return false;
+    std::vector<MaskRect> masks;
+    unsigned hash = 2166136261u;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs)
+            if (o.enabled && o.deviceName == displays[st->displayIdx].deviceName) {
+                masks = o.masks;
+                break;
+            }
+    }
+    for (auto& m : masks) {
+        auto mix = [&hash](float f) {
+            unsigned v;
+            memcpy(&v, &f, 4);
+            hash = (hash ^ v) * 16777619u;
+        };
+        mix(m.x); mix(m.y); mix(m.w); mix(m.h);
+    }
+    if ((unsigned)GetWindowLongPtrW(ov, GWLP_USERDATA) == hash) return false;
+    RECT wr{};
+    GetWindowRect(host, &wr);
+    int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    if (w <= 0 || h <= 0) return false;
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = w; bi.bV5Height = -h; bi.bV5Planes = 1; bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00; bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC sdc = GetDC(nullptr);
+    HDC mdc = CreateCompatibleDC(sdc);
+    HBITMAP bmp = CreateDIBSection(sdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bmp && bits) {
+        auto* px = (unsigned*)bits;
+        for (auto& m : masks) {
+            // premultiplied opaque black = alpha 255, color 0
+            unsigned black = 0xFF000000;
+            int x0 = (int)(m.x * w), y0 = (int)(m.y * h);
+            int x1 = (int)((m.x + m.w) * w), y1 = (int)((m.y + m.h) * h);
+            if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+            if (x1 > w) x1 = w; if (y1 > h) y1 = h;
+            for (int y = y0; y < y1; y++) {
+                unsigned* row = px + (size_t)y * w;
+                for (int x = x0; x < x1; x++) row[x] = black;
+            }
+        }
+        SelectObject(mdc, bmp);
+        POINT src{ 0, 0 };
+        SIZE sz{ w, h };
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        UpdateLayeredWindow(ov, sdc, nullptr, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+        SetWindowLongPtrW(ov, GWLP_USERDATA, (LONG_PTR)hash);
+    }
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(mdc);
+    ReleaseDC(nullptr, sdc);
+    return true;
+}
+
+// UI thread: one always-on mask overlay per MAG host (idempotent). Callers
+// decide the engine before calling; safe under g_cfgMutex (the paint itself
+// happens later on the timer, after the lock is released).
+static void syncMagMaskOverlays() {
+    WNDCLASSW tc{};
+    tc.lpfnWndProc = MagMaskWndProc;
+    tc.hInstance = GetModuleHandleW(nullptr);
+    tc.lpszClassName = MAGMASK_CLASS;
+    RegisterClassW(&tc);
+    for (auto& p : g_outWins) {
+        bool have = false;
+        for (HWND t : g_magMasks) if (GetWindow(t, GW_OWNER) == p.first) { have = true; break; }
+        if (have) continue;
+        RECT r; GetWindowRect(p.first, &r);
+        HWND ov = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+            MAGMASK_CLASS, L"MASK", WS_POPUP | WS_VISIBLE,
+            r.left, r.top, r.right - r.left, r.bottom - r.top,
+            p.first, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!ov) continue;
+        SetWindowLongPtrW(ov, GWLP_USERDATA, 0);   // hash cache: forces first paint
+        SetTimer(ov, 1, 250, nullptr);
+        typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
+        auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                           "SetWindowDisplayAffinity");
+        if (fn) fn(ov, 0x11);
+        g_magMasks.push_back(ov);
+        magAddFilter(ov);
+    }
+    dbgLogLine("syncMagMaskOverlays: " + std::to_string(g_magMasks.size()) + " overlay(s)");
 }
 
 // ------------------------------------------------------------------

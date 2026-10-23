@@ -113,7 +113,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET rotate=90;` / `SET rotate=-90;` | `OK rotate=90` | 所有启用输出旋转 90°（顺/逆时针） |
 | `GET curved;` / `SET curved=on;` | `OK curved=on` | 弯曲网格：控制点间 Catmull-Rom 插值（需 Horiz/Vert ≥ 4，否则自动回退双线性）。off = 双线性（默认） |
 | `GET masks;` | `OK masks=2;0.100,0.200,0.300,0.400;…` | 列出命令目标输出（默认第一个启用输出）的黑位掩码矩形（归一化 0..1，x,y,w,h） |
-| `SET mask.add=x,y,w,h;` / `SET mask.set=i,x,y,w,h;` | `OK masks=2` | 新增 / 按索引（0 基）改写掩码矩形；值域 0..1 越界报 ERR，w/h 自动限幅保证矩形不出屏；上限 8 个；下一帧生效并随 Save Config 持久化 |
+| `SET mask.add=x,y,w,h;` / `SET mask.set=i,x,y,w,h;` | `OK masks=2` | 新增 / 按索引（0 基）改写掩码矩形；值域 0..1 越界报 ERR，w/h 自动限幅保证矩形不出屏；上限 8 个；下一帧生效并随 Save Config 持久化。**MAG 引擎同语义生效**：per-host 分层 overlay 画黑色矩形，内容由 250 ms 轮询自动跟上（无需显式重同步） |
 | `SET mask.del=i;` / `SET mask.clear;` | `OK masks=1` / `OK masks=0` | 删除指定索引 / 清空全部掩码 |
 | `SET mask.load=x,y,w,h x,y,w,h …;` | `OK masks=3` | 批量导入并整体替换掩码列表（矩形间用空格分隔——分号是协议终结符；校验与限幅规则同 mask.add，超过 8 个报 ERR） |
 | `AUTOSTART ON;\|AUTOSTART OFF;` | `OK autostart=on` | 开机自启（写入 HKCU Run，无需管理员） |
