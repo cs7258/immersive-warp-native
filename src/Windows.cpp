@@ -648,8 +648,19 @@ void refreshStatusBar() {
     else
         wsprintfW(l5, L"Capture source: %s (pinned)", srcDev.c_str());
 
-    wchar_t all[800];
-    wsprintfW(all, L"%s\r\n%s\r\n%s\r\n%s\r\n%s", l1, l2, l3, l4, l5);
+    // live render health (same numbers the CMDNET GET perf reports)
+    wchar_t l6[128];
+    {
+        unsigned long long fr = engineFrames();
+        unsigned long long up = engineUptimeMs() / 1000;
+        _snwprintf_s(l6, 128, _TRUNCATE,
+                     L"Engine: %.1f fps   %llu frames   uptime %02u:%02u:%02u",
+                     engineFps(), fr,
+                     (unsigned)(up / 3600), (unsigned)((up / 60) % 60), (unsigned)(up % 60));
+    }
+
+    wchar_t all[960];
+    wsprintfW(all, L"%s\r\n%s\r\n%s\r\n%s\r\n%s\r\n%s", l1, l2, l3, l4, l5, l6);
     SetWindowTextW(g_statusInfo, all);
 }
 
@@ -834,6 +845,7 @@ void notifyOutputRaised() {
 #define IDC_TABS       1032   // main-console tab strip
 #define IDC_CKINPLACE  1033   // in-place overlay (fullscreen click-through)
 #define IDC_SCHEMATIC  1034   // Displays page: owner-drawn output schematic
+#define IDC_STATUSINFO 1035   // structured status block (testable by id)
 // (menu bar IDM_* ids live above showTab, see the note there)
 
 static void refreshList() {
@@ -2125,16 +2137,18 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ComboBox_AddString(g_cbEng, L"DWM Magnification (n/a)");
         ComboBox_AddString(g_cbEng, L"NVAPI clone (n/a)");
         ComboBox_AddString(g_cbEng, L"DOPP (n/a)");
-        // structured status block (Projector / Mode / Color balancing / edges)
+        // structured status block (Projector / Mode / Color balancing / edges
+        // / capture source / Engine fps+uptime), refreshed live by a 1s timer
         g_statusInfo = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 456, 612, 56,
-            hwnd, nullptr, nullptr, nullptr);
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 452, 612, 74,
+            hwnd, (HMENU)IDC_STATUSINFO, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 514, 612, 32,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 530, 612, 22,
             hwnd, nullptr, nullptr, nullptr);
         applyDarkThemeRecursive(hwnd);   // DarkMode_Explorer on every child
         syncInplaceUI(hwnd);             // initial View-menu check state
         showTab(PAGE_DISPLAYS);
+        SetTimer(hwnd, 1, 1000, nullptr);   // 1s: refresh Engine fps/uptime line
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             Button_SetCheck(g_ckTest, g_cfg.testPattern ? BST_CHECKED : BST_UNCHECKED);
@@ -2527,6 +2541,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         }
         break;
     }
+    case WM_TIMER:                     // 1s status refresh (fps/uptime live)
+        if (wp == 1 && g_statusInfo) refreshStatusBar();
+        return 0;
     case WM_DRAWITEM: {                // Displays page output schematic
         DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
         if (dis && dis->CtlID == IDC_SCHEMATIC) { drawDisplaySchematic(dis); return TRUE; }
@@ -2566,6 +2583,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     case WM_DESTROY:
         g_ctl = nullptr;
+        KillTimer(hwnd, 1);
         trayRemove();
         UnregisterHotKey(nullptr, 1);
         UnregisterHotKey(nullptr, 2);
