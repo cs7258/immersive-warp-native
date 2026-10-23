@@ -509,9 +509,12 @@ bool Engine::createDuplication(OutputCtx& oc) {
             break;
         }
         if (!src) dbgLog("dupl: requested source not usable, falling back");
-    } else if (preview && oc.displayIdx >= 0 && oc.displayIdx < (int)displays.size()) {
-        // 2) windowed preview: the output window is small and marked
-        // WDA_EXCLUDEFROMCAPTURE, so capturing its own display does NOT recurse
+    }
+    // 2) windowed preview: the output window is small and marked
+    //    WDA_EXCLUDEFROMCAPTURE, so capturing its own display does NOT recurse.
+    //    Used when no explicit source is set, or when the pinned one was
+    //    rejected above (e.g. it is one of the outputs).
+    if (!src && preview && oc.displayIdx >= 0 && oc.displayIdx < (int)displays.size()) {
         if (g_previewNoCapture.load()) {
             dbgLog("dupl: preview mode but capture exclusion unavailable -> no capture");
             return false;
