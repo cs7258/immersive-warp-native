@@ -22,9 +22,9 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 ## 使用（同原版流程）
 
 1. 投影仪扩展桌面接入 Windows
-2. 控制台列表中选中显示器 → "Toggle selected as projector"
+2. 控制台 **Displays** 页列表中选中显示器 → "Toggle selected as projector"（控制台为多页结构，对齐原版：**Displays / Warp & Blend / Image & Test / Settings** 四页 + 底部常驻条 "Configure alignment" / "Enable Desktop warping" / 扭曲引擎下拉 / 状态区，深色主题）
 3. "Source:" 选择捕获源桌面（默认 `Auto` = 第一个「不是输出」的显示器；多屏机器上可指定具体某个桌面作为画面来源，改动后输出窗口自动重建）。输出窗口标题带捕获源标记 `<label>   [src DISPLAY2]`，便于节目控制/测试工具按标题识别窗口
-4. 多台投影仪做拼接墙时，用 "Layout:" 选 NxN 平铺（如 `2x2`），"Overlap:" 设相邻重叠带宽（0–40%）：程序按显示器物理位置把启用的输出排进网格，每台只显示源桌面对应窗口，内部边界自动设为融合边。注意这会重置各输出的 warp 网格，先 Layout 再校准
+4. 多台投影仪做拼接墙时，用 "Layout:" 选 NxN 平铺（如 `2x2`），"Overlap:" 设相邻重叠带宽（0–40%）：程序按显示器物理位置把启用的输出排进网格，每台只显示源桌面对应窗口，内部边界自动设为融合边。**`1x1` = 单输出异型校正**：主屏/单屏原位输出，不设融合边（需要融合边可用 `SET edges=ALL` 手动开）。注意这会重置各输出的 warp 网格，先 Layout 再校准
 5. "Start Output" 启动全屏输出（先勾 Test pattern 显示测试图）
 6. "Configure alignment" 或 F3 进入校准：
    - 拖绿色控制点做几何校正（方向键微调，Shift+方向键大步）

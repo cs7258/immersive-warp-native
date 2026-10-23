@@ -425,6 +425,19 @@ static std::vector<std::wstring> g_srcDevs;
 static std::vector<std::string> g_tgtShort;
 static bool g_tgtBusy = false;      // suppress CBN_SELCHANGE during programmatic fill
 
+// Main-console tab strip: controls are tagged to a page at creation time and
+// shown/hidden together (1:1 with the original's multi-page console).
+static std::vector<HWND> g_pages[4];
+static HWND g_tab = nullptr;
+enum { PAGE_DISPLAYS = 0, PAGE_WARP, PAGE_IMAGE, PAGE_SETTINGS, PAGE_COUNT };
+static void showTab(int pg) {
+    if (pg < 0 || pg >= PAGE_COUNT) pg = 0;
+    for (int i = 0; i < PAGE_COUNT; i++)
+        for (HWND h : g_pages[i])
+            ShowWindow(h, i == pg ? SW_SHOW : SW_HIDE);
+    // dark accent on the status line mirrors the original's orange highlights
+}
+
 // tray ids must not collide with control ids 1001..1021
 #define IDM_TRAY_SHOW  2001
 #define IDM_TRAY_START 2002
@@ -729,6 +742,7 @@ void notifyOutputRaised() {
 #define IDC_PRESETLOAD 1029
 #define IDC_PRESETDEL  1030
 #define IDC_CBTARGET   1031   // per-output command target dropdown (SET out=)
+#define IDC_TABS       1032   // main-console tab strip
 
 static void refreshList() {
     if (!g_list) return;
@@ -863,7 +877,10 @@ static void applyLayoutLocked() {   // g_cfgMutex held
         // blend only on interior boundaries of the tile grid
         o.edges = (c > 0 ? 1 : 0) | (c < C - 1 ? 2 : 0)
                 | (r > 0 ? 4 : 0) | (r < R - 1 ? 8 : 0);
-        if (R == 1 && C == 1) o.edges = 15;   // no layout: keep all edges on
+        if (R == 1 && C == 1) o.edges = 0;   // 1x1: no interior boundary, no
+                                             // forced fade (in-place correction
+                                             // on the main screen; blending can
+                                             // still be set via SET edges=ALL)
     }
     g_rev++;
 }
@@ -1705,173 +1722,198 @@ static void applyLoadedConfig() {
 static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        g_list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL,
-            10, 10, 420, 200, hwnd, (HMENU)IDC_LIST, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Toggle selected as projector",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 220, 200, 30,
-            hwnd, (HMENU)IDC_TOGGLE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Start Output",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 220, 220, 100, 30,
-            hwnd, (HMENU)IDC_START, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Stop Output",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 330, 220, 100, 30,
-            hwnd, (HMENU)IDC_STOP, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Configure alignment (F3)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 260, 200, 30,
-            hwnd, (HMENU)IDC_CALIB, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Save Config",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 220, 260, 100, 30,
-            hwnd, (HMENU)IDC_SAVE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Load Config",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 330, 260, 100, 30,
-            hwnd, (HMENU)IDC_LOAD, nullptr, nullptr);
-        g_ckEnable = CreateWindowW(L"BUTTON", L"Enable Desktop warping",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 300, 220, 24,
-            hwnd, (HMENU)IDC_CKENABLE, nullptr, nullptr);
-        g_ckTest = CreateWindowW(L"BUTTON", L"Test pattern",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 240, 300, 140, 24,
-            hwnd, (HMENU)IDC_CKTEST, nullptr, nullptr);
-        g_ckAdv = CreateWindowW(L"BUTTON", L"Advanced blending",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 390, 300, 160, 24,
-            hwnd, (HMENU)IDC_CKADV, nullptr, nullptr);
-        g_ckPreview = CreateWindowW(L"BUTTON", L"Windowed preview (single screen)",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 330, 240, 24,
-            hwnd, (HMENU)IDC_CKPREVIEW, nullptr, nullptr);
-        g_ckImage = CreateWindowW(L"BUTTON", L"Image source",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 250, 330, 120, 24,
-            hwnd, (HMENU)IDC_CKIMAGE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Load image...",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 375, 330, 100, 24,
-            hwnd, (HMENU)IDC_LOADIMG, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Clear",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 480, 330, 60, 24,
-            hwnd, (HMENU)IDC_CLEARIMG, nullptr, nullptr);
-        g_imgLabel = CreateWindowW(L"STATIC", L"Image: (none)",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 362, 245, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Patterns:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 262, 362, 62, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        g_cbImg = CreateWindowW(L"COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            326, 358, 214, 200,
-            hwnd, (HMENU)IDC_CBIMG, nullptr, nullptr);
-        ComboBox_AddString(g_cbImg, L"Color bars");
-        ComboBox_AddString(g_cbImg, L"Checkerboard");
-        ComboBox_AddString(g_cbImg, L"Gray ramp");
-        ComboBox_AddString(g_cbImg, L"Identity grid");
-        CreateWindowW(L"BUTTON", L"Color adjustment...",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 388, 170, 28,
-            hwnd, (HMENU)IDC_COLOR, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Configure display...",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 190, 388, 180, 28,
-            hwnd, (HMENU)IDC_CFGDLG, nullptr, nullptr);
-        g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 385, 392, 190, 24,
-            hwnd, (HMENU)IDC_CKNET, nullptr, nullptr);
-        g_ckAuto = CreateWindowW(L"BUTTON", L"Start with Windows",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 455, 420, 170, 24,
-            hwnd, (HMENU)IDC_CKAUTO, nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Sampling:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 424, 62, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        g_cbSamp = CreateWindowW(L"COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            76, 420, 150, 200,
-            hwnd, (HMENU)IDC_CBSAMP, nullptr, nullptr);
+        // 1:1 with the original console: multi-page tab strip on top, always-
+        // visible bottom strip (Configure alignment + Enable Desktop warping +
+        // warp-engine selector) + status block. Controls keep their dialog ids;
+        // pages only toggle visibility, so WM_COMMAND automation still works.
+        g_tab = CreateWindowW(WC_TABCONTROLW, L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS,
+            6, 8, 622, 396, hwnd, (HMENU)IDC_TABS, nullptr, nullptr);
+        static const wchar_t* tabTitles[PAGE_COUNT] =
+            { L"Displays", L"Warp & Blend", L"Image & Test", L"Settings" };
+        for (int i = 0; i < PAGE_COUNT; i++) {
+            TCITEMW ti{};
+            ti.mask = TCIF_TEXT;
+            ti.pszText = (LPWSTR)tabTitles[i];
+            TabCtrl_InsertItem(g_tab, i, &ti);
+        }
+        auto add = [](int pg, HWND h) { if (h) g_pages[pg].push_back(h); return h; };
+
+        // --- Displays page: output list + projector controls + capture source
+        add(PAGE_DISPLAYS, CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+            WS_CHILD | LBS_NOTIFY | WS_VSCROLL,
+            16, 44, 410, 180, hwnd, (HMENU)IDC_LIST, nullptr, nullptr));
+        add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Toggle selected as projector",
+            WS_CHILD | BS_PUSHBUTTON, 436, 44, 178, 28,
+            hwnd, (HMENU)IDC_TOGGLE, nullptr, nullptr));
+        add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Start Output",
+            WS_CHILD | BS_PUSHBUTTON, 436, 80, 178, 28,
+            hwnd, (HMENU)IDC_START, nullptr, nullptr));
+        add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Stop Output",
+            WS_CHILD | BS_PUSHBUTTON, 436, 116, 178, 28,
+            hwnd, (HMENU)IDC_STOP, nullptr, nullptr));
+        add(PAGE_DISPLAYS, CreateWindowW(L"STATIC", L"Source:",
+            WS_CHILD | SS_LEFT, 16, 240, 54, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_DISPLAYS, g_cbSrc = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            72, 236, 290, 220,
+            hwnd, (HMENU)IDC_CBSRC, nullptr, nullptr));
+        add(PAGE_DISPLAYS, CreateWindowW(L"STATIC", L"(auto = first display that is not an output)",
+            WS_CHILD | SS_LEFT, 16, 266, 440, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_DISPLAYS, g_ckPreview = CreateWindowW(L"BUTTON", L"Windowed preview (single screen)",
+            WS_CHILD | BS_AUTOCHECKBOX, 380, 236, 232, 24,
+            hwnd, (HMENU)IDC_CKPREVIEW, nullptr, nullptr));
+
+        // --- Warp & Blend page
+        add(PAGE_WARP, CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
+            WS_CHILD | BS_PUSHBUTTON, 16, 44, 200, 28,
+            hwnd, (HMENU)IDC_EDGES, nullptr, nullptr));
+        add(PAGE_WARP, CreateWindowW(L"STATIC", L"Sampling:",
+            WS_CHILD | SS_LEFT, 16, 92, 62, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_WARP, g_cbSamp = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            82, 88, 150, 200,
+            hwnd, (HMENU)IDC_CBSAMP, nullptr, nullptr));
         ComboBox_AddString(g_cbSamp, L"Trilinear");
         ComboBox_AddString(g_cbSamp, L"Anisotropic 4x");
         ComboBox_AddString(g_cbSamp, L"Anisotropic 8x");
-        // NOTE: this used to be placed at (190,388) where it sat exactly on top
-        // of the "TCP control (CMDNET)" checkbox and was therefore invisible.
-        CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 240, 420, 200, 28,
-            hwnd, (HMENU)IDC_EDGES, nullptr, nullptr);
-        // capture source: which desktop gets warped (auto = first non-output)
-        CreateWindowW(L"STATIC", L"Source:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 458, 54, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        g_cbSrc = CreateWindowW(L"COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            66, 454, 300, 220,
-            hwnd, (HMENU)IDC_CBSRC, nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"(auto = first display that is not an output)",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 374, 458, 200, 32,
-            hwnd, nullptr, nullptr, nullptr);
-        // NxN tiled layout + overlap + warp engine
-        CreateWindowW(L"STATIC", L"Layout:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 494, 50, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        g_cbLayout = CreateWindowW(L"COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            62, 490, 74, 220,
-            hwnd, (HMENU)IDC_CBLAYOUT, nullptr, nullptr);
+        add(PAGE_WARP, CreateWindowW(L"STATIC", L"Layout:",
+            WS_CHILD | SS_LEFT, 260, 92, 50, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_WARP, g_cbLayout = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            312, 88, 74, 220,
+            hwnd, (HMENU)IDC_CBLAYOUT, nullptr, nullptr));
         for (int R = 1; R <= 4; R++)
-            for (int C = 1; C <= 4; C++)
-                if (R * C > 1) {
-                    wchar_t t[8];
-                    _snwprintf_s(t, _TRUNCATE, L"%dx%d", C, R);
-                    ComboBox_AddString(g_cbLayout, t);
-                }
-        CreateWindowW(L"STATIC", L"Overlap:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 148, 494, 56, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        g_cbOvl = CreateWindowW(L"COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            206, 490, 66, 220,
-            hwnd, (HMENU)IDC_CBOVL, nullptr, nullptr);
+            for (int C = 1; C <= 4; C++) {
+                // 1x1 included: single-output in-place correction on the main
+                // screen (same entry the original shows in its NxN menu)
+                wchar_t t[8];
+                _snwprintf_s(t, _TRUNCATE, L"%dx%d", C, R);
+                ComboBox_AddString(g_cbLayout, t);
+            }
+        add(PAGE_WARP, CreateWindowW(L"STATIC", L"Overlap:",
+            WS_CHILD | SS_LEFT, 400, 92, 56, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_WARP, g_cbOvl = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            458, 88, 66, 220,
+            hwnd, (HMENU)IDC_CBOVL, nullptr, nullptr));
         for (int p = 0; p <= 40; p += 5) {
             wchar_t t[8];
             wsprintfW(t, L"%d%%", p);
             ComboBox_AddString(g_cbOvl, t);
         }
+        add(PAGE_WARP, CreateWindowW(L"BUTTON", L"Configure display...",
+            WS_CHILD | BS_PUSHBUTTON, 16, 132, 180, 28,
+            hwnd, (HMENU)IDC_CFGDLG, nullptr, nullptr));
+        add(PAGE_WARP, CreateWindowW(L"BUTTON", L"Color adjustment...",
+            WS_CHILD | BS_PUSHBUTTON, 206, 132, 170, 28,
+            hwnd, (HMENU)IDC_COLOR, nullptr, nullptr));
+        add(PAGE_WARP, CreateWindowW(L"STATIC", L"1x1 = single output: in-place warp / blend correction on the main screen.",
+            WS_CHILD | SS_LEFT, 16, 176, 560, 18,
+            hwnd, nullptr, nullptr, nullptr));
+
+        // --- Image & Test page
+        add(PAGE_IMAGE, g_ckTest = CreateWindowW(L"BUTTON", L"Test pattern",
+            WS_CHILD | BS_AUTOCHECKBOX, 16, 44, 140, 24,
+            hwnd, (HMENU)IDC_CKTEST, nullptr, nullptr));
+        add(PAGE_IMAGE, g_ckAdv = CreateWindowW(L"BUTTON", L"Advanced blending",
+            WS_CHILD | BS_AUTOCHECKBOX, 166, 44, 160, 24,
+            hwnd, (HMENU)IDC_CKADV, nullptr, nullptr));
+        add(PAGE_IMAGE, g_ckImage = CreateWindowW(L"BUTTON", L"Image source",
+            WS_CHILD | BS_AUTOCHECKBOX, 336, 44, 120, 24,
+            hwnd, (HMENU)IDC_CKIMAGE, nullptr, nullptr));
+        add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Load image...",
+            WS_CHILD | BS_PUSHBUTTON, 462, 42, 96, 26,
+            hwnd, (HMENU)IDC_LOADIMG, nullptr, nullptr));
+        add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Clear",
+            WS_CHILD | BS_PUSHBUTTON, 564, 42, 56, 26,
+            hwnd, (HMENU)IDC_CLEARIMG, nullptr, nullptr));
+        add(PAGE_IMAGE, g_imgLabel = CreateWindowW(L"STATIC", L"Image: (none)",
+            WS_CHILD | SS_LEFT, 16, 82, 320, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_IMAGE, CreateWindowW(L"STATIC", L"Patterns:",
+            WS_CHILD | SS_LEFT, 346, 82, 62, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_IMAGE, g_cbImg = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            410, 78, 200, 200,
+            hwnd, (HMENU)IDC_CBIMG, nullptr, nullptr));
+        ComboBox_AddString(g_cbImg, L"Color bars");
+        ComboBox_AddString(g_cbImg, L"Checkerboard");
+        ComboBox_AddString(g_cbImg, L"Gray ramp");
+        ComboBox_AddString(g_cbImg, L"Identity grid");
+
+        // --- Settings page
+        add(PAGE_SETTINGS, g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
+            WS_CHILD | BS_AUTOCHECKBOX, 16, 44, 190, 24,
+            hwnd, (HMENU)IDC_CKNET, nullptr, nullptr));
+        add(PAGE_SETTINGS, g_ckAuto = CreateWindowW(L"BUTTON", L"Start with Windows",
+            WS_CHILD | BS_AUTOCHECKBOX, 216, 44, 170, 24,
+            hwnd, (HMENU)IDC_CKAUTO, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Save Config",
+            WS_CHILD | BS_PUSHBUTTON, 400, 40, 100, 30,
+            hwnd, (HMENU)IDC_SAVE, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Load Config",
+            WS_CHILD | BS_PUSHBUTTON, 506, 40, 100, 30,
+            hwnd, (HMENU)IDC_LOAD, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"STATIC", L"Preset:",
+            WS_CHILD | SS_LEFT, 16, 92, 52, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_SETTINGS, g_cbPreset = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWN | WS_VSCROLL,   // editable: type a new name then Save
+            70, 88, 200, 220,
+            hwnd, (HMENU)IDC_CBPRESET, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Save",
+            WS_CHILD | BS_PUSHBUTTON, 278, 86, 74, 26,
+            hwnd, (HMENU)IDC_PRESETSAVE, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Load",
+            WS_CHILD | BS_PUSHBUTTON, 356, 86, 74, 26,
+            hwnd, (HMENU)IDC_PRESETLOAD, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Delete",
+            WS_CHILD | BS_PUSHBUTTON, 434, 86, 90, 26,
+            hwnd, (HMENU)IDC_PRESETDEL, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"STATIC", L"(CMDNET shared)",
+            WS_CHILD | SS_LEFT, 530, 92, 90, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"STATIC", L"Target:",
+            WS_CHILD | SS_LEFT, 16, 128, 52, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_SETTINGS, g_cbTarget = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            70, 124, 200, 220,
+            hwnd, (HMENU)IDC_CBTARGET, nullptr, nullptr));
+
+        // --- bottom strip, always visible (mirrors the original's bottom bar)
+        CreateWindowW(L"BUTTON", L"Configure alignment (F3)",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 16, 416, 190, 30,
+            hwnd, (HMENU)IDC_CALIB, nullptr, nullptr);
+        g_ckEnable = CreateWindowW(L"BUTTON", L"Enable Desktop warping",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 216, 420, 190, 24,
+            hwnd, (HMENU)IDC_CKENABLE, nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Engine:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 286, 494, 48, 18,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 420, 424, 44, 18,
             hwnd, nullptr, nullptr, nullptr);
         g_cbEng = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            336, 490, 238, 220,
+            466, 420, 152, 220,
             hwnd, (HMENU)IDC_CBENG, nullptr, nullptr);
         ComboBox_AddString(g_cbEng, L"Desktop Duplication (DXGI)");
         ComboBox_AddString(g_cbEng, L"DWM Magnification (n/a)");
         ComboBox_AddString(g_cbEng, L"NVAPI clone (n/a)");
         ComboBox_AddString(g_cbEng, L"DOPP (n/a)");
-        // named presets (shared with the CMDNET SAVEAS/LOADAS commands)
-        CreateWindowW(L"STATIC", L"Preset:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 528, 52, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        g_cbPreset = CreateWindowW(L"COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL,   // editable: type a new name then Save
-            64, 524, 210, 220,
-            hwnd, (HMENU)IDC_CBPRESET, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Save",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 284, 522, 78, 26,
-            hwnd, (HMENU)IDC_PRESETSAVE, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Load",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 368, 522, 78, 26,
-            hwnd, (HMENU)IDC_PRESETLOAD, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Delete",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 452, 522, 90, 26,
-            hwnd, (HMENU)IDC_PRESETDEL, nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"(CMDNET shared)",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 550, 528, 84, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        // per-output command target (mirrors CMDNET "SET out=")
-        CreateWindowW(L"STATIC", L"Target:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 560, 52, 18,
-            hwnd, nullptr, nullptr, nullptr);
-        g_cbTarget = CreateWindowW(L"COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            64, 556, 210, 220,
-            hwnd, (HMENU)IDC_CBTARGET, nullptr, nullptr);
         // structured status block (Projector / Mode / Color balancing / edges)
         g_statusInfo = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 594, 620, 76,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 456, 612, 56,
             hwnd, nullptr, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 668, 620, 40,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 514, 612, 32,
             hwnd, nullptr, nullptr, nullptr);
+        showTab(PAGE_DISPLAYS);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             Button_SetCheck(g_ckTest, g_cfg.testPattern ? BST_CHECKED : BST_UNCHECKED);
@@ -2192,6 +2234,33 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             switchSubModeAll();
         }
         return 0;
+    case WM_NOTIFY: {                  // main-console tab strip
+        NMHDR* nm = (NMHDR*)lp;
+        if (nm->idFrom == IDC_TABS && nm->code == TCN_SELCHANGE) {
+            showTab(TabCtrl_GetCurSel(g_tab));
+            return 0;
+        }
+        break;
+    }
+    case WM_CTLCOLORSTATIC: {          // dark theme: dark panels, light text,
+        HDC dc = (HDC)wp;              // orange accent on the status line
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, (HWND)lp == g_status ? RGB(232, 148, 10) : RGB(224, 224, 224));
+        static HBRUSH darkBrush = CreateSolidBrush(RGB(30, 30, 34));
+        return (LRESULT)darkBrush;
+    }
+    case WM_CTLCOLORDLG: {
+        static HBRUSH dlgBrush = CreateSolidBrush(RGB(30, 30, 34));
+        return (LRESULT)dlgBrush;
+    }
+    case WM_CTLCOLOREDIT:              // combobox edit field
+    case WM_CTLCOLORLISTBOX: {         // combobox dropdown / output list
+        HDC dc = (HDC)wp;
+        SetBkColor(dc, RGB(44, 44, 50));
+        SetTextColor(dc, RGB(224, 224, 224));
+        static HBRUSH lbBrush = CreateSolidBrush(RGB(44, 44, 50));
+        return (LRESULT)lbBrush;
+    }
     case WM_TRAYICON:
         if (lp == WM_LBUTTONUP) {          // left click: toggle console
             if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
@@ -2232,7 +2301,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterClassW(&wc);
     uiThreadId = GetCurrentThreadId();
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 650, 780,
+        WS_OVERLAPPEDWINDOW, 100, 100, 650, 608,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);
