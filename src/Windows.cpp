@@ -1032,6 +1032,8 @@ void toggleInplaceOverlay() {
 
 // keep every in-place affordance in step: checkbox, View menu check mark
 // (the tray menu is rebuilt on every right-click, so it reads g_inplace live)
+static void invalidateToolbarToggles();     // fwd: syncInplaceUI calls it
+
 static void syncInplaceUI(HWND hwnd) {
     bool on = g_inplace.load();
     if (g_ckInplace)
@@ -1041,6 +1043,16 @@ static void syncInplaceUI(HWND hwnd) {
         if (HMENU m = GetMenu(hwnd))
             CheckMenuItem(m, IDM_VIEW_INPLACE, MF_BYCOMMAND |
                           (on ? MF_CHECKED : MF_UNCHECKED));
+    invalidateToolbarToggles();   // In-place button paints its checked state
+}
+
+// toolbar toggle buttons (In-place / Test) paint from live state, so any
+// path that flips the underlying value just invalidates the buttons and
+// WM_DRAWITEM draws the truth - one helper keeps all entry points honest.
+static void invalidateToolbarToggles() {
+    if (!g_ctl) return;
+    if (HWND b = GetDlgItem(g_ctl, IDM_VIEW_INPLACE)) InvalidateRect(b, nullptr, TRUE);
+    if (HWND b = GetDlgItem(g_ctl, IDM_WARP_TEST)) InvalidateRect(b, nullptr, TRUE);
 }
 
 void notifyOutputRaised() {
@@ -2087,7 +2099,8 @@ static void applyLoadedConfig() {
     Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_ckInplace, g_cfg.inplace ? BST_CHECKED : BST_UNCHECKED);
     PostMessageW(g_ctl, WM_INPLACESET, 0, 0);   // style change needs a rebuild
-    PostMessageW(g_ctl, WM_MAGTEST, 0, 0);      // MAG test overlays follow the config
+    PostMessageW(g_ctl, WM_MAGTEST, 0, 0);      // MAG overlays + Test checkbox follow
+    invalidateToolbarToggles();                 // Test button checked frame
     Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
     Engine::inst().setSampling(g_cfg.sampling);
@@ -2302,9 +2315,25 @@ static void drawToolbarButton(DRAWITEMSTRUCT* dis) {
     HDC dc = dis->hDC;
     RECT rc = dis->rcItem;
     bool hot = (dis->itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
-    HBRUSH bg = CreateSolidBrush(hot ? RGB(70, 70, 78) : RGB(45, 45, 48));
+    // toggle state read WITHOUT g_cfgMutex: WM_DRAWITEM can be dispatched
+    // synchronously inside paint, and this thread must never wait on a lock
+    // another thread may hold while posting UI work (benign int race).
+    bool active = false;
+    if (dis->CtlID == IDM_VIEW_INPLACE) active = g_inplace.load();
+    else if (dis->CtlID == IDM_WARP_TEST) active = g_cfg.testPattern != 0;
+    HBRUSH bg = CreateSolidBrush(hot ? RGB(70, 70, 78)
+                                     : active ? RGB(58, 54, 40) : RGB(45, 45, 48));
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
+    if (active) {                       // orange frame marks the "on" toggles
+        HPEN fr = CreatePen(PS_SOLID, 1, RGB(232, 148, 10));
+        HGDIOBJ op = SelectObject(dc, fr);
+        HGDIOBJ ob = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+        SelectObject(dc, op);
+        SelectObject(dc, ob);
+        DeleteObject(fr);
+    }
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(220, 220, 225));
     wchar_t lbl[64];
@@ -2603,7 +2632,12 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             on = g_cfg.engine == 1 && g_cfg.testPattern != 0;
         }
+        // one place syncs the checkbox for BOTH load paths (UI Load button and
+        // remote LOAD) - applyLoadedConfig only invalidates the toolbar
+        if (g_ckTest)
+            Button_SetCheck(g_ckTest, g_cfg.testPattern ? BST_CHECKED : BST_UNCHECKED);
         syncMagTestOverlays(on);
+        invalidateToolbarToggles();   // Test button checked frame
         return 0;
     }
     case WM_LAYSET: {   // tiled layout changed from the socket thread
@@ -2653,6 +2687,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 }
                 Button_SetCheck(g_ckTest, on ? BST_CHECKED : BST_UNCHECKED);
                 syncMagTestOverlays(on && g_cfg.engine == 1);
+                invalidateToolbarToggles();   // Test button checked frame
                 setStatus(on ? L"Test pattern ON." : L"Test pattern OFF.");
             } else if (id == IDM_HELP_ABOUT) {
                 MessageBoxW(hwnd,
@@ -2751,6 +2786,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 g_rev++;
             }
             syncMagTestOverlays(on);   // no-op outside engine=1
+            invalidateToolbarToggles();   // Test button checked frame
         } else if (id == IDC_CKADV && HIWORD(wp) == BN_CLICKED) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             g_cfg.advancedBlend = Button_GetCheck(g_ckAdv) == BST_CHECKED;
