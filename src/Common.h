@@ -121,6 +121,7 @@ extern std::atomic<bool> g_inplace;
 // post WM_INPLACESET to the console so it restyles the output windows
 // (implemented in Windows.cpp; safe from any thread)
 void requestInplaceRestyle();
+void requestMagBlendSync();    // any thread: MAG edge-blend overlays resync (UI thread)
 void requestOutputRebuild();   // any thread: destroy+recreate output windows on the UI thread
 void requestMagTestSync();     // any thread: test pattern overlays follow (engine=1)
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state

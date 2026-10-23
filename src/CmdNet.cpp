@@ -890,6 +890,11 @@ static std::string dispatch(std::string line) {
             if (!applied) return "ERR SET " + key + "\n";
             g_rev++;
         }
+        if (key.size() > 5) {
+            // blend parameter writes reshape the MAG fade-bar overlays
+            std::string field = key.substr(key.find('.') == std::string::npos ? key.size() : key.find('.') + 1);
+            if (field == "fade") requestMagBlendSync();
+        }
         refreshStatusBar();
         return "OK " + key + "=" + val + "\n";
     }

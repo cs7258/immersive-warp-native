@@ -108,6 +108,8 @@ static LRESULT CALLBACK MagWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
 static std::vector<HWND> g_magTests;    // MAG test-pattern overlays (UI thread)
+constexpr UINT WM_MAGBLEND = WM_APP + 13;   // MAG blend overlays resync (defined
+                                            // before requestMagBlendSync uses it)
 
 static OutputCfg* cfgForWindowNoLock(OutWinState* st) {
     // caller must already hold g_cfgMutex
@@ -573,6 +575,8 @@ void createOutputWindows() {
     // MAG test pattern overlays (g_cfgMutex already held; no lock inside)
     if (g_cfg.engine == 1 && g_cfg.testPattern != 0)
         syncMagTestOverlays(true);
+    // MAG edge-blend overlays: marshalled so they paint after the lock
+    requestMagBlendSync();
     // console always stays on top of the output windows (like the original)
     notifyOutputRaised();
 }
@@ -584,6 +588,9 @@ void destroyOutputWindows() {
     for (HWND t : g_magTests) magRemoveFilter(t);
     for (HWND t : g_magTests) DestroyWindow(t);
     g_magTests.clear();
+    for (HWND t : g_magBlends) magRemoveFilter(t);
+    for (HWND t : g_magBlends) DestroyWindow(t);
+    g_magBlends.clear();
     for (auto& p : g_outWins) DestroyWindow(p.first);
     g_outWins.clear();
     Engine::inst().detachAll();
@@ -625,6 +632,144 @@ static void syncMagTestOverlays(bool on) {
         magAddFilter(ov);
     }
     dbgLogLine("syncMagTestOverlays: " + std::to_string(g_magTests.size()) + " overlay(s)");
+}
+
+// ------------------------------------------------------------------
+// MAG blend overlays: per-host layered windows painting the edge-fade bars
+// with per-pixel alpha. The MAG engine has no mesh renderer, so the blend
+// rides on top of the feed - same edge mask / fade semantics as the DXGI
+// shader (edges bits L/R/T/B = 1/2/4/8, fade = fraction of the dimension).
+static const wchar_t* MAGBLEND_CLASS = L"IWN_MagBlendWnd";
+static std::vector<HWND> g_magBlends;   // MAG edge-blend overlays (UI thread)
+
+static LRESULT CALLBACK MagBlendWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    return DefWindowProcW(hwnd, msg, wp, lp);   // painted at creation/sync
+}
+
+static void paintMagBlend(HWND ov, HWND host) {
+    OutWinState* st = (OutWinState*)GetWindowLongPtrW(host, GWLP_USERDATA);
+    if (!st) return;
+    auto displays = enumerateDisplays();
+    if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return;
+    int edges = 0;
+    float fade[4] = { 0, 0, 0, 0 };
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs)
+            if (o.enabled && o.deviceName == displays[st->displayIdx].deviceName) {
+                edges = o.edges;
+                for (int s = 0; s < 4; s++) fade[s] = o.blend[s].fade;
+                break;
+            }
+    }
+    RECT wr{};
+    GetWindowRect(host, &wr);
+    int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    if (w <= 0 || h <= 0) return;
+    if (!edges) { UpdateLayeredWindow(ov, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 0); return; }
+
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = w; bi.bV5Height = -h; bi.bV5Planes = 1; bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00; bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC sdc = GetDC(nullptr);
+    HDC mdc = CreateCompatibleDC(sdc);
+    HBITMAP bmp = CreateDIBSection(sdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bmp && bits) {
+        auto* px = (unsigned*)bits;
+        for (int y = 0; y < h; y++) {
+            unsigned* row = px + (size_t)y * w;
+            for (int x = 0; x < w; x++) {
+                float a = 0;
+                if ((edges & 1) && fade[0] > 0 && x < fade[0] * w)
+                    a = 1.0f - x / (fade[0] * w);
+                if ((edges & 2) && fade[1] > 0) {
+                    float d = (w - 1 - x) / (fade[1] * w);
+                    if (d < 1 && 1 - d > a) a = 1 - d;
+                }
+                if ((edges & 4) && fade[2] > 0 && y < fade[2] * h) {
+                    float t = 1 - y / (fade[2] * h);
+                    if (t > a) a = t;
+                }
+                if ((edges & 8) && fade[3] > 0) {
+                    float d = (h - 1 - y) / (fade[3] * h);
+                    if (d < 1 && 1 - d > a) a = 1 - d;
+                }
+                row[x] = (unsigned)(a * 255.0f) << 24;   // black, premultiplied
+            }
+        }
+        SelectObject(mdc, bmp);
+        POINT src{ 0, 0 };
+        SIZE sz{ w, h };
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        UpdateLayeredWindow(ov, sdc, nullptr, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+    }
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(mdc);
+    ReleaseDC(nullptr, sdc);
+}
+
+// UI thread only (via WM_MAGBLEND): create/remove overlays per host and
+// repaint them with the current edges/fade values.
+static void syncMagBlendOverlays() {
+    bool want;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        want = g_cfg.engine == 1;
+    }
+    if (!want) {
+        for (HWND t : g_magBlends) magRemoveFilter(t);
+        for (HWND t : g_magBlends) DestroyWindow(t);
+        g_magBlends.clear();
+        return;
+    }
+    WNDCLASSW bc{};
+    bc.lpfnWndProc = MagBlendWndProc;
+    bc.hInstance = GetModuleHandleW(nullptr);
+    bc.lpszClassName = MAGBLEND_CLASS;
+    RegisterClassW(&bc);
+    for (auto& p : g_outWins) {
+        int mine = -1;
+        for (size_t i = 0; i < g_magBlends.size(); i++)
+            if (GetWindow(g_magBlends[i], GW_OWNER) == p.first) { mine = (int)i; break; }
+        if (mine < 0) {
+            RECT r{};
+            GetWindowRect(p.first, &r);
+            HWND ov = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                MAGBLEND_CLASS, L"", WS_POPUP,
+                r.left, r.top, r.right - r.left, r.bottom - r.top,
+                p.first, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (!ov) continue;
+            g_magBlends.push_back(ov);
+            magAddFilter(ov);
+            typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
+            auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                               "SetWindowDisplayAffinity");
+            if (fn) fn(ov, 0x11);
+            mine = (int)g_magBlends.size() - 1;
+        }
+        paintMagBlend(g_magBlends[mine], p.first);
+    }
+    // drop overlays whose host is gone
+    for (size_t i = 0; i < g_magBlends.size();) {
+        bool alive = false;
+        for (auto& p : g_outWins)
+            if (GetWindow(g_magBlends[i], GW_OWNER) == p.first) { alive = true; break; }
+        if (alive) { i++; continue; }
+        magRemoveFilter(g_magBlends[i]);
+        DestroyWindow(g_magBlends[i]);
+        g_magBlends.erase(g_magBlends.begin() + i);
+    }
+}
+
+void requestMagBlendSync() {
+    // any thread: the sync itself touches windows, so always marshal to the
+    // UI thread even when already on it (PostMessage defers past the caller's
+    // g_cfgMutex section)
+    if (g_ctl) PostMessageW(g_ctl, WM_MAGBLEND, 0, 0);
 }
 
 // ------------------------------------------------------------------
@@ -999,6 +1144,7 @@ void setBlendEdgesMask(int mask) {
     else wsprintfW(msg, L"Blend edges: %s", e);
     setStatus(msg);
     refreshStatusBar();
+    requestMagBlendSync();   // engine=1: fade-bar overlays follow the mask
 }
 
 // Ctrl+F3: freeze the captured desktop so alignment is done on a still image.
@@ -2113,6 +2259,7 @@ static void applyLoadedConfig() {
     Button_SetCheck(g_ckInplace, g_cfg.inplace ? BST_CHECKED : BST_UNCHECKED);
     PostMessageW(g_ctl, WM_INPLACESET, 0, 0);   // style change needs a rebuild
     PostMessageW(g_ctl, WM_MAGTEST, 0, 0);      // MAG overlays + Test checkbox follow
+    requestMagBlendSync();                      // MAG fade-bar overlays follow
     invalidateToolbarToggles();                 // Test button checked frame
     Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
@@ -2655,6 +2802,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_TGTREFRESH: {   // Target dropdown refresh marshalled from socket
         refreshTargetComboNow();
+        return 0;
+    }
+    case WM_MAGBLEND: {     // MAG edge-blend overlays: create/remove/repaint
+        syncMagBlendOverlays();
         return 0;
     }
     case WM_LAYSET: {   // tiled layout changed from the socket thread
