@@ -810,7 +810,7 @@ static std::string dispatch(std::string line) {
 static void handleClient(SOCKET s) {
     dbgLogLine("cmdnet client tid=" + std::to_string((long)GetCurrentThreadId()));
     std::string buf;
-    char tmp[256];
+    char tmp[4096];
     while (g_netRun.load()) {
         int n = recv(s, tmp, sizeof(tmp), 0);
         if (n <= 0) break;
@@ -822,7 +822,9 @@ static void handleClient(SOCKET s) {
                     send(s, rep.c_str(), (int)rep.size(), 0);
                     buf.clear();
                 }
-            } else if (buf.size() < 255) {
+            } else if (buf.size() < 16384) {
+                // generous line budget: GET warp dumps ~120 points (~1.7KB),
+                // and SET warp.load feeds them right back
                 buf += c;
             }
         }
