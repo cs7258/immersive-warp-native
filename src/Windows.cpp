@@ -2223,9 +2223,34 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         // dialog ids; pages only toggle visibility, so WM_COMMAND automation
         // still works.
         SetMenu(hwnd, buildMenuBar());   // File / View / Warping / Help
+
+        // toolbar band (1:1 with the original's top icon strip): flat text
+        // buttons that reuse the existing command ids, so menu handlers and
+        // unattended tests drive the exact same code paths.
+        struct TbBtn { int id; const wchar_t* label; int w; };
+        static const TbBtn tbBtns[] = {
+            { IDC_LOAD,       L"Load",       62 },
+            { IDC_SAVE,       L"Save",       62 },
+            { IDM_WARP_TEST,  L"Test",       58 },
+            { IDM_VIEW_INPLACE, L"In-place", 76 },
+            { IDC_CALIB,      L"Calibrate",  78 },
+            { IDC_START,      L"Start",      62 },
+            { IDC_STOP,       L"Stop",       58 },
+        };
+        int tbx = 10;
+        for (const auto& b : tbBtns) {
+            CreateWindowW(L"BUTTON", b.label,
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+                tbx, 8, b.w, 26, hwnd, (HMENU)(INT_PTR)b.id, nullptr, nullptr);
+            tbx += b.w + 6;
+        }
+        CreateWindowW(L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 8, 38, 622, 2,
+            hwnd, nullptr, nullptr, nullptr);
+
         g_tab = CreateWindowW(WC_TABCONTROLW, L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS,
-            6, 8, 622, 396, hwnd, (HMENU)IDC_TABS, nullptr, nullptr);
+            6, 44, 622, 396, hwnd, (HMENU)IDC_TABS, nullptr, nullptr);
         static const wchar_t* tabTitles[PAGE_COUNT] =
             { L"Displays", L"Warp & Blend", L"Image & Test", L"Settings" };
         for (int i = 0; i < PAGE_COUNT; i++) {
@@ -2420,6 +2445,17 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         g_status = CreateWindowW(L"STATIC", L"Ready.",
             WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 530, 612, 22,
             hwnd, nullptr, nullptr, nullptr);
+        // shift every page control below the toolbar band (their creation
+        // coordinates predate the toolbar; one loop beats thirty edits)
+        for (int pg = 0; pg < PAGE_COUNT; pg++)
+            for (HWND h : g_pages[pg]) {
+                RECT rc{};
+                GetWindowRect(h, &rc);
+                MapWindowPoints(nullptr, hwnd, (POINT*)&rc, 2);
+                SetWindowPos(h, nullptr, rc.left, rc.top + 38,
+                             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+
         applyDarkThemeRecursive(hwnd);   // DarkMode_Explorer on every child
         syncInplaceUI(hwnd);             // initial View-menu check state
         magSetConsoleWindow(hwnd);       // console excluded from the mag feed
@@ -2921,7 +2957,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterClassW(&wc);
     uiThreadId = GetCurrentThreadId();
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 650, 608,
+        WS_OVERLAPPEDWINDOW, 100, 100, 650, 646,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);
