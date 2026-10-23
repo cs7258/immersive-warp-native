@@ -646,28 +646,43 @@ static LRESULT CALLBACK MagBlendWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return DefWindowProcW(hwnd, msg, wp, lp);   // painted at creation/sync
 }
 
-// edges mask + fade values for one output (by OutWinState), under lock
-static bool magBlendInfo(OutWinState* st, int& edges, float fade[4]) {
+// edges mask + per-side blend params for one output (by OutWinState), under
+// lock. Side order L/R/T/B = 0..3, matching BlendSide.
+static bool magBlendInfo(OutWinState* st, int& edges, float fade[4],
+                         float gam[4], float gn[4], float sl[4]) {
     if (!st) return false;
     auto displays = enumerateDisplays();
     if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return false;
     edges = 0;
-    for (int s = 0; s < 4; s++) fade[s] = 0;
+    for (int s = 0; s < 4; s++) { fade[s] = 0; gam[s] = 1; gn[s] = 0; sl[s] = 0; }
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     for (auto& o : g_cfg.outputs)
         if (o.enabled && o.deviceName == displays[st->displayIdx].deviceName) {
             edges = o.edges;
-            for (int s = 0; s < 4; s++) fade[s] = o.blend[s].fade;
+            for (int s = 0; s < 4; s++) {
+                fade[s] = o.blend[s].fade;
+                gam[s] = o.blend[s].gamma;
+                gn[s] = o.blend[s].gain;
+                sl[s] = o.blend[s].slope;
+            }
             return true;
         }
     return false;
 }
 
+// CPU mirror of the shader's parametric blend curve (Engine.cpp):
+// f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1); defaults give f(x)=x.
+static float magBlendCurve(float x, float gain, float slope) {
+    float d = slope * (x - 1.0f) + gain * x + 1.0f;
+    if (d < 1e-4f) d = 1e-4f;
+    return (gain + 1.0f) * x / d;
+}
+
 static void paintMagBlend(HWND ov, HWND host) {
     OutWinState* st = (OutWinState*)GetWindowLongPtrW(host, GWLP_USERDATA);
     int edges = 0;
-    float fade[4] = { 0, 0, 0, 0 };
-    magBlendInfo(st, edges, fade);
+    float fade[4], gam[4], gn[4], sl[4];
+    magBlendInfo(st, edges, fade, gam, gn, sl);
     RECT wr{};
     GetWindowRect(host, &wr);
     int w = wr.right - wr.left, h = wr.bottom - wr.top;
@@ -689,21 +704,26 @@ static void paintMagBlend(HWND ov, HWND host) {
         for (int y = 0; y < h; y++) {
             unsigned* row = px + (size_t)y * w;
             for (int x = 0; x < w; x++) {
-                float a = 0;
+                // transmitted weight per pixel = product of the participating
+                // sides' pow(blendCurve(t), gamma) - exactly the shader's
+                // multiplication; the overlay paints black with alpha
+                // 1 - weight so content * (1 - alpha) == content * weight
+                float wt = 1.0f;
                 if ((edges & 1) && fade[0] > 0 && x < fade[0] * w)
-                    a = 1.0f - x / (fade[0] * w);
+                    wt *= powf(magBlendCurve(x / (fade[0] * w), gn[0], sl[0]), gam[0]);
                 if ((edges & 2) && fade[1] > 0) {
-                    float d = (w - 1 - x) / (fade[1] * w);
-                    if (d < 1 && 1 - d > a) a = 1 - d;
+                    float t = (w - 1 - x) / (fade[1] * w);
+                    if (t < 1) wt *= powf(magBlendCurve(t, gn[1], sl[1]), gam[1]);
                 }
-                if ((edges & 4) && fade[2] > 0 && y < fade[2] * h) {
-                    float t = 1 - y / (fade[2] * h);
-                    if (t > a) a = t;
-                }
+                if ((edges & 4) && fade[2] > 0 && y < fade[2] * h)
+                    wt *= powf(magBlendCurve(y / (fade[2] * h), gn[2], sl[2]), gam[2]);
                 if ((edges & 8) && fade[3] > 0) {
-                    float d = (h - 1 - y) / (fade[3] * h);
-                    if (d < 1 && 1 - d > a) a = 1 - d;
+                    float t = (h - 1 - y) / (fade[3] * h);
+                    if (t < 1) wt *= powf(magBlendCurve(t, gn[3], sl[3]), gam[3]);
                 }
+                float a = 1.0f - wt;
+                if (a < 0) a = 0;
+                if (a > 1) a = 1;
                 row[x] = (unsigned)(a * 255.0f) << 24;   // black, premultiplied
             }
         }
@@ -742,8 +762,9 @@ static void syncMagBlendOverlays() {
         for (size_t i = 0; i < g_magBlends.size(); i++)
             if (GetWindow(g_magBlends[i], GW_OWNER) == p.first) { mine = (int)i; break; }
         // no fade content for this output (mask 0 or all fades 0): no overlay
-        int edges = 0; float fade[4] = { 0, 0, 0, 0 };
-        bool info = magBlendInfo((OutWinState*)GetWindowLongPtrW(p.first, GWLP_USERDATA), edges, fade);
+        int edges = 0; float fade[4], gam[4], gn[4], sl[4];
+        bool info = magBlendInfo((OutWinState*)GetWindowLongPtrW(p.first, GWLP_USERDATA),
+                                 edges, fade, gam, gn, sl);
         bool content = info && edges != 0 &&
             ((edges & 1 && fade[0] > 0) || (edges & 2 && fade[1] > 0) ||
              (edges & 4 && fade[2] > 0) || (edges & 8 && fade[3] > 0));
@@ -1428,6 +1449,17 @@ static void applyLayoutLocked() {   // g_cfgMutex held
         // blend only on interior boundaries of the tile grid
         o.edges = (c > 0 ? 1 : 0) | (c < C - 1 ? 2 : 0)
                 | (r > 0 ? 4 : 0) | (r < R - 1 ? 8 : 0);
+        // auto blend width: interior fades follow the source overlap, so
+        // adjacent tiles carry complementary ramps over the same band (with
+        // the default linear curve weightA + weightB == 1 across the seam).
+        // Outer edges keep their user-set fades; 1x1 touches nothing.
+        if (R > 1 || C > 1) {
+            float fw = clampf(ov, 0.0f, 0.5f);
+            if (c > 0) o.blend[0].fade = fw;
+            if (c < C - 1) o.blend[1].fade = fw;
+            if (r > 0) o.blend[2].fade = fw;
+            if (r < R - 1) o.blend[3].fade = fw;
+        }
         if (R == 1 && C == 1) o.edges = 0;   // 1x1: no interior boundary, no
                                              // forced fade (in-place correction
                                              // on the main screen; blending can
@@ -1472,14 +1504,17 @@ static void applyLayoutUI(int R, int C, int ov) {      // UI thread
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         magTiles = g_cfg.engine == 1;
     }
-    if (applyLayoutValue(R, C, ov)) {
-        syncLayoutCombos();
-        if (magTiles) {
-            // MAG hosts carry the tile's source window in their magnifier
-            // source rect: layout/overlap changes mean a window rebuild
-            destroyOutputWindows();
-            createOutputWindows();
-        }
+    bool changed = applyLayoutValue(R, C, ov);
+    if (changed) syncLayoutCombos();
+    if (magTiles) {
+        // MAG hosts carry the tile's source window in their magnifier source
+        // rect, so any layout/overlap change means a window rebuild. This
+        // includes the socket path: setLayout already applied the values on
+        // the socket thread (GET-after-SET consistency), which made
+        // applyLayoutValue report "unchanged" here - without the unconditional
+        // rebuild CMDNET SET layout= never retiled the MAG hosts (real bug).
+        destroyOutputWindows();
+        createOutputWindows();
     }
     refreshStatusBar();
 }
