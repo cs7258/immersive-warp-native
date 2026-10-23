@@ -44,7 +44,7 @@ struct ColorAdj {
     float bright = 1.0f, contrast = 1.0f;
 };
 
-struct MaskRect { float x = 0, y = 0, w = 0.2f, h = 0.2f; };
+struct MaskRect { float x = 0, y = 0, w = 0.10f, h = 0.10f; };   // default = 10%x10% at top-left
 
 struct OutputCfg {
     std::wstring deviceName;          // DXGI output device name e.g. \\.\DISPLAY1
