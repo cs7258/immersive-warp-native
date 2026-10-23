@@ -216,11 +216,15 @@ static std::string dispatch(std::string line) {
         }
         // NxN tiled layout, e.g. "SET layout=2x2" / "SET overlap=15"
         // (setLayout locks g_cfgMutex itself; the grid rebuild bumps g_rev so
-        // the render thread rebuilds every mesh on the next frame)
+        // the render thread rebuilds every mesh on the next frame).
+        // NOTE: dispatch() uppercases the whole line -> val arrives as "2X2"
         if (key == "layout") {
             int C = 0, R = 0;
-            if (sscanf_s(val.c_str(), "%dx%d", &C, &R) != 2 || C < 1 || R < 1 || C > 4 || R > 4)
-                return "ERR SET layout (want WxH, each 1..4)\n";
+            if (sscanf_s(val.c_str(), "%dX%d", &C, &R) != 2 &&
+                sscanf_s(val.c_str(), "%dx%d", &C, &R) != 2)
+                return "ERR SET layout (want WxH)\n";
+            if (C < 1 || R < 1 || C > 4 || R > 4)
+                return "ERR SET layout (each 1..4)\n";
             setLayout(R, C, g_cfg.overlap);
             return "OK layout=" + std::to_string(C) + "x" + std::to_string(R) + "\n";
         }
@@ -231,7 +235,7 @@ static std::string dispatch(std::string line) {
             return "OK overlap=" + std::to_string(ov) + "\n";
         }
         if (key == "engine") {
-            if (val == "0" || val == "desktopduplication" || val == "dxgi") {
+            if (val == "0" || val == "DXGI" || val == "DESKTOPDUPLICATION") {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 g_cfg.engine = 0;
                 return "OK engine=desktopduplication\n";
