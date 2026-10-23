@@ -948,6 +948,17 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
         d.masks[i][0] = cfg.masks[i].x; d.masks[i][1] = cfg.masks[i].y;
         d.masks[i][2] = cfg.masks[i].w; d.masks[i][3] = cfg.masks[i].h;
     }
+    // right-drag rubber band: overlay the pending rectangle as one more black
+    // rect so the user sees the area live while drawing (visual only; the real
+    // mask is committed on WM_RBUTTONUP)
+    if (oc.hwnd) {
+        float pm[4];
+        if (getPendingMask(oc.hwnd, pm) && d.flags[2] < MAX_MASKS) {
+            d.masks[d.flags[2]][0] = pm[0]; d.masks[d.flags[2]][1] = pm[1];
+            d.masks[d.flags[2]][2] = pm[2]; d.masks[d.flags[2]][3] = pm[3];
+            d.flags[2]++;
+        }
+    }
     d.color[0] = cfg.color.gammaR; d.color[1] = cfg.color.gammaG;
     d.color[2] = cfg.color.gammaB; d.color[3] = cfg.color.bright;
     d.contrast = cfg.color.contrast;

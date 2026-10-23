@@ -15,11 +15,15 @@
 struct OutWinState {
     int displayIdx = -1;
     int subMode = 0;              // 0 = geometrical correction, 1 = edge blending
-    int dragKind = -1;            // -1 none, 0 warp point, 1 simple blend side, 2 advanced point, 3 window move
+    int dragKind = -1;            // -1 none, 0 warp point, 1 simple blend side, 2 advanced point, 3 window move, 4 mask rubber band
     int dragIdx = -1;             // warp point index or blend side index
     int advIdx = -1;              // advanced point index
     float lastX = 0, lastY = 0;
     int moveOffX = 0, moveOffY = 0;   // preview window drag offset
+    // pending mask rubber band (right-drag), normalized; the render thread
+    // overlays it as an extra black rect so the user sees the area live
+    std::atomic<bool> pend{ false };
+    float pendX0 = 0, pendY0 = 0, pendX1 = 0, pendY1 = 0;
 };
 static const wchar_t* OUT_CLASS = L"IWN_OutputWnd";
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
@@ -36,6 +40,28 @@ static OutputCfg* cfgForWindowNoLock(OutWinState* st) {
 static OutputCfg* cfgForWindow(OutWinState* st) {
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     return cfgForWindowNoLock(st);
+}
+
+// render-thread bridge: the in-progress right-drag rectangle, normalized and
+// min/max ordered, so Engine can overlay it as a temporary black rect
+bool getPendingMask(HWND hwnd, float m[4]) {
+    for (auto& w : g_outWins) {
+        if (w.first != hwnd) continue;
+        if (!w.second->pend.load()) return false;
+        float x0 = w.second->pendX0, x1 = w.second->pendX1;
+        float y0 = w.second->pendY0, y1 = w.second->pendY1;
+        m[0] = (std::min)(x0, x1); m[1] = (std::min)(y0, y1);
+        m[2] = std::fabs(x1 - x0); m[3] = std::fabs(y1 - y0);
+        return true;
+    }
+    return false;
+}
+
+static void normFromLparam(HWND hwnd, LPARAM lp, float& nx, float& ny) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    nx = clampf(GET_X_LPARAM(lp) / (float)(w > 0 ? w : 1), 0, 1);
+    ny = clampf(GET_Y_LPARAM(lp) / (float)(h > 0 ? h : 1), 0, 1);
 }
 
 static float normPointRadius(HWND hwnd) { return 12.0f; }
@@ -158,6 +184,12 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                          SWP_NOSIZE | SWP_NOACTIVATE);
             return 0;
         }
+        if (st->dragKind == 4) {   // mask rubber band (any mode)
+            float nx, ny;
+            normFromLparam(hwnd, lp, nx, ny);
+            st->pendX1 = nx; st->pendY1 = ny;
+            return 0;
+        }
         if (!g_calib.load()) break;
         RECT rc; GetClientRect(hwnd, &rc);
         float nx = GET_X_LPARAM(lp) / (float)(rc.right - rc.left);
@@ -195,11 +227,55 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_RBUTTONDOWN: {
+        // right-drag = draw a black mask rectangle, works in every mode
+        // (masks are content blocking, not a calibration-only feature)
+        if (!st || st->dragKind >= 0) break;
+        float nx, ny;
+        normFromLparam(hwnd, lp, nx, ny);
+        st->pendX0 = st->pendX1 = nx;
+        st->pendY0 = st->pendY1 = ny;
+        st->pend.store(true);
+        st->dragKind = 4;
+        SetCapture(hwnd);
+        return 0;
+    }
     case WM_LBUTTONUP:
         if (st) { st->dragKind = -1; ReleaseCapture(); }
         return 0;
+    case WM_RBUTTONUP: {
+        if (!st || st->dragKind != 4) break;
+        float nx, ny;
+        normFromLparam(hwnd, lp, nx, ny);
+        st->pendX1 = nx; st->pendY1 = ny;
+        st->pend.store(false);          // stop overlaying before mutating config
+        float x0 = (std::min)(st->pendX0, st->pendX1), x1 = (std::max)(st->pendX0, st->pendX1);
+        float y0 = (std::min)(st->pendY0, st->pendY1), y1 = (std::max)(st->pendY0, st->pendY1);
+        float w = x1 - x0, h = y1 - y0;
+        st->dragKind = -1;
+        ReleaseCapture();
+        if (w < 0.01f || h < 0.01f) return 0;   // click, not a drag
+        w = (std::min)(w, 1.0f - x0); h = (std::min)(h, 1.0f - y0);
+        bool added = false;
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            if (auto* cfg = cfgForWindowNoLock(st)) {
+                if (cfg->masks.size() < MAX_MASKS) {
+                    cfg->masks.push_back(MaskRect{ x0, y0, w, h });
+                    added = true;
+                } else {
+                    dbgLogLine("mask drag dropped: max 8 masks");
+                }
+            }
+        }
+        if (added) refreshStatusBar();   // locks g_cfgMutex itself
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (st && st->dragKind == 4) { st->dragKind = -1; st->pend.store(false); }
+        return 0;
     case WM_MOUSEWHEEL: {
-        if (!g_calib.load() || !st || st->dragKind < 1) break;
+        if (!g_calib.load() || !st || st->dragKind < 1 || st->dragKind == 4) break;
         float dir = (short)HIWORD(wp) > 0 ? 0.05f : -0.05f;
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;

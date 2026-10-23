@@ -36,7 +36,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
    - **Geometry**：控制点 Horiz/Vert 密度（3–24，Apply 会重置网格）、水平/垂直镜像、旋转 90°、Reset grid
    - **Blending**：按边（Left/Right/Top/Bottom）设置 Fade/Gamma/Gain/Slope，可勾选"Apply to all 4 edges"同步
    - **Color**：本投影机独立的 亮度/对比度/Gamma RGB 滑杆（与全局 Color adjustment 对话框区分，后者改所有启用输出）
-   - **Masking**：黑位掩码矩形列表（最多 8 个，渲染为黑色）。选中列表项后在 X/Y/W/H 输入框按百分比编辑位置与尺寸，Apply 写入（自动限幅保证矩形不出屏），Reset 10% 复位为左上角 10%x10%；结果随 Save Config 持久化为 `mask=x,y,w,h`（归一化 0..1）
+   - **Masking**：黑位掩码矩形列表（最多 8 个，渲染为黑色）。选中列表项后在 X/Y/W/H 输入框按百分比编辑位置与尺寸，Apply 写入（自动限幅保证矩形不出屏），Reset 10% 复位为左上角 10%x10%；**也可直接在输出窗口上右键拖拽画掩码**（拖拽中实时黑块预览，松手落地，任何模式可用；误点 <1% 自动忽略）；结果随 Save Config 持久化为 `mask=x,y,w,h`（归一化 0..1）
    - Bezels / Align 为占位说明（未实现）；Help 是快捷键速查
 
 ## 快捷键（全局，任何窗口有焦点都生效）

@@ -142,6 +142,9 @@ bool engineLoadImage(const std::wstring& path);
 bool engineHasImage();
 bool engineSetTestImage(int id);   // built-in test image library (0..3)
 void createOutputWindows();
+// render-thread bridge: the in-progress right-drag mask rectangle (true when
+// a rubber band is being drawn on that output window)
+bool getPendingMask(HWND hwnd, float m[4]);
 void toggleCalibration();      // global hotkey F3: enter/exit calibration
 void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all outputs
 void cycleBlendEdges();        // global hotkey F12: cycle blended edges
