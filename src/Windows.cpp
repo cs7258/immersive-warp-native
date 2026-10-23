@@ -2546,12 +2546,12 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 {
                     std::lock_guard<std::mutex> lk(g_cfgMutex);
                     g_cfg.testPattern = !g_cfg.testPattern;
-                    on = g_cfg.engine == 1 && g_cfg.testPattern != 0;
+                    on = g_cfg.testPattern != 0;
                     g_rev++;
                 }
                 Button_SetCheck(g_ckTest, on ? BST_CHECKED : BST_UNCHECKED);
-                syncMagTestOverlays(g_cfg.testPattern != 0 && g_cfg.engine == 1);
-                setStatus(g_cfg.testPattern ? L"Test pattern ON." : L"Test pattern OFF.");
+                syncMagTestOverlays(on && g_cfg.engine == 1);
+                setStatus(on ? L"Test pattern ON." : L"Test pattern OFF.");
             } else if (id == IDM_HELP_ABOUT) {
                 MessageBoxW(hwnd,
                     L"Immersive Warp Native\n"
