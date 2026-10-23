@@ -146,6 +146,9 @@ void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all ou
 void cycleBlendEdges();        // global hotkey F12: cycle blended edges
 void toggleSnapshot();         // global hotkey Ctrl+F3: freeze / resume capture
 void openColorDialogEx();      // global hotkey D: color adjustment dialog
+// per-projector "Configure display" dialog (Bezels/Align/Geometry/Blending/
+// Color/Masking/Help tabs, edits the output selected in the console list)
+void openConfigDialog();
 // apply an R x C tiled layout with the given overlap percent (0..40):
 // regenerates the warp grid of every enabled output and sets the blend-edge
 // mask so only interior boundaries blend. Safe from any thread (marshals to UI).

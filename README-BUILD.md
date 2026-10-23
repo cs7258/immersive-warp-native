@@ -32,6 +32,12 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
    - 勾选 "Advanced blending" 后为蓝点（每边多个）
    - Esc 退出校准
 7. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载
+8. "Configure display..." 打开每投影机配置对话框（对应原版同名牌）：七标签页 **Bezels / Align / Geometry / Blending / Color / Masking / Help**
+   - **Geometry**：控制点 Horiz/Vert 密度（3–24，Apply 会重置网格）、水平/垂直镜像、旋转 90°、Reset grid
+   - **Blending**：按边（Left/Right/Top/Bottom）设置 Fade/Gamma/Gain/Slope，可勾选"Apply to all 4 edges"同步
+   - **Color**：本投影机独立的 亮度/对比度/Gamma RGB 滑杆（与全局 Color adjustment 对话框区分，后者改所有启用输出）
+   - **Masking**：黑位掩码矩形列表（最多 8 个，渲染为黑色；当前通过 config 的 `mask=` 行微调位置尺寸）
+   - Bezels / Align 为占位说明（未实现）；Help 是快捷键速查
 
 ## 快捷键（全局，任何窗口有焦点都生效）
 

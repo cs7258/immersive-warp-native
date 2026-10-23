@@ -585,6 +585,7 @@ void notifyOutputRaised() {
 #define IDC_CBLAYOUT  1023   // NxN tiled layout dropdown
 #define IDC_CBOVL     1024   // tile overlap percent dropdown
 #define IDC_CBENG     1025   // warp engine dropdown
+#define IDC_CFGDLG    1026   // per-projector Configure display dialog
 
 static void refreshList() {
     if (!g_list) return;
@@ -889,6 +890,469 @@ void openColorDialogEx() {   // hotkey D (registered only while calibrating)
     openColorDialog(GetModuleHandleW(nullptr), g_ctl);
 }
 
+// ---- Configure display dialog (per-projector, mirrors the original's
+// Bezels / Align / Geometry / Blending / Color / Masking / Help tabs) ----
+static HWND g_cfgDlg = nullptr;
+static HWND g_cfgTab = nullptr, g_cfgProj = nullptr;
+static HWND g_cfgPanel[7] = {};   // one child "page" per tab
+static int g_cfgSel = 0;          // index into g_cfg.outputs shown in the combo
+
+// control ids (must not collide with 1001..1026 console ids or tray 2001..2004;
+// the color dialog uses 2000..2006, so this dialog lives at 2100+)
+#define CFG_PROJ     2100
+#define CFG_TAB      2101
+// geometry page
+#define CFG_HORIZ    2110
+#define CFG_VERT     2111
+#define CFG_GAPPLY   2112
+#define CFG_FLIPH    2113
+#define CFG_FLIPV    2114
+#define CFG_ROT90    2115
+#define CFG_GRESET   2116
+// blending page
+#define CFG_SIDE     2120
+#define CFG_FADE     2121
+#define CFG_GAMMA    2122
+#define CFG_GAIN     2123
+#define CFG_SLOPE    2124
+#define CFG_BAPPLY   2125
+#define CFG_BALL     2126
+// color page
+#define CFG_CTB(i)   (2130 + (i))      // 5 trackbars
+#define CFG_CRESET   2136
+// masking page
+#define CFG_MLIST    2140
+#define CFG_MADD     2141
+#define CFG_MDEL     2142
+#define CFG_MCLEAR   2143
+
+static const wchar_t* cfgTabs[7] = {
+    L"Bezels", L"Align", L"Geometry", L"Blending", L"Color", L"Masking", L"Help"
+};
+
+static OutputCfg* cfgOutput() {   // g_cfgMutex held by caller
+    if (g_cfgSel < 0 || g_cfgSel >= (int)g_cfg.outputs.size()) return nullptr;
+    return &g_cfg.outputs[g_cfgSel];
+}
+
+// fill the projector combo; keeps editing the same output across refreshes
+static void cfgFillProjects() {
+    if (!g_cfgProj) return;
+    ComboBox_ResetContent(g_cfgProj);
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        int n = 0;
+        for (auto& o : g_cfg.outputs) {
+            wchar_t t[64];
+            std::wstring lab = o.label.empty() ? o.deviceName : o.label;
+            wsprintfW(t, L"%d: %s%s", ++n, lab.c_str(),
+                      o.enabled ? L"  [on]" : L"  [off]");
+            ComboBox_AddString(g_cfgProj, t);
+        }
+        if (g_cfgSel >= n) g_cfgSel = n ? n - 1 : 0;
+    }
+    ComboBox_SetCurSel(g_cfgProj, g_cfgSel);
+}
+
+// ---- geometry transforms on the dest grid ----
+static void cfgTransformPoints(void (*fn)(float&, float&)) {
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    OutputCfg* o = cfgOutput();
+    if (!o) return;
+    for (size_t i = 0; i < o->points.size(); i += 2)
+        fn(o->points[i], o->points[i + 1]);
+    g_rev++;
+}
+
+static void cfgReloadGeometry() {
+    if (!g_cfgPanel[2]) return;
+    wchar_t t[16];
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    OutputCfg* o = cfgOutput();
+    if (!o) return;
+    wsprintfW(t, L"%d", o->cols);
+    SetWindowTextW(GetDlgItem(g_cfgPanel[2], CFG_HORIZ), t);
+    wsprintfW(t, L"%d", o->rows);
+    SetWindowTextW(GetDlgItem(g_cfgPanel[2], CFG_VERT), t);
+}
+
+static void cfgReloadBlend() {
+    if (!g_cfgPanel[3]) return;
+    int side = ComboBox_GetCurSel(GetDlgItem(g_cfgPanel[3], CFG_SIDE));
+    if (side < 0 || side > 3) side = 0;
+    wchar_t t[16];
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    OutputCfg* o = cfgOutput();
+    if (!o) return;
+    const BlendSide& b = o->blend[side];
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", b.fade);  SetWindowTextW(GetDlgItem(g_cfgPanel[3], CFG_FADE), t);
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", b.gamma); SetWindowTextW(GetDlgItem(g_cfgPanel[3], CFG_GAMMA), t);
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", b.gain);  SetWindowTextW(GetDlgItem(g_cfgPanel[3], CFG_GAIN), t);
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", b.slope); SetWindowTextW(GetDlgItem(g_cfgPanel[3], CFG_SLOPE), t);
+}
+
+static void cfgReloadColor() {
+    if (!g_cfgPanel[4]) return;
+    ColorAdj c;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        OutputCfg* o = cfgOutput();
+        if (!o) return;
+        c = o->color;
+    }
+    int pos[5] = { (int)(c.bright * 100), (int)(c.contrast * 100),
+                   (int)(c.gammaR * 100), (int)(c.gammaG * 100), (int)(c.gammaB * 100) };
+    for (int i = 0; i < 5; i++)
+        SendMessageW(GetDlgItem(g_cfgPanel[4], CFG_CTB(i)), TBM_SETPOS, TRUE, (LPARAM)pos[i]);
+}
+
+static void cfgReloadMasks() {
+    if (!g_cfgPanel[5]) return;
+    HWND lb = GetDlgItem(g_cfgPanel[5], CFG_MLIST);
+    ListBox_ResetContent(lb);
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    OutputCfg* o = cfgOutput();
+    if (!o) return;
+    int n = 1;
+    for (auto& m : o->masks) {
+        wchar_t t[96];
+        wsprintfW(t, L"#%d  x=%.2f y=%.2f  %dx%d%%", n++, m.x, m.y,
+                  (int)(m.w * 100), (int)(m.h * 100));
+        ListBox_AddString(lb, t);
+    }
+}
+
+static void cfgReloadAll() {
+    cfgFillProjects();
+    cfgReloadGeometry();
+    cfgReloadBlend();
+    cfgReloadColor();
+    cfgReloadMasks();
+}
+
+// show/hide the page belonging to each tab
+static void cfgShowPage() {
+    int sel = TabCtrl_GetCurSel(g_cfgTab);
+    for (int i = 0; i < 7; i++)
+        ShowWindow(g_cfgPanel[i], (i == sel) ? SW_SHOW : SW_HIDE);
+}
+
+static void cfgApplyColor() {
+    if (!g_cfgPanel[4]) return;
+    ColorAdj c;
+    c.bright   = (float)SendMessageW(GetDlgItem(g_cfgPanel[4], CFG_CTB(0)), TBM_GETPOS, 0, 0) / 100.0f;
+    c.contrast = (float)SendMessageW(GetDlgItem(g_cfgPanel[4], CFG_CTB(1)), TBM_GETPOS, 0, 0) / 100.0f;
+    c.gammaR   = (float)SendMessageW(GetDlgItem(g_cfgPanel[4], CFG_CTB(2)), TBM_GETPOS, 0, 0) / 100.0f;
+    c.gammaG   = (float)SendMessageW(GetDlgItem(g_cfgPanel[4], CFG_CTB(3)), TBM_GETPOS, 0, 0) / 100.0f;
+    c.gammaB   = (float)SendMessageW(GetDlgItem(g_cfgPanel[4], CFG_CTB(4)), TBM_GETPOS, 0, 0) / 100.0f;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        OutputCfg* o = cfgOutput();
+        if (o) o->color = c;
+        g_rev++;
+    }
+    refreshStatusBar();
+}
+
+static float cfgEditF(HWND panel, int id) {
+    wchar_t t[32] = L"";
+    GetWindowTextW(GetDlgItem(panel, id), t, 32);
+    return (float)_wtof(t);
+}
+
+static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        CreateWindowW(L"STATIC", L"Projector:", WS_CHILD | WS_VISIBLE,
+            10, 13, 62, 18, hwnd, nullptr, nullptr, nullptr);
+        g_cfgProj = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            74, 9, 220, 200, hwnd, (HMENU)CFG_PROJ, nullptr, nullptr);
+        g_cfgTab = CreateWindowW(WC_TABCONTROLW, L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS,
+            6, 38, 402, 356, hwnd, (HMENU)CFG_TAB, nullptr, nullptr);
+        // one page per tab; pages are plain containers positioned inside the tab
+        for (int i = 0; i < 7; i++) {
+            g_cfgPanel[i] = CreateWindowW(L"STATIC", L"",
+                WS_CHILD | WS_CLIPCHILDREN,   // hidden until its tab is picked
+                14, 64, 386, 322, hwnd, nullptr, nullptr, nullptr);
+        }
+        // --- Geometry page (index 2) ---
+        {
+            HWND p = g_cfgPanel[2];
+            CreateWindowW(L"STATIC", L"Control points:", WS_CHILD | WS_VISIBLE,
+                10, 10, 90, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Horiz", WS_CHILD | WS_VISIBLE, 104, 10, 34, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"12",
+                WS_CHILD | WS_VISIBLE | ES_NUMBER, 140, 7, 40, 22, p, (HMENU)CFG_HORIZ, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Vert", WS_CHILD | WS_VISIBLE, 190, 10, 30, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10",
+                WS_CHILD | WS_VISIBLE | ES_NUMBER, 222, 7, 40, 22, p, (HMENU)CFG_VERT, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Apply (resets grid)",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 272, 6, 104, 24, p, (HMENU)CFG_GAPPLY, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Flip horizontal", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                10, 44, 114, 26, p, (HMENU)CFG_FLIPH, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Flip vertical", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                132, 44, 114, 26, p, (HMENU)CFG_FLIPV, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Rotate 90", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                254, 44, 114, 26, p, (HMENU)CFG_ROT90, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Reset grid", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                10, 78, 114, 26, p, (HMENU)CFG_GRESET, nullptr, nullptr);
+            CreateWindowW(L"STATIC",
+                L"Curved / Linear grid and per-point Move modes live on the output\n"
+                L"window (F3 calibration): drag green points, arrow keys fine-tune.",
+                WS_CHILD | WS_VISIBLE, 10, 120, 360, 40, p, nullptr, nullptr, nullptr);
+        }
+        // --- Blending page (index 3) ---
+        {
+            HWND p = g_cfgPanel[3];
+            CreateWindowW(L"STATIC", L"Side:", WS_CHILD | WS_VISIBLE, 10, 12, 34, 18, p, nullptr, nullptr, nullptr);
+            HWND cb = CreateWindowW(L"COMBOBOX", nullptr,
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                48, 8, 110, 200, p, (HMENU)CFG_SIDE, nullptr, nullptr);
+            ComboBox_AddString(cb, L"Left");
+            ComboBox_AddString(cb, L"Right");
+            ComboBox_AddString(cb, L"Top");
+            ComboBox_AddString(cb, L"Bottom");
+            ComboBox_SetCurSel(cb, 0);
+            CreateWindowW(L"STATIC", L"Fade", WS_CHILD | WS_VISIBLE, 10, 46, 90, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.200", WS_CHILD | WS_VISIBLE, 104, 43, 70, 22, p, (HMENU)CFG_FADE, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Gamma", WS_CHILD | WS_VISIBLE, 10, 76, 90, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1.000", WS_CHILD | WS_VISIBLE, 104, 73, 70, 22, p, (HMENU)CFG_GAMMA, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Gain", WS_CHILD | WS_VISIBLE, 10, 106, 90, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.000", WS_CHILD | WS_VISIBLE, 104, 103, 70, 22, p, (HMENU)CFG_GAIN, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Slope", WS_CHILD | WS_VISIBLE, 10, 136, 90, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.000", WS_CHILD | WS_VISIBLE, 104, 133, 70, 22, p, (HMENU)CFG_SLOPE, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                190, 43, 96, 24, p, (HMENU)CFG_BAPPLY, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Apply to all 4 edges", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                190, 78, 150, 22, p, (HMENU)CFG_BALL, nullptr, nullptr);
+            CreateWindowW(L"STATIC",
+                L"Fade = soft ramp width, Gamma = ramp response.\n"
+                L"Gain/Slope shape the curve: f(x)=(g+1)x / (slope(x-1)+gx+1).\n"
+                L"Live editing with red points is available in blend mode (F10).",
+                WS_CHILD | WS_VISIBLE, 10, 180, 360, 60, p, nullptr, nullptr, nullptr);
+        }
+        // --- Color page (index 4) ---
+        {
+            HWND p = g_cfgPanel[4];
+            static const wchar_t* names[5] = { L"Brightness", L"Contrast", L"Gamma R", L"Gamma G", L"Gamma B" };
+            for (int i = 0; i < 5; i++) {
+                CreateWindowW(L"STATIC", names[i], WS_CHILD | WS_VISIBLE,
+                    10, 14 + i * 40, 90, 18, p, nullptr, nullptr, nullptr);
+                CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ,
+                    104, 8 + i * 40, 190, 30, p, (HMENU)CFG_CTB(i), nullptr, nullptr);
+                SendMessageW(GetDlgItem(p, CFG_CTB(i)), TBM_SETRANGE, TRUE, MAKELPARAM(20, 300));
+            }
+            CreateWindowW(L"BUTTON", L"Reset", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                104, 214, 90, 26, p, (HMENU)CFG_CRESET, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"(this projector only)",
+                WS_CHILD | WS_VISIBLE, 204, 219, 150, 18, p, nullptr, nullptr, nullptr);
+        }
+        // --- Masking page (index 5) ---
+        {
+            HWND p = g_cfgPanel[5];
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+                WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL,
+                10, 10, 220, 160, p, (HMENU)CFG_MLIST, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Add 10%x10%", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                244, 10, 120, 26, p, (HMENU)CFG_MADD, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Delete selected", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                244, 44, 120, 26, p, (HMENU)CFG_MDEL, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Clear all", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                244, 78, 120, 26, p, (HMENU)CFG_MCLEAR, nullptr, nullptr);
+            CreateWindowW(L"STATIC",
+                L"Mask rectangles render black on the output (up to 8).\n"
+                L"Move/resize masks by editing the config file for now:\n"
+                L"each line mask=i:x:y:w:h (normalized 0..1).",
+                WS_CHILD | WS_VISIBLE, 10, 184, 360, 60, p, nullptr, nullptr, nullptr);
+        }
+        // --- Bezels / Align / Help placeholders (0, 1, 6) ---
+        CreateWindowW(L"STATIC",
+            L"Bezel compensation (shift the image by the monitor bezel width)\n"
+            L"is not implemented yet. Overlap-driven tiling is on the console.",
+            WS_CHILD | WS_VISIBLE, 20, 20, 350, 40, g_cfgPanel[0], nullptr, nullptr, nullptr);
+        CreateWindowW(L"STATIC",
+            L"Automatic camera alignment is not implemented.\n"
+            L"Use Ctrl+F3 (screenshot calibration) + the output window's grid.",
+            WS_CHILD | WS_VISIBLE, 20, 20, 350, 40, g_cfgPanel[1], nullptr, nullptr, nullptr);
+        CreateWindowW(L"STATIC",
+            L"F3  enter/exit calibration          F10  warp <-> blend mode\n"
+            L"F12 (Ctrl+F12 global)  cycle blend edges\n"
+            L"Ctrl+F3  freeze frame for alignment  D  color dialog\n"
+            L"Arrows  nudge point 1px / Shift+Arrows 10px\n"
+            L"Blend mode wheel: gamma | Ctrl+wheel gain | Shift+wheel slope",
+            WS_CHILD | WS_VISIBLE, 20, 20, 350, 100, g_cfgPanel[6], nullptr, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            318, 400, 90, 26, hwnd, (HMENU)IDCANCEL, nullptr, nullptr);
+        cfgReloadAll();
+        cfgShowPage();
+        return 0;
+    }
+    case WM_NOTIFY: {
+        NMHDR* nm = (NMHDR*)lp;
+        if (nm->idFrom == CFG_TAB && nm->code == TCN_SELCHANGE) { cfgShowPage(); return 0; }
+        break;
+    }
+    case WM_HSCROLL:
+        cfgApplyColor();
+        return 0;
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == CFG_PROJ && HIWORD(wp) == CBN_SELCHANGE) {
+            g_cfgSel = ComboBox_GetCurSel(g_cfgProj);
+            cfgReloadGeometry();
+            cfgReloadBlend();
+            cfgReloadColor();
+            cfgReloadMasks();
+            return 0;
+        }
+        if (id == CFG_GAPPLY) {   // rebuild the grid at the new density
+            int cols = (int)cfgEditF(g_cfgPanel[2], CFG_HORIZ);
+            int rows = (int)cfgEditF(g_cfgPanel[2], CFG_VERT);
+            cols = cols < 3 ? 3 : (cols > 24 ? 24 : cols);
+            rows = rows < 3 ? 3 : (rows > 24 ? 24 : rows);
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                OutputCfg* o = cfgOutput();
+                if (o) { o->cols = cols; o->rows = rows; o->initIdentity(); g_rev++; }
+            }
+            cfgReloadGeometry();
+            refreshList();
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_FLIPH) {
+            cfgTransformPoints([](float& x, float& y) { (void)y; x = 1.0f - x; });
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_FLIPV) {
+            cfgTransformPoints([](float& x, float& y) { (void)x; y = 1.0f - y; });
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_ROT90) {
+            cfgTransformPoints([](float& x, float& y) { float t = x; x = 1.0f - y; y = t; });
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_GRESET) {
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                OutputCfg* o = cfgOutput();
+                if (o) { o->initIdentity(); g_rev++; }
+            }
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_BAPPLY) {
+            int side = ComboBox_GetCurSel(GetDlgItem(g_cfgPanel[3], CFG_SIDE));
+            if (side < 0 || side > 3) side = 0;
+            bool all = Button_GetCheck(GetDlgItem(g_cfgPanel[3], CFG_BALL)) == BST_CHECKED;
+            float fade = cfgEditF(g_cfgPanel[3], CFG_FADE);
+            float gamma = cfgEditF(g_cfgPanel[3], CFG_GAMMA);
+            float gain = cfgEditF(g_cfgPanel[3], CFG_GAIN);
+            float slope = cfgEditF(g_cfgPanel[3], CFG_SLOPE);
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                OutputCfg* o = cfgOutput();
+                if (o) {
+                    BlendSide b;
+                    b.fade = clampf(fade, 0.0f, 0.5f);
+                    b.gamma = clampf(gamma, 0.1f, 5.0f);
+                    b.gain = clampf(gain, 0.0f, 2.0f);
+                    b.slope = clampf(slope, 0.0f, 1.0f);
+                    for (int s = 0; s < 4; s++)
+                        if (all || s == side) o->blend[s] = b;
+                    g_rev++;
+                }
+            }
+            cfgReloadBlend();
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_CRESET) {
+            for (int i = 0; i < 5; i++)
+                SendMessageW(GetDlgItem(g_cfgPanel[4], CFG_CTB(i)), TBM_SETPOS, TRUE, 100);
+            cfgApplyColor();
+            return 0;
+        }
+        if (id == CFG_MADD || id == CFG_MDEL || id == CFG_MCLEAR) {
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                OutputCfg* o = cfgOutput();
+                if (o) {
+                    if (id == CFG_MADD) {
+                        if (o->masks.size() < 8)
+                            o->masks.push_back(MaskRect{});   // 10%x10% at top-left
+                    } else if (id == CFG_MDEL) {
+                        int sel = ListBox_GetCurSel(GetDlgItem(g_cfgPanel[5], CFG_MLIST));
+                        if (sel >= 0 && sel < (int)o->masks.size())
+                            o->masks.erase(o->masks.begin() + sel);
+                    } else {
+                        o->masks.clear();
+                    }
+                    g_rev++;
+                }
+            }
+            cfgReloadMasks();
+            return 0;
+        }
+        if (id == IDCANCEL) { DestroyWindow(hwnd); return 0; }
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        g_cfgDlg = nullptr;
+        g_cfgTab = nullptr;
+        g_cfgProj = nullptr;
+        for (auto& h : g_cfgPanel) h = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void openConfigDialogInternal(HINSTANCE hInst) {
+    if (g_cfgDlg) {
+        SetWindowPos(g_cfgDlg, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        return;
+    }
+    // start on the output selected in the console list, if any
+    int sel = ListBox_GetCurSel(g_list);
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        g_cfgSel = 0;
+        auto displays = enumerateDisplays();
+        if (sel >= 0 && sel < (int)displays.size()) {
+            int n = 0;
+            for (auto& o : g_cfg.outputs) {
+                if (sameDisplayName(o.deviceName, displays[sel].deviceName))
+                    g_cfgSel = n;
+                n++;
+            }
+            if (g_cfgSel >= n) g_cfgSel = n ? n - 1 : 0;
+        }
+    }
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = CfgDlgProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"IWN_CfgDlg";
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+    g_cfgDlg = CreateWindowExW(WS_EX_TOPMOST, L"IWN_CfgDlg",
+        L"Configure display",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        160, 120, 424, 474, nullptr, nullptr, hInst, nullptr);
+}
+
+void openConfigDialog() {
+    openConfigDialogInternal(GetModuleHandleW(nullptr));
+}
+
 static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -951,11 +1415,14 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         CreateWindowW(L"BUTTON", L"Color adjustment...",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 388, 170, 28,
             hwnd, (HMENU)IDC_COLOR, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Configure display...",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 190, 388, 180, 28,
+            hwnd, (HMENU)IDC_CFGDLG, nullptr, nullptr);
         g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 190, 392, 190, 24,
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 385, 392, 190, 24,
             hwnd, (HMENU)IDC_CKNET, nullptr, nullptr);
         g_ckAuto = CreateWindowW(L"BUTTON", L"Start with Windows",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 390, 392, 170, 24,
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 455, 420, 170, 24,
             hwnd, (HMENU)IDC_CKAUTO, nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Sampling:",
             WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 424, 62, 18,
@@ -1023,10 +1490,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ComboBox_AddString(g_cbEng, L"DOPP (n/a)");
         // structured status block (Projector / Mode / Color balancing / edges)
         g_statusInfo = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 526, 545, 76,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 526, 620, 76,
             hwnd, nullptr, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 598, 545, 40,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 598, 620, 40,
             hwnd, nullptr, nullptr, nullptr);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -1222,6 +1689,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             }
         } else if (id == IDC_COLOR && HIWORD(wp) == BN_CLICKED) {
             openColorDialog(GetModuleHandleW(nullptr), hwnd);
+        } else if (id == IDC_CFGDLG && HIWORD(wp) == BN_CLICKED) {
+            openConfigDialogInternal(GetModuleHandleW(nullptr));
         } else if (id == IDC_EDGES && HIWORD(wp) == BN_CLICKED) {
             cycleBlendEdges();
         } else if (id == IDC_CKNET && HIWORD(wp) == BN_CLICKED) {
@@ -1347,7 +1816,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterClassW(&wc);
     uiThreadId = GetCurrentThreadId();
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 580, 700,
+        WS_OVERLAPPEDWINDOW, 100, 100, 650, 700,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);
