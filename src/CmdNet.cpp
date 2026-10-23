@@ -126,6 +126,8 @@ static std::string dispatch(std::string line) {
                     char b[64];
                     if (field == "fade")  { sprintf_s(b, "OK %s.fade=%.3f\n",  sides[s], o.blend[s].fade);  return b; }
                     if (field == "gamma") { sprintf_s(b, "OK %s.gamma=%.3f\n", sides[s], o.blend[s].gamma); return b; }
+                    if (field == "gain")  { sprintf_s(b, "OK %s.gain=%.3f\n",  sides[s], o.blend[s].gain);  return b; }
+                    if (field == "slope") { sprintf_s(b, "OK %s.slope=%.3f\n", sides[s], o.blend[s].slope); return b; }
                 }
                 return "ERR GET " + k + "\n";
             }
@@ -212,6 +214,8 @@ static std::string dispatch(std::string line) {
                     if (!o.enabled) continue;
                     if (field == "fade")  { o.blend[s].fade  = clampf(v, 0.0f, 0.5f); applied = true; }
                     if (field == "gamma") { o.blend[s].gamma = clampf(v, 0.1f, 5.0f); applied = true; }
+                    if (field == "gain")  { o.blend[s].gain  = clampf(v, 0.0f, 2.0f); applied = true; }
+                    if (field == "slope") { o.blend[s].slope = clampf(v, 0.0f, 1.0f); applied = true; }
                 }
             }
             if (!applied && key == "testpattern") {

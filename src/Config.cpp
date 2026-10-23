@@ -68,6 +68,7 @@ static std::wstring fromUtf8(const std::string& s) {
 
 static void writeSide(std::ostream& os, const char* name, const BlendSide& s, const std::vector<AdvPoint>& adv) {
     os << name << ".fade=" << s.fade << "\n" << name << ".gamma=" << s.gamma << "\n";
+    os << name << ".gain=" << s.gain << "\n" << name << ".slope=" << s.slope << "\n";
     os << name << ".advN=" << adv.size() << "\n";
     for (auto& p : adv)
         os << name << ".adv=" << p.pos << "," << p.fade << "," << p.gamma << "\n";
@@ -118,6 +119,8 @@ static void parseSideVal(const std::string& key, const std::string& val, OutputC
     auto& adv = o.adv[side];
     if (key == "fade") b.fade = (float)atof(val.c_str());
     else if (key == "gamma") b.gamma = (float)atof(val.c_str());
+    else if (key == "gain") b.gain = clampf((float)atof(val.c_str()), 0.0f, 2.0f);
+    else if (key == "slope") b.slope = clampf((float)atof(val.c_str()), 0.0f, 1.0f);
     else if (key == "advN") adv.clear();
     else if (key == "adv") {
         AdvPoint p; sscanf_s(val.c_str(), "%f,%f,%f", &p.pos, &p.fade, &p.gamma);

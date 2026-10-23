@@ -25,6 +25,12 @@ void dbgLogLine(const std::string& line);
 struct BlendSide {
     float fade = 0.0f;   // fraction of output dimension, 0..0.5
     float gamma = 1.0f;
+    // parametric blend curve (matches the original's Gain/Slope per side):
+    // f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1). gain=0, slope=0 gives
+    // the plain linear ramp f(x)=x that earlier builds used, so defaults
+    // preserve existing configs pixel-for-pixel. gain 0..2, slope 0..1.
+    float gain = 0.0f;
+    float slope = 0.0f;
 };
 
 struct AdvPoint {

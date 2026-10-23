@@ -201,11 +201,17 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEWHEEL: {
         if (!g_calib.load() || !st || st->dragKind < 1) break;
         float dir = (short)HIWORD(wp) > 0 ? 0.05f : -0.05f;
+        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         if (auto* cfg = cfgForWindowNoLock(st)) {
+            // wheel = gamma (original behaviour), Ctrl+wheel = gain,
+            // Shift+wheel = slope of the parametric blend curve
             if (st->dragKind == 1) {
                 auto& b = cfg->blend[st->dragIdx];
-                b.gamma = clampf(b.gamma + dir, 0.1f, 6.0f);
+                if (ctrl)      b.gain  = clampf(b.gain + dir, 0.0f, 2.0f);
+                else if (shift) b.slope = clampf(b.slope + dir, 0.0f, 1.0f);
+                else           b.gamma = clampf(b.gamma + dir, 0.1f, 6.0f);
             } else {
                 auto& p = cfg->adv[st->dragIdx][st->advIdx];
                 p.gamma = clampf(p.gamma + dir, 0.1f, 6.0f);
@@ -484,7 +490,7 @@ void switchSubModeAll() {
     if (!g_calib.load()) { setStatus(L"Press F3 (or Configure alignment) first."); return; }
     int m = g_calibMode.fetch_xor(1) ^ 1;   // 0 warp <-> 1 blend
     for (auto& p : g_outWins) p.second->subMode = m;
-    setStatus(m == 1 ? L"Mode: Edge blending (red = simple handles, blue = advanced). F10 to switch back."
+    setStatus(m == 1 ? L"Mode: Edge blending (red = simple handles, blue = advanced). Wheel = gamma, Ctrl+wheel = gain, Shift+wheel = slope. F10 to switch back."
                      : L"Mode: Geometrical correction (drag green points). F10 to switch.");
     refreshStatusBar();
 }

@@ -27,7 +27,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 4. "Start Output" 启动全屏输出（先勾 Test pattern 显示测试图）
 5. "Configure alignment" 或 F3 进入校准：
    - 拖绿色控制点做几何校正（方向键微调，Shift+方向键大步）
-   - F10 切到融合模式：拖红点调融合宽度，滚轮调 gamma
+   - F10 切到融合模式：拖红点调融合宽度，滚轮调 gamma，Ctrl+滚轮调 gain，Shift+滚轮调 slope（融合曲线参数，默认 0/0 = 线性斜坡）
    - 勾选 "Advanced blending" 后为蓝点（每边多个）
    - Esc 退出校准
 6. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载
@@ -67,8 +67,9 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SNAPSHOT ON;\|SNAPSHOT OFF;` | `OK snapshot=on` | 冻结/恢复捕获帧（同 Ctrl+F3） |
 | `SAVE;` | `OK saved` | 保存配置到 config.txt |
 | `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
+| `SET left.gain=0.8;` / `SET left.slope=0.3;` | `OK left.gain=0.8` | 融合曲线增益/陡度（gain 0–2、slope 0–1；0/0 = 线性斜坡，slope=1 为硬切换） |
 | `SET testpattern=off;` | `OK testpattern=off` | 切换测试图 |
-| `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/各边 fade·gamma） |
+| `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/各边 fade·gamma·gain·slope） |
 | `GET displays;` | `OK displays=2;DISPLAY1=1920x1080*;DISPLAY2=1920x1080;` | 列出显示器拓扑（`*` = 主显示器），便于节目控制端挑捕获源 |
 | `SET source=DISPLAY2;` / `SET source=auto;` | `OK source=DISPLAY2` | 指定捕获源桌面（auto = 第一个非输出的显示器）。改动会重建输出窗口；若指定的显示器本身是输出，引擎按防递归规则回退自动选择 |
 | `AUTOSTART ON;\|AUTOSTART OFF;` | `OK autostart=on` | 开机自启（写入 HKCU Run，无需管理员） |
