@@ -452,6 +452,7 @@ static std::string dispatch(std::string line) {
     if (cmd == "PROBE") {
         bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_probe.load();
         g_probe.store(want);
+        requestMagProbeSync();   // engine=1: overlays follow on the UI thread
         return std::string("OK probe=") + (g_probe.load() ? "on" : "off") + "\n";
     }
 
@@ -465,6 +466,7 @@ static std::string dispatch(std::string line) {
         g_inplace.store(g_cfg.inplace);
         requestInplaceRestyle();   // restyle outputs
         requestMagTestSync();      // engine=1 test-pattern overlays follow
+        requestMagProbeSync();     // engine=1 probe-marker overlays follow
         Engine::inst().setSampling(g_cfg.sampling);
         Engine::inst().setTestImage(g_cfg.testImg);   // <0 clears the overlay
         if (!g_cfg.imagePath.empty()) engineLoadImage(g_cfg.imagePath);
@@ -806,6 +808,7 @@ static std::string dispatch(std::string line) {
                 g_rev++;
             }
             refreshStatusBar();
+            requestMagProbeSync();   // engine=1: probe grid follows the density
             return "OK " + key + "=" + val + "\n";
         }
         // grid transforms on every enabled output (same math as the dialog)
@@ -890,6 +893,7 @@ static std::string dispatch(std::string line) {
             if (!applied && key == "probe") {
                 g_probe.store(val == "ON" || val == "1" || val == "true");
                 applied = true;
+                requestMagProbeSync();   // engine=1: overlays follow
             }
             if (!applied && key == "inplace") {
                 g_inplace.store(val == "ON" || val == "1" || val == "true");

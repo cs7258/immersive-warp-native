@@ -34,6 +34,7 @@ static const wchar_t* MAG_CLASS = L"IWN_MagWnd";   // engine=1 magnifier host
 static const wchar_t* MAGTEST_CLASS = L"IWN_MagTestWnd"; // engine=1 test pattern
 static void syncMagTestOverlays(bool on);   // fwd: createOutputWindows calls it
 static void syncMagMaskOverlays();          // fwd: createOutputWindows calls it
+static void syncMagProbeOverlays(bool on);  // fwd: WM_MAGPROBE handler + createOutputWindows
 
 // GDI replica of the DXGI test pattern (Engine.cpp testPattern shader):
 // 24x16 checker, 12x8 grid lines, red border, green center cross. Drawn in
@@ -110,6 +111,7 @@ static LRESULT CALLBACK MagWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
 static std::vector<HWND> g_magTests;    // MAG test-pattern overlays (UI thread)
 static std::vector<HWND> g_magMasks;    // MAG black-mask overlays (UI thread)
+static std::vector<HWND> g_magProbes;   // MAG probe-marker overlays (UI thread)
 static std::vector<HWND> g_magBlends;   // MAG edge-blend overlays (UI thread)
 constexpr UINT WM_MAGBLEND = WM_APP + 13;   // MAG blend overlays resync (defined
                                             // before requestMagBlendSync uses it)
@@ -582,6 +584,10 @@ void createOutputWindows() {
     // repaint on their own 250 ms timer after the lock is released
     if (g_cfg.engine == 1)
         syncMagMaskOverlays();
+    // MAG probe-marker overlays (camera alignment): raise themselves above
+    // the blend bars on first paint
+    if (g_cfg.engine == 1)
+        syncMagProbeOverlays(g_probe.load());
     // MAG edge-blend overlays: marshalled so they paint after the lock
     requestMagBlendSync();
     // console always stays on top of the output windows (like the original)
@@ -601,6 +607,9 @@ void destroyOutputWindows() {
     for (HWND t : g_magMasks) magRemoveFilter(t);
     for (HWND t : g_magMasks) DestroyWindow(t);   // WM_DESTROY kills the timer
     g_magMasks.clear();
+    for (HWND t : g_magProbes) magRemoveFilter(t);
+    for (HWND t : g_magProbes) DestroyWindow(t);
+    g_magProbes.clear();
     for (auto& p : g_outWins) DestroyWindow(p.first);
     g_outWins.clear();
     Engine::inst().detachAll();
@@ -774,6 +783,134 @@ static void syncMagMaskOverlays() {
         magAddFilter(ov);
     }
     dbgLogLine("syncMagMaskOverlays: " + std::to_string(g_magMasks.size()) + " overlay(s)");
+}
+
+// ------------------------------------------------------------------
+// MAG probe overlays: white crosses at a uniform rows x cols grid, one
+// layered window per MAG host. Camera-alignment parity with the DXGI
+// engine's probe pass (white crosses at the warp destination points); MAG
+// has no warp mesh, so the markers sit on an even grid across the mirror.
+// Create/destroy driven by explicit resync hooks (PROBE / SET probe= /
+// LOAD / host rebuild) - few entry points, so no polling timer is needed.
+static const wchar_t* MAGPROBE_CLASS = L"IWN_MagProbeWnd";
+
+static bool paintMagProbe(HWND ov, HWND host);   // fwd: posted self-message
+
+static LRESULT CALLBACK MagProbeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_USER + 1) {              // deferred first paint (lock-free)
+        paintMagProbe(hwnd, GetWindow(hwnd, GW_OWNER));
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// paint the probe grid: opaque white crosses (12 px arms, 2 px stroke, 4 px
+// center dot) inset so border markers stay fully visible. Probe off paints
+// a fully transparent layer (the window stays but shows nothing).
+static bool paintMagProbe(HWND ov, HWND host) {
+    if (!ov || !host) return false;
+    OutWinState* st = (OutWinState*)GetWindowLongPtrW(host, GWLP_USERDATA);
+    if (!st) return false;
+    auto displays = enumerateDisplays();
+    if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return false;
+    bool on = g_probe.load();
+    int rows = 10, cols = 10;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs)
+            if (o.enabled && o.deviceName == displays[st->displayIdx].deviceName) {
+                rows = o.rows; cols = o.cols;
+                break;
+            }
+    }
+    RECT wr{};
+    GetWindowRect(host, &wr);
+    int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    if (w <= 0 || h <= 0) return false;
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = w; bi.bV5Height = -h; bi.bV5Planes = 1; bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00; bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC sdc = GetDC(nullptr);
+    HDC mdc = CreateCompatibleDC(sdc);
+    HBITMAP bmp = CreateDIBSection(sdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bmp && bits) {
+        auto* px = (unsigned*)bits;      // all-zero = fully transparent
+        if (on) {
+            const int arm = 12, inset = arm + 4;
+            auto put = [&](int x, int y) {
+                if (x < 0 || y < 0 || x >= w || y >= h) return;
+                px[(size_t)y * w + x] = 0xFFFFFFFF;   // opaque white
+            };
+            for (int r = 0; r < rows; r++) {
+                int cy = rows > 1 ? inset + (int)((long long)(h - 2 * inset) * r / (rows - 1))
+                                  : h / 2;
+                for (int c = 0; c < cols; c++) {
+                    int cx = cols > 1 ? inset + (int)((long long)(w - 2 * inset) * c / (cols - 1))
+                                      : w / 2;
+                    for (int d = -arm; d <= arm; d++) {
+                        put(cx + d, cy); put(cx + d, cy + 1);      // horizontal
+                        put(cx, cy + d); put(cx + 1, cy + d);      // vertical
+                    }
+                    for (int dy = -2; dy <= 1; dy++)
+                        for (int dx = -2; dx <= 1; dx++) put(cx + dx, cy + dy);
+                }
+            }
+        }
+        SelectObject(mdc, bmp);
+        POINT src{ 0, 0 };
+        SIZE sz{ w, h };
+        BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        UpdateLayeredWindow(ov, sdc, nullptr, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+        if (on)
+            // the blend overlays are created asynchronously after us and on
+            // every edges/fade change - keep the markers readable above them
+            SetWindowPos(ov, HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(mdc);
+    ReleaseDC(nullptr, sdc);
+    return true;
+}
+
+// UI thread: one probe overlay per MAG host when `on` (create/destroy
+// semantics, idempotent). Callers decide engine + state; safe under
+// g_cfgMutex - the paint is deferred via a posted self-message.
+static void syncMagProbeOverlays(bool on) {
+    for (HWND t : g_magProbes) magRemoveFilter(t);
+    for (HWND t : g_magProbes) DestroyWindow(t);
+    g_magProbes.clear();
+    if (!on) {
+        dbgLogLine("syncMagProbeOverlays: off");
+        return;
+    }
+    WNDCLASSW tc{};
+    tc.lpfnWndProc = MagProbeWndProc;
+    tc.hInstance = GetModuleHandleW(nullptr);
+    tc.lpszClassName = MAGPROBE_CLASS;
+    RegisterClassW(&tc);
+    for (auto& p : g_outWins) {
+        RECT r; GetWindowRect(p.first, &r);
+        HWND ov = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+            MAGPROBE_CLASS, L"PROBE", WS_POPUP | WS_VISIBLE,
+            r.left, r.top, r.right - r.left, r.bottom - r.top,
+            p.first, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!ov) continue;
+        PostMessageW(ov, WM_USER + 1, 0, 0);   // paint after the lock
+        typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
+        auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                           "SetWindowDisplayAffinity");
+        if (fn) fn(ov, 0x11);
+        g_magProbes.push_back(ov);
+        magAddFilter(ov);
+    }
+    dbgLogLine("syncMagProbeOverlays: " + std::to_string(g_magProbes.size()) + " overlay(s)");
 }
 
 // ------------------------------------------------------------------
@@ -999,6 +1136,11 @@ static void syncMagBlendOverlays() {
         DestroyWindow(g_magBlends[i]);
         g_magBlends.erase(g_magBlends.begin() + i);
     }
+    // blend bars just (re)landed above everything - raise the probe markers
+    // back so camera alignment stays readable over the fade bands
+    for (HWND t : g_magProbes)
+        SetWindowPos(t, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 // ------------------------------------------------------------------
@@ -1082,6 +1224,7 @@ constexpr UINT WM_INPLACESET = WM_APP + 11;   // in-place overlay toggled off-th
 constexpr UINT WM_MAGTEST = WM_APP + 14;      // test pattern changed off-thread
 constexpr UINT WM_TGTREFRESH = WM_APP + 15;   // refresh the Target combo (off-thread)
 constexpr UINT WM_DISPCHANGE = WM_APP + 16;   // deferred output rebuild after
+constexpr UINT WM_MAGPROBE = WM_APP + 17;     // probe markers toggled off-thread
                                               // WM_DISPLAYCHANGE (the handler
                                               // must not do heavy work inline)
 static DWORD uiThreadId = 0;
@@ -1610,6 +1753,12 @@ void requestMagTestSync() {
     // socket thread: test pattern toggled -> GDI overlays follow on the UI
     // thread (engine=1 only; the DXGI engine renders it in the shader)
     if (g_ctl) PostMessageW(g_ctl, WM_MAGTEST, 0, 0);
+}
+
+void requestMagProbeSync() {
+    // socket thread: probe markers toggled -> overlays follow on the UI
+    // thread (engine=1 only; the DXGI engine draws them in its overlay pass)
+    if (g_ctl) PostMessageW(g_ctl, WM_MAGPROBE, 0, 0);
 }
 
 // ---- NxN tiled layout -------------------------------------------------------
@@ -3089,6 +3238,15 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_MAGBLEND: {     // MAG edge-blend overlays: create/remove/repaint
         syncMagBlendOverlays();
+        return 0;
+    }
+    case WM_MAGPROBE: {     // probe markers toggled from the socket thread
+        bool on;
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            on = g_cfg.engine == 1;
+        }
+        syncMagProbeOverlays(on && g_probe.load() && !g_outWins.empty());
         return 0;
     }
     case WM_LAYSET: {   // tiled layout changed from the socket thread

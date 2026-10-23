@@ -124,6 +124,7 @@ void requestInplaceRestyle();
 void requestMagBlendSync();    // any thread: MAG edge-blend overlays resync (UI thread)
 void requestOutputRebuild();   // any thread: destroy+recreate output windows on the UI thread
 void requestMagTestSync();     // any thread: test pattern overlays follow (engine=1)
+void requestMagProbeSync();    // any thread: probe marker overlays follow (engine=1)
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
 
 // ---- DWM Magnification engine (src/MagEngine.cpp) --------------------
