@@ -146,6 +146,7 @@ static std::string dispatch(std::string line) {
         if (k == "calib")    return std::string("OK calib=")    + (g_calib.load() ? "on" : "off") + "\n";
         if (k == "mode")     return std::string("OK mode=")     + (g_calibMode.load() == 1 ? "blend" : "warp") + "\n";
         if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
+        if (k == "probe")    return std::string("OK probe=")    + (g_probe.load() ? "on" : "off") + "\n";
         // remote health monitoring: one line, key=value; pairs (STATUS style)
         if (k == "perf") {
             int nOut = 0;
@@ -232,6 +233,7 @@ static std::string dispatch(std::string line) {
             s += std::string("calib=") + (g_calib.load() ? "on" : "off") + ";";
             s += "mode=" + std::string(g_calibMode.load() == 1 ? "blend" : "warp") + ";";
             s += std::string("snapshot=") + (g_snapshot.load() ? "on" : "off") + ";";
+            s += std::string("probe=") + (g_probe.load() ? "on" : "off") + ";";
             s += std::string("autostart=") + (queryAutostart() ? "on" : "off") + ";";
             std::wstring src = currentSourceDevice();   // locks g_cfgMutex itself
             s += "source=" + (src.empty() ? std::string("auto") : shortDev(src)) + ";";
@@ -384,7 +386,8 @@ static std::string dispatch(std::string line) {
                ";masks=" + std::to_string(masks) +
                ";testpattern=" + std::string(tp ? "on" : "off") +
                ";source=" + (src.empty() ? std::string("auto") : shortDev(src)) +
-               ";out=" + (tgt.empty() ? std::string("auto") : tgt) + "\n";
+               ";out=" + (tgt.empty() ? std::string("auto") : tgt) +
+               ";probe=" + std::string(g_probe.load() ? "on" : "off") + "\n";
     }
 
     if (cmd == "CALIB") {
@@ -412,6 +415,14 @@ static std::string dispatch(std::string line) {
         bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_snapshot.load();
         if (g_snapshot.load() != want) toggleSnapshot();
         return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
+    }
+
+    // camera alignment probe markers (white crosses at the warp dest points).
+    // PROBE (no arg) toggles; PROBE ON/OFF sets explicitly.
+    if (cmd == "PROBE") {
+        bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_probe.load();
+        g_probe.store(want);
+        return std::string("OK probe=") + (g_probe.load() ? "on" : "off") + "\n";
     }
 
     if (cmd == "SAVE") return saveConfig(L"") ? "OK saved\n" : "ERR SAVE\n";
@@ -822,6 +833,10 @@ static std::string dispatch(std::string line) {
             }
             if (!applied && key == "testpattern") {
                 g_cfg.testPattern = (val == "ON" || val == "1" || val == "true");
+                applied = true;
+            }
+            if (!applied && key == "probe") {
+                g_probe.store(val == "ON" || val == "1" || val == "true");
                 applied = true;
             }
             if (!applied) return "ERR SET " + key + "\n";

@@ -12,6 +12,7 @@ std::atomic<bool> g_previewMode{ false };
 std::atomic<bool> g_previewNoCapture{ false };
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_snapshot{ false };
+std::atomic<bool> g_probe{ false };
 
 std::vector<DisplayInfo> enumerateDisplays() {
     std::vector<DisplayInfo> result;

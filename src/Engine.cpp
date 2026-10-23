@@ -855,6 +855,20 @@ void Engine::buildOverlay(OutputCtx& oc, const OutputCfg& cfg) {
             ovQuad(tris, x, y, half, 0.2f, 1.0f, 0.4f);
         }
     }
+    // camera alignment probe: bright white crosses at every warp destination
+    // point. A calibration camera detects these, measures where each point
+    // actually landed, and the auto-aligner feeds corrections back through
+    // SET warp.load. Independent of calibration mode (drawn in both).
+    if (g_probe.load()) {
+        float half = 12.0f / std::max((float)oc.w, 1.0f);
+        size_t nPts = cfg.points.size() / 2;
+        for (size_t p = 0; p < nPts; p++) {
+            float x = cfg.points[p * 2], y = cfg.points[p * 2 + 1];
+            ovLine(lines, x - half, y, x + half, y, 1.0f, 1.0f, 1.0f);
+            ovLine(lines, x, y - half, x, y + half, 1.0f, 1.0f, 1.0f);
+            ovQuad(tris, x, y, half * 0.4f, 1.0f, 1.0f, 1.0f);
+        }
+    }
     // blend handles: visible in blend mode even when parked at the edge;
     // in warp mode only shown when actually configured (fade > 0)
     float half = 6.0f / std::max((float)oc.w, 1.0f);
@@ -1095,7 +1109,7 @@ void Engine::renderAll() {
                 oc->meshRev = g_rev.load();
             }
             updateFrameCB(*oc, *cfg);
-            if (g_calib.load()) buildOverlay(*oc, *cfg);
+            if (g_calib.load() || g_probe.load()) buildOverlay(*oc, *cfg);
         }
         drawOutput(*oc, *cfg);
     }

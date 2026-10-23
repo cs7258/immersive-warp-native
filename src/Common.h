@@ -123,6 +123,10 @@ extern std::atomic<bool> g_running;
 // alignment can be done on a stable image (matches the original's
 // "Edit Warp and Blend with screenshot")
 extern std::atomic<bool> g_snapshot;
+// PROBE mode: bright white cross markers at every warp destination point so
+// a calibration camera can detect where each grid point actually landed and
+// feed the measured positions back through SET warp.load (auto-alignment)
+extern std::atomic<bool> g_probe;
 
 struct DisplayInfo {
     std::wstring deviceName, label;
