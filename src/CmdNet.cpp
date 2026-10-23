@@ -375,12 +375,16 @@ void cmdnetStart(int port) {
     }
     g_listenSock = s;
     g_netRun.store(true);
+    // one thread per client: a show controller may open a second connection
+    // for monitoring while the first one keeps commanding (the serial loop
+    // used to park the second accept until the first client disconnected,
+    // which looked like random connection resets to fast clients)
     g_netThread = std::thread([s]() {
         while (g_netRun.load()) {
             sockaddr_in ca{}; int cl = sizeof(ca);
             SOCKET c = accept(s, (sockaddr*)&ca, &cl);
             if (c == INVALID_SOCKET) break;
-            handleClient(c);
+            std::thread([c]() { handleClient(c); }).detach();
         }
     });
     g_netThread.detach();
