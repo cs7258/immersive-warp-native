@@ -3102,6 +3102,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_COMMAND: {
         int id = LOWORD(wp);
+        if (id == IDC_EXIT) {   // toolbar Exit (id 1008: OUTSIDE the menu-id
+            DestroyWindow(hwnd);   // range below - a range check would eat it)
+            return 0;
+        }
         if (id >= IDM_FILE_LOAD && id <= IDM_HELP_ABOUT) {
             // menu bar commands (HIWORD(wp) is 0 for menus, so these are
             // handled in their own branch before the control chain)
@@ -3110,7 +3114,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 applyLoadedConfig();
             } else if (id == IDM_FILE_SAVE) {
                 setStatus(saveConfig(L"") ? L"Config saved." : L"Save failed.");
-            } else if (id == IDM_FILE_EXIT || id == IDC_EXIT) {
+            } else if (id == IDM_FILE_EXIT) {
                 DestroyWindow(hwnd);
             } else if (id >= IDM_VIEW_DISP && id < IDM_VIEW_DISP + PAGE_COUNT) {
                 int pg = id - IDM_VIEW_DISP;
