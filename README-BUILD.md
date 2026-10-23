@@ -65,7 +65,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 
 - **多页布局**：Tab 条（Displays / Warp & Blend / Image & Test / Settings）+ 底部常驻条（Configure alignment / Enable Desktop warping / Engine 选择器）+ 结构化状态块，与原版控制台同构；View 菜单可切页并与 Tab 勾选联动。
 - **菜单栏**：File（Load/Save Config、Exit）、View（四页切换、Hide console to tray）、Warping（Configure alignment F3、Cycle blend edges Ctrl+F12、Snapshot freeze Ctrl+F3、Test pattern）、Help（About）。
-- **工具栏**：Tab 条上方一排扁平快捷按钮（Load / Save / Test / In-place / Calibrate / Start / Stop），复用菜单与页面控件的命令 ID——任何入口触发的都是同一份状态机。
+- **工具栏**：Tab 条上方一排扁平快捷按钮（Load / Save / Test / In-place / Calibrate / Start / Stop），右端固定 **Exit**（与原版图标条同位），复用菜单与页面控件的命令 ID——任何入口触发的都是同一份状态机。
 - **Displays 页输出示意图**：按显示器真实相对位置摆放的虚线框图——启用输出为橙色虚线框并标 `[PROJECTOR]`，未启用为灰色虚线框（对应原版的显示器示意区）。
 - **全套深色主题**：控制台窗口 + 全部子控件（列表/下拉/按钮/Tab）应用 `DarkMode_Explorer` 主题（Win10 1809+），配合深色背景与橙色状态行，观感对齐原版。
 

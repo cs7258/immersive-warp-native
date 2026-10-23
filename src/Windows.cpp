@@ -2648,7 +2648,7 @@ static void drawDisplaySchematic(DRAWITEMSTRUCT* dis) {
 static bool isToolbarCmd(int id) {
     return id == IDC_LOAD || id == IDC_SAVE || id == IDM_WARP_TEST ||
            id == IDM_VIEW_INPLACE || id == IDC_CALIB ||
-           id == IDC_START || id == IDC_STOP;
+           id == IDC_START || id == IDC_STOP || id == IDC_EXIT;
 }
 
 static void drawToolbarGlyph(HDC dc, int id, int x, int y, int s) {
@@ -2715,6 +2715,17 @@ static void drawToolbarGlyph(HDC dc, int id, int x, int y, int s) {
     case IDC_STOP: {                       // stop square
         RECT q{ x, y, x + s, y + s };
         FillRect(dc, &q, acc);
+        break;
+    }
+    case IDC_EXIT: {                       // X mark (original: toolbar right end)
+        HPEN xp = CreatePen(PS_SOLID, 2, RGB(232, 148, 10));
+        HGDIOBJ op2 = SelectObject(dc, xp);
+        MoveToEx(dc, x + 1, y + 1, nullptr);
+        LineTo(dc, x + s - 1, y + s - 1);
+        MoveToEx(dc, x + s - 1, y + 1, nullptr);
+        LineTo(dc, x + 1, y + s - 1);
+        SelectObject(dc, op2);
+        DeleteObject(xp);
         break;
     }
     }
@@ -2789,6 +2800,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 tbx, 8, b.w, 26, hwnd, (HMENU)(INT_PTR)b.id, nullptr, nullptr);
             tbx += b.w + 6;
         }
+        // Exit pinned to the right end, like the original's icon strip
+        CreateWindowW(L"BUTTON", L"Exit",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            632 - 58 - 10, 8, 58, 26, hwnd, (HMENU)(INT_PTR)IDC_EXIT, nullptr, nullptr);
         CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 8, 38, 622, 2,
             hwnd, nullptr, nullptr, nullptr);
@@ -3095,7 +3110,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 applyLoadedConfig();
             } else if (id == IDM_FILE_SAVE) {
                 setStatus(saveConfig(L"") ? L"Config saved." : L"Save failed.");
-            } else if (id == IDM_FILE_EXIT) {
+            } else if (id == IDM_FILE_EXIT || id == IDC_EXIT) {
                 DestroyWindow(hwnd);
             } else if (id >= IDM_VIEW_DISP && id < IDM_VIEW_DISP + PAGE_COUNT) {
                 int pg = id - IDM_VIEW_DISP;
