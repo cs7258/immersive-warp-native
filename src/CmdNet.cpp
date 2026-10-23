@@ -238,6 +238,31 @@ static std::string dispatch(std::string line) {
             return b;
         }
         if (k == "presets") return listPresets();
+        // warp grid dump: "GET warp" lists every dest point as "x,y" pairs
+        // (space separated, row-major), "GET warp=r,c" reads one point.
+        if (k == "warp" || k.compare(0, 5, "warp=") == 0) {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            OutputCfg* o = targetOutputLocked();
+            if (!o) return "ERR no output (SET out=<name>?)\n";
+            char b[40];
+            if (k.size() > 5) {
+                int r, c;
+                if (sscanf_s(k.c_str() + 5, "%d,%d", &r, &c) != 2)
+                    return "ERR GET warp (want warp or warp=r,c)\n";
+                if (r < 0 || r >= o->rows || c < 0 || c >= o->cols)
+                    return "ERR GET warp (row %d col %d out of %dx%d grid)\n";
+                size_t i = ((size_t)r * o->cols + c) * 2;
+                sprintf_s(b, "OK point=%d,%d,%.4f,%.4f\n", r, c, o->points[i], o->points[i + 1]);
+                return b;
+            }
+            sprintf_s(b, "OK warp=%d;%d;", o->rows, o->cols);
+            std::string s = b;
+            for (size_t i = 0; i < o->points.size(); i += 2) {
+                sprintf_s(b, " %.4f,%.4f", o->points[i], o->points[i + 1]);
+                s += b;
+            }
+            return s + "\n";
+        }
         if (k == "rows" || k == "cols") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             OutputCfg* o = targetOutputLocked();
@@ -609,6 +634,29 @@ static std::string dispatch(std::string line) {
             }
             refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
             return "OK color=" + val + "\n";
+        }
+        // single warp control point: "SET point=r,c,x,y" moves the dest
+        // position of one grid node (row-major, 0-based). Dest points may go
+        // slightly outside [0..1] (keystone), clamped to -0.5..1.5 like the
+        // drag handler's working range. Next-frame effect via g_rev++.
+        if (key == "point") {
+            int r, c;
+            float x, y;
+            if (sscanf_s(val.c_str(), "%d,%d,%f,%f", &r, &c, &x, &y) != 4)
+                return "ERR SET point (want r,c,x,y)\n";
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                OutputCfg* o = targetOutputLocked();
+                if (!o) return "ERR no output (SET out=<name>?)\n";
+                if (r < 0 || r >= o->rows || c < 0 || c >= o->cols)
+                    return "ERR SET point (row %d col %d out of %dx%d grid)\n";
+                size_t i = ((size_t)r * o->cols + c) * 2;
+                o->points[i]     = clampf(x, -0.5f, 1.5f);
+                o->points[i + 1] = clampf(y, -0.5f, 1.5f);
+                g_rev++;
+            }
+            refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
+            return "OK point=" + val + "\n";
         }
         // grid density (REBUILDS each warp grid, dropping manual point edits,
         // same as the Configure dialog's Apply). Targets the selected output

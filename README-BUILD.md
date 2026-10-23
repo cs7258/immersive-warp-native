@@ -93,6 +93,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET engine;` / `SET engine=dxgi;` | `OK engine=desktopduplication` | 查询/选择 warp 引擎；当前构建只有 Desktop Duplication，其余为占位 |
 | `GET rows;` / `GET cols;` | `OK rows=10` | 查询（第一个启用的）输出的控制点网格密度 |
 | `SET rows=8;` / `SET cols=16;` | `OK rows=8` | 重建所有启用输出的控制点网格（3–24；**会丢弃手工校正点**，与对话框 Apply 一致） |
+| `GET warp;` / `GET warp=r,c;` / `SET point=r,c,x,y;` | `OK point=1,1,0.1500,0.1200` | 远程校正单个控制点：`GET warp` 全量导出（`rows;cols;` + 每点 `x,y` 空格分隔，行优先），`GET warp=r,c` / `SET point=r,c,x,y` 读写单点（0 基，归一化坐标，允许 -0.5–1.5 梯形出界）；遵循 `SET out=` 定向 |
 | `SET flip=H;` / `SET flip=V;` | `OK flip=H` | 所有启用输出水平/垂直镜像（对已校正的点阵做变换） |
 | `SET rotate=90;` / `SET rotate=-90;` | `OK rotate=90` | 所有启用输出旋转 90°（顺/逆时针） |
 | `GET curved;` / `SET curved=on;` | `OK curved=on` | 弯曲网格：控制点间 Catmull-Rom 插值（需 Horiz/Vert ≥ 4，否则自动回退双线性）。off = 双线性（默认） |
