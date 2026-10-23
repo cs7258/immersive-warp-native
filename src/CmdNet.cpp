@@ -658,6 +658,41 @@ static std::string dispatch(std::string line) {
             refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
             return "OK point=" + val + "\n";
         }
+        // batch grid import, replacing the whole dest-point list: "x,y"
+        // pairs separated by SPACES (';' terminates the wire command), count
+        // must match rows*cols of the target output. Pairs with GET warp for
+        // snapshot/restore and camera-feedback auto-alignment loops.
+        if (key == "warp.load") {
+            std::vector<float> pts;
+            size_t pos = 0;
+            bool bad = false;
+            while (pos <= val.size()) {
+                size_t sp = val.find(' ', pos);
+                std::string t = val.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos);
+                if (!t.empty()) {
+                    float px, py;
+                    if (sscanf_s(t.c_str(), "%f,%f", &px, &py) != 2) { bad = true; break; }
+                    pts.push_back(clampf(px, -0.5f, 1.5f));
+                    pts.push_back(clampf(py, -0.5f, 1.5f));
+                }
+                if (sp == std::string::npos) break;
+                pos = sp + 1;
+            }
+            if (bad) return "ERR SET warp.load (want x,y pairs, space separated)\n";
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                OutputCfg* o = targetOutputLocked();
+                if (!o) return "ERR no output (SET out=<name>?)\n";
+                if (pts.size() != o->points.size())
+                    return "ERR SET warp.load (want " +
+                           std::to_string(o->rows * o->cols) + " points, got " +
+                           std::to_string(pts.size() / 2) + ")\n";
+                o->points = pts;
+                g_rev++;
+            }
+            refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
+            return "OK warp.load=" + std::to_string(pts.size() / 2) + "\n";
+        }
         // grid density (REBUILDS each warp grid, dropping manual point edits,
         // same as the Configure dialog's Apply). Targets the selected output
         // when one is set, else every enabled output (legacy).
