@@ -698,6 +698,7 @@ constexpr UINT WM_SRCSET = WM_APP + 9;
 constexpr UINT WM_LAYSET = WM_APP + 10;
 constexpr UINT WM_INPLACESET = WM_APP + 11;   // in-place overlay toggled off-thread
 constexpr UINT WM_MAGTEST = WM_APP + 14;      // test pattern changed off-thread
+constexpr UINT WM_TGTREFRESH = WM_APP + 15;   // refresh the Target combo (off-thread)
 static DWORD uiThreadId = 0;
 constexpr UINT WM_TRAYICON = WM_APP + 7;
 static std::mutex g_layMsgMutex;
@@ -2062,7 +2063,7 @@ static void refreshPresetCombo() {
 // Reads the shared command target (cmdGetTarget), so network and UI always
 // agree. Safe on the socket thread (CMDNET SET out= calls it) -- it takes
 // g_cfgMutex itself; never call it while that mutex is held.
-void refreshTargetComboUI() {
+static void refreshTargetComboNow() {
     if (!g_cbTarget) return;
     g_tgtBusy = true;
     ComboBox_ResetContent(g_cbTarget);
@@ -2088,6 +2089,18 @@ void refreshTargetComboUI() {
         if (_stricmp(g_tgtShort[i].c_str(), cur.c_str()) == 0) { sel = (int)i; break; }
     ComboBox_SetCurSel(g_cbTarget, sel);
     g_tgtBusy = false;
+}
+
+void refreshTargetComboUI() {
+    // combo calls are SendMessage to a UI-thread window: from the socket
+    // thread they block until the UI thread pumps messages - and while it is
+    // busy rebuilding outputs that wait is unbounded (SET out= would hang).
+    // Marshal to the UI thread instead, mirroring refreshEngineComboUI.
+    if (g_ctl && uiThreadId && GetCurrentThreadId() != uiThreadId) {
+        PostMessageW(g_ctl, WM_TGTREFRESH, 0, 0);
+        return;
+    }
+    refreshTargetComboNow();
 }
 
 // shared by Load Config and preset load: resync all UI + engine state after
@@ -2638,6 +2651,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             Button_SetCheck(g_ckTest, g_cfg.testPattern ? BST_CHECKED : BST_UNCHECKED);
         syncMagTestOverlays(on);
         invalidateToolbarToggles();   // Test button checked frame
+        return 0;
+    }
+    case WM_TGTREFRESH: {   // Target dropdown refresh marshalled from socket
+        refreshTargetComboNow();
         return 0;
     }
     case WM_LAYSET: {   // tiled layout changed from the socket thread
