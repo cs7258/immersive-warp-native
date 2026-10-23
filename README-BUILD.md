@@ -31,7 +31,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
    - F10 切到融合模式：拖红点调融合宽度，滚轮调 gamma，Ctrl+滚轮调 gain，Shift+滚轮调 slope（融合曲线参数，默认 0/0 = 线性斜坡）
    - 勾选 "Advanced blending" 后为蓝点（每边多个）
    - Esc 退出校准
-7. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载；"Preset:" 行可把当前整套配置（几何/融合/掩码/布局）存为命名预设并随时一键切回——预设文件与 CMDNET 的 `SAVEAS`/`LOADAS` 命令共用同一目录，名称规则同为 A-Z 0-9 `_` `-`
+7. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载；"Preset:" 行可把当前整套配置（几何/融合/掩码/布局）存为命名预设并随时一键切回——预设文件与 CMDNET 的 `SAVEAS`/`LOADAS` 命令共用同一目录，名称规则同为 A-Z 0-9 `_` `-`；**托盘图标右键菜单也带 "Load preset" 子菜单**（逐项列出预设，单击即切换）
 8. "Configure display..." 打开每投影机配置对话框（对应原版同名牌）：七标签页 **Bezels / Align / Geometry / Blending / Color / Masking / Help**
    - **Geometry**：控制点 Horiz/Vert 密度（3–24，Apply 会重置网格）、水平/垂直镜像、旋转 90°、Reset grid
    - **Blending**：按边（Left/Right/Top/Bottom）设置 Fade/Gamma/Gain/Slope，可勾选"Apply to all 4 edges"同步

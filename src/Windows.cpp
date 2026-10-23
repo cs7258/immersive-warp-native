@@ -426,6 +426,8 @@ static std::vector<std::wstring> g_srcDevs;
 #define IDM_TRAY_START 2002
 #define IDM_TRAY_STOP  2003
 #define IDM_TRAY_EXIT  2004
+#define IDM_TRAY_PRESET 2200   // +0..31: dynamic preset submenu (not used by dialog ids)
+#define TRAY_PRESET_MAX 32
 
 // cross-thread capture-source change (CMDNET runs on the socket thread).
 // constexpr so it can be used as a switch case label.
@@ -440,6 +442,26 @@ static LayMsg g_layMsg;
 // ---------------- tray icon ----------------
 static NOTIFYICONDATAW g_nid{};
 static bool g_trayOn = false;
+
+// nth preset name (alphabetical order as returned by FindFirstFile); shared by
+// the tray submenu build and its click handler so indices stay consistent
+static bool presetNameByIndex(int idx, std::wstring& out) {
+    std::wstring file = presetPath("x");
+    std::wstring dir = file.substr(0, file.find_last_of(L'\\') + 1);
+    int n = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*.cfg").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring nm = fd.cFileName;
+            if (nm.size() > 4 && nm.rfind(L".cfg") == nm.size() - 4) nm = nm.substr(0, nm.size() - 4);
+            if (n++ == idx) { out = nm; FindClose(h); return true; }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return false;
+}
 
 static void trayInit(HWND hwnd) {
     if (g_trayOn) return;
@@ -470,6 +492,18 @@ static void showTrayMenu(HWND hwnd) {
     AppendMenuW(m, MF_STRING, IDM_TRAY_START, L"Start Output");
     AppendMenuW(m, MF_STRING, IDM_TRAY_STOP, L"Stop Output");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    // named presets: one-click scene switching (same files as CMDNET SAVEAS/LOADAS)
+    {
+        HMENU pm = CreatePopupMenu();
+        int n = 0;
+        std::wstring nm;
+        while (n < TRAY_PRESET_MAX && presetNameByIndex(n, nm)) {
+            AppendMenuW(pm, MF_STRING, IDM_TRAY_PRESET + n, nm.c_str());
+            n++;
+        }
+        if (!n) AppendMenuW(pm, MF_STRING | MF_GRAYED, 0, L"(no presets)");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)pm, L"Load preset");
+    }
     AppendMenuW(m, MF_STRING, IDM_TRAY_EXIT, L"Exit");
     SetForegroundWindow(hwnd);   // required so the menu dismisses on outside click
     TrackPopupMenu(m, TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, nullptr);
@@ -2061,6 +2095,17 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 // placeholders: only Desktop Duplication exists in this build
                 ComboBox_SetCurSel(g_cbEng, 0);
                 setStatus(L"Only Desktop Duplication is available in this build.");
+            }
+        } else if (id >= IDM_TRAY_PRESET && id < IDM_TRAY_PRESET + TRAY_PRESET_MAX) {
+            std::wstring nm;
+            if (presetNameByIndex(id - IDM_TRAY_PRESET, nm) &&
+                loadConfig(presetPath(toNarrowStr(nm.c_str())))) {
+                applyLoadedConfig();
+                wchar_t msg[96];
+                wsprintfW(msg, L"Preset '%s' loaded (tray).", nm.c_str());
+                setStatus(msg);
+            } else {
+                setStatus(L"Preset load failed.");
             }
         } else if (id == IDM_TRAY_SHOW) {
             if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
