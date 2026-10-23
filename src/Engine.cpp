@@ -371,7 +371,13 @@ bool engineSetTestImage(int id) { return Engine::inst().setTestImage(id); }
 static void dbgLog(const std::string& line) { dbgLogLine(line); }
 
 void dbgLogLine(const std::string& line) {
+    // called from the render thread (mesh/attach), the UI thread (window
+    // create/destroy) and the CMDNET thread - without this lock the shared
+    // ofstream races and heap corruption kills the process mid-test with no
+    // trace at all
+    static std::mutex s_mtx;
     static std::ofstream* f = nullptr;
+    std::lock_guard<std::mutex> lk(s_mtx);
     if (!f) {
         wchar_t path[MAX_PATH];
         SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path);

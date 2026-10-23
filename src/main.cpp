@@ -2,6 +2,32 @@
 #include "Engine.h"
 #include <thread>
 
+// vectored exception handler: silent deaths during test runs (frequent output
+// rebuilds) left no trace at all - no WER event, no log line. This writes the
+// exception code + offset-in-module into debug.log so a failing build can be
+// diagnosed from the test machine alone.
+static LONG WINAPI iwnExcHandler(EXCEPTION_POINTERS* ep) {
+    HMODULE m = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&iwnExcHandler, &m);
+    uintptr_t off = m ? (uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)m : 0;
+    dbgLog("FATAL exc=0x" +
+           [](DWORD c) {
+               char b[16];
+               sprintf_s(b, "%08lX", (unsigned long)c);
+               return std::string(b);
+           }(ep->ExceptionRecord->ExceptionCode) +
+           " @module+0x" +
+           [](uintptr_t v) {
+               char b[24];
+               sprintf_s(b, "%llX", (unsigned long long)v);
+               return std::string(b);
+           }(off) +
+           " tid=" + std::to_string((long)GetCurrentThreadId()));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void renderLoop() {
     while (g_running.load()) {
         Engine::inst().renderAll();
@@ -23,6 +49,7 @@ static void enableDpiAwareness() {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     (void)nCmdShow;
+    AddVectoredExceptionHandler(1, iwnExcHandler);
     enableDpiAwareness();
     // initial config: one entry per display, all disabled
     {
