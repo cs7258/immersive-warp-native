@@ -66,9 +66,11 @@ static int edgesMask(const std::string& v) {
 
 // GET presets: names of all saved presets (without the .cfg extension)
 static std::string listPresets() {
-    wchar_t path[MAX_PATH];
-    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path);
-    std::wstring dir = std::wstring(path) + L"\\ImmersiveWarpNative\\presets";
+    // derive the presets dir from presetPath() instead of calling
+    // SHGetFolderPathW here (keeps the path logic in Config.cpp, avoids
+    // pulling shlobj.h into the socket TU)
+    std::wstring file = presetPath("x");
+    std::wstring dir = file.substr(0, file.find_last_of(L'\\') + 1);
     std::string out = "OK presets=";
     bool first = true;
     WIN32_FIND_DATAW fd;
