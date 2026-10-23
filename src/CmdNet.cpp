@@ -158,6 +158,60 @@ static std::string dispatch(std::string line) {
             std::string t = currentTarget();
             return "OK out=" + (t.empty() ? std::string("auto") : t) + "\n";
         }
+        // full state dump in the same key=value; pairing as STATUS: global
+        // keys first, then one outN.* block per output (masks use SPACES
+        // between rects because ';' would end the pair). A show controller
+        // can mirror the whole UI state in one round trip.
+        if (k == "config") {
+            char b[96];
+            std::string s;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                s += "sampling=" + std::to_string(g_cfg.sampling) + ";";
+                s += std::string("testpattern=") + (g_cfg.testPattern ? "on" : "off") + ";";
+                s += "layout=" + std::to_string(g_cfg.layoutC) + "x" + std::to_string(g_cfg.layoutR) + ";";
+                s += "overlap=" + std::to_string(g_cfg.overlap) + ";";
+                s += std::string("curved=") + (g_cfg.curved ? "on" : "off") + ";";
+                s += std::string("engine=") + (g_cfg.engine == 0 ? "desktopduplication" : "unknown") + ";";
+                int n = 0;
+                for (auto& o : g_cfg.outputs) {
+                    char p[8];
+                    sprintf_s(p, "out%d.", n++);
+                    s += std::string(p) + "dev=" + shortDev(o.deviceName) + ";";
+                    s += std::string(p) + "enabled=" + (o.enabled ? "1" : "0") + ";";
+                    s += std::string(p) + "rows=" + std::to_string(o.rows) + ";";
+                    s += std::string(p) + "cols=" + std::to_string(o.cols) + ";";
+                    s += std::string(p) + "edges=" + edgesName(o.edges) + ";";
+                    static const char* sd[4] = { "left", "right", "top", "bottom" };
+                    for (int q = 0; q < 4; q++) {
+                        sprintf_s(b, "%s%s.fade=%.3f;%s%s.gamma=%.3f;%s%s.gain=%.3f;%s%s.slope=%.3f;",
+                                  p, sd[q], o.blend[q].fade, p, sd[q], o.blend[q].gamma,
+                                  p, sd[q], o.blend[q].gain, p, sd[q], o.blend[q].slope);
+                        s += b;
+                    }
+                    const ColorAdj& c = o.color;
+                    sprintf_s(b, "%scolor=%.3f,%.3f,%.3f,%.3f,%.3f;",
+                              p, c.gammaR, c.gammaG, c.gammaB, c.bright, c.contrast);
+                    s += b;
+                    sprintf_s(b, "%smasks=%d", p, (int)o.masks.size());
+                    s += b;
+                    for (auto& m : o.masks) {
+                        sprintf_s(b, " %.3f,%.3f,%.3f,%.3f", m.x, m.y, m.w, m.h);
+                        s += b;
+                    }
+                    s += ";";
+                }
+            }
+            s += std::string("calib=") + (g_calib.load() ? "on" : "off") + ";";
+            s += "mode=" + std::string(g_calibMode.load() == 1 ? "blend" : "warp") + ";";
+            s += std::string("snapshot=") + (g_snapshot.load() ? "on" : "off") + ";";
+            s += std::string("autostart=") + (queryAutostart() ? "on" : "off") + ";";
+            std::wstring src = currentSourceDevice();   // locks g_cfgMutex itself
+            s += "source=" + (src.empty() ? std::string("auto") : shortDev(src)) + ";";
+            std::string t = currentTarget();
+            s += "out=" + (t.empty() ? std::string("auto") : t) + ";";
+            return "OK " + s + "\n";
+        }
         // mask rectangles of the command-target output, normalized 0..1:
         // "OK masks=2;0.000,0.000,0.100,0.100;0.500,0.500,0.200,0.200;"
         if (k == "masks") {
