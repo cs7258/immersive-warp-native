@@ -12,19 +12,19 @@ static LONG WINAPI iwnExcHandler(EXCEPTION_POINTERS* ep) {
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCWSTR)&iwnExcHandler, &m);
     uintptr_t off = m ? (uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)m : 0;
-    dbgLog("FATAL exc=0x" +
-           [](DWORD c) {
-               char b[16];
-               sprintf_s(b, "%08lX", (unsigned long)c);
-               return std::string(b);
-           }(ep->ExceptionRecord->ExceptionCode) +
-           " @module+0x" +
-           [](uintptr_t v) {
-               char b[24];
-               sprintf_s(b, "%llX", (unsigned long long)v);
-               return std::string(b);
-           }(off) +
-           " tid=" + std::to_string((long)GetCurrentThreadId()));
+    dbgLogLine("FATAL exc=0x" +
+               [](DWORD c) {
+                   char b[16];
+                   sprintf_s(b, "%08lX", (unsigned long)c);
+                   return std::string(b);
+               }(ep->ExceptionRecord->ExceptionCode) +
+               " @module+0x" +
+               [](uintptr_t v) {
+                   char b[24];
+                   sprintf_s(b, "%llX", (unsigned long long)v);
+                   return std::string(b);
+               }(off) +
+               " tid=" + std::to_string((long)GetCurrentThreadId()));
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
