@@ -31,6 +31,74 @@ struct OutWinState {
 };
 static const wchar_t* OUT_CLASS = L"IWN_OutputWnd";
 static const wchar_t* MAG_CLASS = L"IWN_MagWnd";   // engine=1 magnifier host
+static const wchar_t* MAGTEST_CLASS = L"IWN_MagTestWnd"; // engine=1 test pattern
+static void syncMagTestOverlays(bool on);   // fwd: createOutputWindows calls it
+
+// GDI replica of the DXGI test pattern (Engine.cpp testPattern shader):
+// 24x16 checker, 12x8 grid lines, red border, green center cross. Drawn in
+// an overlay on top of the magnifier host because the MAG engine has no
+// render pipeline of its own.
+static LRESULT CALLBACK MagTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int W = rc.right, H = rc.bottom;
+        // 24x16 checker (same greys as the shader)
+        for (int row = 0; row < 16; row++)
+            for (int col = 0; col < 24; col++) {
+                if ((col + row) % 2 == 0) continue;
+                RECT cell{ col * W / 24, row * H / 16,
+                           (col + 1) * W / 24, (row + 1) * H / 16 };
+                HBRUSH b = CreateSolidBrush(RGB(97, 97, 97));   // 0.38
+                FillRect(dc, &cell, &b);
+                DeleteObject(b);
+            }
+        // base 0.06 grey where the checker is dark
+        HBRUSH dark = CreateSolidBrush(RGB(15, 15, 15));
+        for (int row = 0; row < 16; row++)
+            for (int col = 0; col < 24; col++) {
+                if ((col + row) % 2 != 0) continue;
+                RECT cell{ col * W / 24, row * H / 16,
+                           (col + 1) * W / 24, (row + 1) * H / 16 };
+                FillRect(dc, &cell, &dark);
+            }
+        DeleteObject(dark);
+        // 12x8 grid lines
+        HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(217, 217, 217));   // 0.85
+        HGDIOBJ oldPen = SelectObject(dc, gridPen);
+        for (int c = 1; c < 12; c++) {
+            MoveToEx(dc, c * W / 12, 0, nullptr);
+            LineTo(dc, c * W / 12, H);
+        }
+        for (int r = 1; r < 8; r++) {
+            MoveToEx(dc, 0, r * H / 8, nullptr);
+            LineTo(dc, W, r * H / 8);
+        }
+        SelectObject(dc, oldPen);
+        DeleteObject(gridPen);
+        // red border
+        HPEN redPen = CreatePen(PS_SOLID, 3, RGB(255, 64, 64));
+        oldPen = SelectObject(dc, redPen);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, 1, 1, W - 1, H - 1);
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(redPen);
+        // green center cross
+        HPEN greenPen = CreatePen(PS_SOLID, 1, RGB(38, 255, 38));
+        oldPen = SelectObject(dc, greenPen);
+        MoveToEx(dc, W / 2, 0, nullptr); LineTo(dc, W / 2, H);
+        MoveToEx(dc, 0, H / 2, nullptr); LineTo(dc, W, H / 2);
+        SelectObject(dc, oldPen);
+        DeleteObject(greenPen);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
 
 // Magnifier host proc: the Magnification API paints through the default
 // window procedure, we only keep click-to-raise disabled like DXGI outputs.
@@ -39,6 +107,7 @@ static LRESULT CALLBACK MagWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
+static std::vector<HWND> g_magTests;    // MAG test-pattern overlays (UI thread)
 
 static OutputCfg* cfgForWindowNoLock(OutWinState* st) {
     // caller must already hold g_cfgMutex
@@ -501,6 +570,9 @@ void createOutputWindows() {
         g_outWins.push_back({ hwnd, st });
         Engine::inst().attachOutput((int)i, hwnd);
     }
+    // MAG test pattern overlays (g_cfgMutex already held; no lock inside)
+    if (g_cfg.engine == 1 && g_cfg.testPattern != 0)
+        syncMagTestOverlays(true);
     // console always stays on top of the output windows (like the original)
     notifyOutputRaised();
 }
@@ -508,9 +580,51 @@ void createOutputWindows() {
 void destroyOutputWindows() {
     dbgLogLine("destroyOutputWindows: " + std::to_string(g_outWins.size()) + " window(s)");
     magDetachAll();   // no-op outside engine=1
+    // test-pattern overlays are owned by the mag hosts: destroy them first
+    for (HWND t : g_magTests) magRemoveFilter(t);
+    for (HWND t : g_magTests) DestroyWindow(t);
+    g_magTests.clear();
     for (auto& p : g_outWins) DestroyWindow(p.first);
     g_outWins.clear();
     Engine::inst().detachAll();
+}
+
+// UI thread: one GDI overlay per MAG host when `on`. Callers decide the
+// state BEFORE taking g_cfgMutex (createOutputWindows calls this while the
+// mutex is already held). The overlays sit in the mag filter list (and
+// WDA_EXCLUDEFROMCAPTURE) so they neither recurse the feed nor pollute a
+// capture of the output.
+static void syncMagTestOverlays(bool on) {
+    if (!on) {
+        for (HWND t : g_magTests) magRemoveFilter(t);
+        for (HWND t : g_magTests) DestroyWindow(t);
+        g_magTests.clear();
+        return;
+    }
+    WNDCLASSW tc{};
+    tc.lpfnWndProc = MagTestWndProc;
+    tc.hInstance = GetModuleHandleW(nullptr);
+    tc.lpszClassName = MAGTEST_CLASS;
+    RegisterClassW(&tc);
+    for (auto& p : g_outWins) {
+        // keep 1 overlay per host (idempotent)
+        bool have = false;
+        for (HWND t : g_magTests) if (GetWindow(t, GW_OWNER) == p.first) { have = true; break; }
+        if (have) continue;
+        RECT r; GetWindowRect(p.first, &r);
+        HWND ov = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            MAGTEST_CLASS, L"TEST PATTERN", WS_POPUP | WS_VISIBLE,
+            r.left, r.top, r.right - r.left, r.bottom - r.top,
+            p.first, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!ov) continue;
+        typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
+        auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                           "SetWindowDisplayAffinity");
+        if (fn) fn(ov, 0x11);
+        g_magTests.push_back(ov);
+        magAddFilter(ov);
+    }
+    dbgLogLine("syncMagTestOverlays: " + std::to_string(g_magTests.size()) + " overlay(s)");
 }
 
 // ------------------------------------------------------------------
@@ -583,6 +697,7 @@ static void showTab(int pg) {
 constexpr UINT WM_SRCSET = WM_APP + 9;
 constexpr UINT WM_LAYSET = WM_APP + 10;
 constexpr UINT WM_INPLACESET = WM_APP + 11;   // in-place overlay toggled off-thread
+constexpr UINT WM_MAGTEST = WM_APP + 14;      // test pattern changed off-thread
 static DWORD uiThreadId = 0;
 constexpr UINT WM_TRAYICON = WM_APP + 7;
 static std::mutex g_layMsgMutex;
@@ -1090,6 +1205,12 @@ void requestOutputRebuild() {
     // WM_INPLACESET entry point - it is already an idempotent rebuild that
     // also resyncs the overlay checkbox.
     if (g_ctl) PostMessageW(g_ctl, WM_INPLACESET, 0, 0);
+}
+
+void requestMagTestSync() {
+    // socket thread: test pattern toggled -> GDI overlays follow on the UI
+    // thread (engine=1 only; the DXGI engine renders it in the shader)
+    if (g_ctl) PostMessageW(g_ctl, WM_MAGTEST, 0, 0);
 }
 
 // ---- NxN tiled layout -------------------------------------------------------
@@ -1966,6 +2087,7 @@ static void applyLoadedConfig() {
     Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_ckInplace, g_cfg.inplace ? BST_CHECKED : BST_UNCHECKED);
     PostMessageW(g_ctl, WM_INPLACESET, 0, 0);   // style change needs a rebuild
+    PostMessageW(g_ctl, WM_MAGTEST, 0, 0);      // MAG test overlays follow the config
     Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
     Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
     Engine::inst().setSampling(g_cfg.sampling);
@@ -2336,7 +2458,17 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         // checkbox + View menu follow whichever entry point toggled it
         syncInplaceUI(hwnd);
         return 0;
-    }    case WM_LAYSET: {   // tiled layout changed from the socket thread
+    }
+    case WM_MAGTEST: {      // test pattern toggled from the socket thread
+        bool on;
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            on = g_cfg.engine == 1 && g_cfg.testPattern != 0;
+        }
+        syncMagTestOverlays(on);
+        return 0;
+    }
+    case WM_LAYSET: {   // tiled layout changed from the socket thread
         LayMsg m;
         {
             std::lock_guard<std::mutex> lk(g_layMsgMutex);
@@ -2472,9 +2604,14 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             g_cfg.enabled = Button_GetCheck(g_ckEnable) == BST_CHECKED;
             g_rev++;
         } else if (id == IDC_CKTEST && HIWORD(wp) == BN_CLICKED) {
-            std::lock_guard<std::mutex> lk(g_cfgMutex);
-            g_cfg.testPattern = Button_GetCheck(g_ckTest) == BST_CHECKED;
-            g_rev++;
+            bool on;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.testPattern = Button_GetCheck(g_ckTest) == BST_CHECKED;
+                on = g_cfg.engine == 1 && g_cfg.testPattern != 0;
+                g_rev++;
+            }
+            syncMagTestOverlays(on);   // no-op outside engine=1
         } else if (id == IDC_CKADV && HIWORD(wp) == BN_CLICKED) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             g_cfg.advancedBlend = Button_GetCheck(g_ckAdv) == BST_CHECKED;

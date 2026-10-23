@@ -122,6 +122,7 @@ extern std::atomic<bool> g_inplace;
 // (implemented in Windows.cpp; safe from any thread)
 void requestInplaceRestyle();
 void requestOutputRebuild();   // any thread: destroy+recreate output windows on the UI thread
+void requestMagTestSync();     // any thread: test pattern overlays follow (engine=1)
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
 
 // ---- DWM Magnification engine (src/MagEngine.cpp) --------------------
@@ -132,6 +133,8 @@ bool magEngineInit();                          // idempotent process-wide init
 void magEngineShutdown();                      // idempotent uninit
 bool magAttachOutput(HWND host, const RECT& srcDesktop); // source rect + recursion filter
 void magSetConsoleWindow(HWND ctl);            // console is excluded from the feed too
+void magAddFilter(HWND w);                     // extra windows hidden from the feed
+void magRemoveFilter(HWND w);
 void magDetachAll();                           // clear sources, uninit
 // set when WDA_EXCLUDEFROMCAPTURE is unavailable: capturing our own display
 // would recursively film the output window, so capture is disabled instead

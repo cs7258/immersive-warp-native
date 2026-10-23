@@ -461,6 +461,7 @@ static std::string dispatch(std::string line) {
         g_previewMode.store(g_cfg.previewMode);
         g_inplace.store(g_cfg.inplace);
         requestInplaceRestyle();   // restyle outputs
+        requestMagTestSync();      // engine=1 test-pattern overlays follow
         Engine::inst().setSampling(g_cfg.sampling);
         Engine::inst().setTestImage(g_cfg.testImg);   // <0 clears the overlay
         if (!g_cfg.imagePath.empty()) engineLoadImage(g_cfg.imagePath);

@@ -23,6 +23,18 @@ static std::mutex g_magMutex;
 static bool g_magReady = false;
 static std::vector<HWND> g_magHosts;
 static HWND g_magConsole = nullptr;   // excluded from the feed as well
+static std::vector<HWND> g_magExtras; // test-pattern overlays etc.
+
+// g_magMutex held: hosts + console + extras for every live host
+static void applyFiltersLocked() {
+    std::vector<HWND> filter = g_magHosts;
+    if (g_magConsole) filter.push_back(g_magConsole);
+    for (HWND e : g_magExtras) if (e && IsWindow(e)) filter.push_back(e);
+    for (HWND h : g_magHosts)
+        if (h && IsWindow(h))
+            MagSetWindowFilterList(h, MW_FILTERMODE_EXCLUDE,
+                                   (int)filter.size(), filter.data());
+}
 
 bool magEngineAvailable() {
     std::lock_guard<std::mutex> lk(g_magMutex);
@@ -59,19 +71,31 @@ bool magAttachOutput(HWND host, const RECT& srcDesktop) {
     }
     // exclude every host (incl. this one) plus the console from the feed
     g_magHosts.push_back(host);
-    std::vector<HWND> filter = g_magHosts;
-    if (g_magConsole) filter.push_back(g_magConsole);
-    if (!filter.empty())
-        MagSetWindowFilterList(host, MW_FILTERMODE_EXCLUDE,
-                               (int)filter.size(), filter.data());
+    applyFiltersLocked();
     dbgLogLine("magAttachOutput: host attached, filter=" +
-               std::to_string(filter.size()));
+               std::to_string((long)g_magHosts.size() + (g_magConsole ? 1 : 0) + g_magExtras.size()));
     return true;
 }
 
 void magSetConsoleWindow(HWND ctl) {
     std::lock_guard<std::mutex> lk(g_magMutex);
     g_magConsole = ctl;
+    applyFiltersLocked();
+}
+
+// extra windows that must never appear in the magnified feed (GDI test
+// pattern overlays). Applies to every live host immediately.
+void magAddFilter(HWND w) {
+    std::lock_guard<std::mutex> lk(g_magMutex);
+    if (w) g_magExtras.push_back(w);
+    applyFiltersLocked();
+}
+
+void magRemoveFilter(HWND w) {
+    std::lock_guard<std::mutex> lk(g_magMutex);
+    for (size_t i = 0; i < g_magExtras.size(); i++)
+        if (g_magExtras[i] == w) { g_magExtras.erase(g_magExtras.begin() + i); break; }
+    applyFiltersLocked();
 }
 
 void magDetachAll() {
