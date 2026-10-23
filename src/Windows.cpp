@@ -53,7 +53,7 @@ static LRESULT CALLBACK MagTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 RECT cell{ col * W / 24, row * H / 16,
                            (col + 1) * W / 24, (row + 1) * H / 16 };
                 HBRUSH b = CreateSolidBrush(RGB(97, 97, 97));   // 0.38
-                FillRect(dc, &cell, &b);
+                FillRect(dc, &cell, b);
                 DeleteObject(b);
             }
         // base 0.06 grey where the checker is dark
@@ -63,7 +63,7 @@ static LRESULT CALLBACK MagTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 if ((col + row) % 2 != 0) continue;
                 RECT cell{ col * W / 24, row * H / 16,
                            (col + 1) * W / 24, (row + 1) * H / 16 };
-                FillRect(dc, &cell, &dark);
+                FillRect(dc, &cell, dark);
             }
         DeleteObject(dark);
         // 12x8 grid lines
