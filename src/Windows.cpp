@@ -1740,7 +1740,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         auto add = [](int pg, HWND h) { if (h) g_pages[pg].push_back(h); return h; };
 
         // --- Displays page: output list + projector controls + capture source
-        add(PAGE_DISPLAYS, CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+        add(PAGE_DISPLAYS, g_list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
             WS_CHILD | LBS_NOTIFY | WS_VSCROLL,
             16, 44, 410, 180, hwnd, (HMENU)IDC_LIST, nullptr, nullptr));
         add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Toggle selected as projector",
