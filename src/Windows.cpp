@@ -646,22 +646,28 @@ static LRESULT CALLBACK MagBlendWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return DefWindowProcW(hwnd, msg, wp, lp);   // painted at creation/sync
 }
 
+// edges mask + fade values for one output (by OutWinState), under lock
+static bool magBlendInfo(OutWinState* st, int& edges, float fade[4]) {
+    if (!st) return false;
+    auto displays = enumerateDisplays();
+    if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return false;
+    edges = 0;
+    for (int s = 0; s < 4; s++) fade[s] = 0;
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    for (auto& o : g_cfg.outputs)
+        if (o.enabled && o.deviceName == displays[st->displayIdx].deviceName) {
+            edges = o.edges;
+            for (int s = 0; s < 4; s++) fade[s] = o.blend[s].fade;
+            return true;
+        }
+    return false;
+}
+
 static void paintMagBlend(HWND ov, HWND host) {
     OutWinState* st = (OutWinState*)GetWindowLongPtrW(host, GWLP_USERDATA);
-    if (!st) return;
-    auto displays = enumerateDisplays();
-    if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return;
     int edges = 0;
     float fade[4] = { 0, 0, 0, 0 };
-    {
-        std::lock_guard<std::mutex> lk(g_cfgMutex);
-        for (auto& o : g_cfg.outputs)
-            if (o.enabled && o.deviceName == displays[st->displayIdx].deviceName) {
-                edges = o.edges;
-                for (int s = 0; s < 4; s++) fade[s] = o.blend[s].fade;
-                break;
-            }
-    }
+    magBlendInfo(st, edges, fade);
     RECT wr{};
     GetWindowRect(host, &wr);
     int w = wr.right - wr.left, h = wr.bottom - wr.top;
@@ -735,6 +741,20 @@ static void syncMagBlendOverlays() {
         int mine = -1;
         for (size_t i = 0; i < g_magBlends.size(); i++)
             if (GetWindow(g_magBlends[i], GW_OWNER) == p.first) { mine = (int)i; break; }
+        // no fade content for this output (mask 0 or all fades 0): no overlay
+        int edges = 0; float fade[4] = { 0, 0, 0, 0 };
+        bool info = magBlendInfo((OutWinState*)GetWindowLongPtrW(p.first, GWLP_USERDATA), edges, fade);
+        bool content = info && edges != 0 &&
+            ((edges & 1 && fade[0] > 0) || (edges & 2 && fade[1] > 0) ||
+             (edges & 4 && fade[2] > 0) || (edges & 8 && fade[3] > 0));
+        if (!content) {
+            if (mine >= 0) {
+                magRemoveFilter(g_magBlends[mine]);
+                DestroyWindow(g_magBlends[mine]);
+                g_magBlends.erase(g_magBlends.begin() + mine);
+            }
+            continue;
+        }
         if (mine < 0) {
             RECT r{};
             GetWindowRect(p.first, &r);
