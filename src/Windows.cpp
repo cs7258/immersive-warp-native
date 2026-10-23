@@ -417,6 +417,7 @@ static HWND g_ckNet = nullptr;
 static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
 static HWND g_cbLayout = nullptr, g_cbOvl = nullptr, g_cbEng = nullptr;
 static HWND g_cbSrc = nullptr;
+static HWND g_cbPreset = nullptr;   // named presets (shared with CMDNET)
 // capture source combo: index 0 = auto, index i>0 = g_srcDevs[i]
 static std::vector<std::wstring> g_srcDevs;
 
@@ -685,6 +686,10 @@ void notifyOutputRaised() {
 #define IDC_CBOVL     1024   // tile overlap percent dropdown
 #define IDC_CBENG     1025   // warp engine dropdown
 #define IDC_CFGDLG    1026   // per-projector Configure display dialog
+#define IDC_CBPRESET  1027   // named preset dropdown (CMDNET SAVEAS/LOADAS files)
+#define IDC_PRESETSAVE 1028
+#define IDC_PRESETLOAD 1029
+#define IDC_PRESETDEL  1030
 
 static void refreshList() {
     if (!g_list) return;
@@ -1561,6 +1566,69 @@ void openConfigDialog() {
     openConfigDialogInternal(GetModuleHandleW(nullptr));
 }
 
+// named presets live in %APPDATA%\ImmersiveWarpNative\presets and are shared
+// with the CMDNET SAVEAS/LOADAS commands
+static std::string toNarrowStr(const wchar_t* w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string s((size_t)n - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+static void refreshPresetCombo() {
+    if (!g_cbPreset) return;
+    wchar_t keep[64] = L"";
+    int sel = ComboBox_GetCurSel(g_cbPreset);
+    if (sel >= 0) ComboBox_GetLBText(g_cbPreset, sel, keep);
+    ComboBox_ResetContent(g_cbPreset);
+    std::wstring file = presetPath("x");
+    std::wstring dir = file.substr(0, file.find_last_of(L'\\') + 1);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*.cfg").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring n = fd.cFileName;
+            if (n.size() > 4 && n.rfind(L".cfg") == n.size() - 4) n = n.substr(0, n.size() - 4);
+            ComboBox_AddString(g_cbPreset, n.c_str());
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (keep[0]) {   // keep the previous selection if that preset still exists
+        int cnt = ComboBox_GetCount(g_cbPreset);
+        for (int i = 0; i < cnt; i++) {
+            wchar_t t[64];
+            ComboBox_GetLBText(g_cbPreset, i, t);
+            if (wcscmp(t, keep) == 0) { ComboBox_SetCurSel(g_cbPreset, i); return; }
+        }
+    }
+    ComboBox_SetCurSel(g_cbPreset, 0);
+}
+
+// shared by Load Config and preset load: resync all UI + engine state after
+// loadConfig() swapped g_cfg. Must be called WITHOUT g_cfgMutex held.
+static void applyLoadedConfig() {
+    refreshList();
+    g_previewMode.store(g_cfg.previewMode);
+    Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
+    Engine::inst().setSampling(g_cfg.sampling);
+    ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
+    ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
+    syncLayoutCombos();
+    if (!g_cfg.imagePath.empty() && engineLoadImage(g_cfg.imagePath)) {
+        const wchar_t* base = g_cfg.imagePath.c_str();
+        for (const wchar_t* p = g_cfg.imagePath.c_str(); *p; p++)
+            if (*p == L'\\' || *p == L'/') base = p + 1;
+        wchar_t line[512];
+        wsprintfW(line, L"Image: %s  (%d x %d)", base,
+                  Engine::inst().imageWidth(), Engine::inst().imageHeight());
+        SetWindowTextW(g_imgLabel, line);
+    }
+    refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
+}
+
 static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -1696,12 +1764,32 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ComboBox_AddString(g_cbEng, L"DWM Magnification (n/a)");
         ComboBox_AddString(g_cbEng, L"NVAPI clone (n/a)");
         ComboBox_AddString(g_cbEng, L"DOPP (n/a)");
+        // named presets (shared with the CMDNET SAVEAS/LOADAS commands)
+        CreateWindowW(L"STATIC", L"Preset:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 528, 52, 18,
+            hwnd, nullptr, nullptr, nullptr);
+        g_cbPreset = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL,   // editable: type a new name then Save
+            64, 524, 210, 220,
+            hwnd, (HMENU)IDC_CBPRESET, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Save",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 284, 522, 78, 26,
+            hwnd, (HMENU)IDC_PRESETSAVE, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Load",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 368, 522, 78, 26,
+            hwnd, (HMENU)IDC_PRESETLOAD, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Delete",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 452, 522, 90, 26,
+            hwnd, (HMENU)IDC_PRESETDEL, nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"(CMDNET shared)",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 550, 528, 84, 18,
+            hwnd, nullptr, nullptr, nullptr);
         // structured status block (Projector / Mode / Color balancing / edges)
         g_statusInfo = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 526, 620, 76,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 562, 620, 76,
             hwnd, nullptr, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 598, 620, 40,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 636, 620, 40,
             hwnd, nullptr, nullptr, nullptr);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -1718,6 +1806,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         populateSourceCombo();   // locks g_cfgMutex itself
         syncLayoutCombos();
         trayInit(hwnd);
+        refreshPresetCombo();
         refreshStatusBar();
         return 0;
     }
@@ -1778,25 +1867,37 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             setStatus(saveConfig(L"") ? L"Config saved." : L"Save failed.");
         } else if (id == IDC_LOAD && HIWORD(wp) == BN_CLICKED) {
             setStatus(loadConfig(L"") ? L"Config loaded." : L"Load failed (no file?).");
-            refreshList();
-            // config may have changed preview/image state -> resync the UI
-            g_previewMode.store(g_cfg.previewMode);
-            Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
-            Button_SetCheck(g_ckImage, (g_cfg.useImage && engineHasImage()) ? BST_CHECKED : BST_UNCHECKED);
-            Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
-            Engine::inst().setSampling(g_cfg.sampling);
-            ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
-            ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
-            syncLayoutCombos();
-            if (!g_cfg.imagePath.empty() && engineLoadImage(g_cfg.imagePath)) {
-                const wchar_t* base = g_cfg.imagePath.c_str();
-                for (const wchar_t* p = g_cfg.imagePath.c_str(); *p; p++)
-                    if (*p == L'\\' || *p == L'/') base = p + 1;
-                wchar_t line[512];
-                wsprintfW(line, L"Image: %s  (%d x %d)", base,
-                          Engine::inst().imageWidth(), Engine::inst().imageHeight());
-                SetWindowTextW(g_imgLabel, line);
+            applyLoadedConfig();
+        } else if (id == IDC_PRESETSAVE && HIWORD(wp) == BN_CLICKED) {
+            wchar_t name[64] = L"";
+            GetWindowTextW(g_cbPreset, name, 64);   // typed text or the selected item
+            // only safe name characters (same rule as the CMDNET commands;
+            // a typed name may contain anything, so re-check here)
+            bool ok = name[0] && wcslen(name) <= 32;
+            for (const wchar_t* p = name; *p; p++)
+                if (!((*p >= L'A' && *p <= L'Z') || (*p >= L'0' && *p <= L'9') || *p == L'_' || *p == L'-'))
+                    ok = false;
+            if (!ok) { setStatus(L"Preset name: A-Z 0-9 _ - only (max 32)."); return 0; }
+            setStatus(saveConfig(presetPath(toNarrowStr(name))) ? (std::wstring(L"Preset '") + name + L"' saved.").c_str()
+                                                               : L"Save failed.");
+            refreshPresetCombo();
+        } else if (id == IDC_PRESETLOAD && HIWORD(wp) == BN_CLICKED) {
+            wchar_t name[64] = L"";
+            GetWindowTextW(g_cbPreset, name, 64);
+            if (!name[0]) { setStatus(L"No preset selected."); return 0; }
+            if (loadConfig(presetPath(toNarrowStr(name)))) {
+                applyLoadedConfig();
+                setStatus((std::wstring(L"Preset '") + name + L"' loaded.").c_str());
+            } else {
+                setStatus(L"Load failed (no such preset?).");
             }
+        } else if (id == IDC_PRESETDEL && HIWORD(wp) == BN_CLICKED) {
+            wchar_t name[64] = L"";
+            GetWindowTextW(g_cbPreset, name, 64);
+            if (!name[0]) { setStatus(L"No preset selected."); return 0; }
+            setStatus(DeleteFileW(presetPath(toNarrowStr(name))) ? (std::wstring(L"Preset '") + name + L"' deleted.").c_str()
+                                                                 : L"Delete failed.");
+            refreshPresetCombo();
         } else if (id == IDC_CKENABLE && HIWORD(wp) == BN_CLICKED) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             g_cfg.enabled = Button_GetCheck(g_ckEnable) == BST_CHECKED;
@@ -2024,7 +2125,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterClassW(&wc);
     uiThreadId = GetCurrentThreadId();
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 650, 700,
+        WS_OVERLAPPEDWINDOW, 100, 100, 650, 744,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);
