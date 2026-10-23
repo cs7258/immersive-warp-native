@@ -87,6 +87,9 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET flip=H;` / `SET flip=V;` | `OK flip=H` | 所有启用输出水平/垂直镜像（对已校正的点阵做变换） |
 | `SET rotate=90;` / `SET rotate=-90;` | `OK rotate=90` | 所有启用输出旋转 90°（顺/逆时针） |
 | `GET curved;` / `SET curved=on;` | `OK curved=on` | 弯曲网格：控制点间 Catmull-Rom 插值（需 Horiz/Vert ≥ 4，否则自动回退双线性）。off = 双线性（默认） |
+| `GET masks;` | `OK masks=2;0.100,0.200,0.300,0.400;…` | 列出第一个启用输出的黑位掩码矩形（归一化 0..1，x,y,w,h） |
+| `SET mask.add=x,y,w,h;` / `SET mask.set=i,x,y,w,h;` | `OK masks=2` | 新增 / 按索引（0 基）改写掩码矩形；值域 0..1 越界报 ERR，w/h 自动限幅保证矩形不出屏；上限 8 个；下一帧生效并随 Save Config 持久化 |
+| `SET mask.del=i;` / `SET mask.clear;` | `OK masks=1` / `OK masks=0` | 删除指定索引 / 清空全部掩码 |
 | `AUTOSTART ON;\|AUTOSTART OFF;` | `OK autostart=on` | 开机自启（写入 HKCU Run，无需管理员） |
 | 其他 | `ERR UNKNOWN` | 未知命令 |
 

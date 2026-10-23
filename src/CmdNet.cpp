@@ -101,6 +101,23 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return std::string("OK curved=") + (g_cfg.curved ? "on" : "off") + "\n";
         }
+        // mask rectangles of the first enabled output, normalized 0..1:
+        // "OK masks=2;0.000,0.000,0.100,0.100;0.500,0.500,0.200,0.200;"
+        if (k == "masks") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            for (auto& o : g_cfg.outputs) {
+                if (!o.enabled) continue;
+                char b[40];
+                sprintf_s(b, "OK masks=%d;", (int)std::min(o.masks.size(), (size_t)MAX_MASKS));
+                std::string s = b;
+                for (auto& m : o.masks) {
+                    sprintf_s(b, "%.3f,%.3f,%.3f,%.3f;", m.x, m.y, m.w, m.h);
+                    s += b;
+                }
+                return s + "\n";
+            }
+            return "ERR no output\n";
+        }
         if (k == "rows" || k == "cols") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             for (auto& o : g_cfg.outputs)
@@ -262,6 +279,78 @@ static std::string dispatch(std::string line) {
             g_cfg.curved = (val == "ON" || val == "1") ? 1 : 0;
             g_rev++;   // render thread rebuilds every mesh on the next frame
             return std::string("OK curved=") + (g_cfg.curved ? "on" : "off") + "\n";
+        }
+        // black-mask rectangles on the first enabled output, normalized 0..1:
+        // "SET mask.add=x,y,w,h" / "SET mask.set=i,x,y,w,h" / "SET mask.del=i"
+        // / "SET mask.clear". The UI edits the same vector, and the renderer
+        // uploads masks in its per-frame constant buffer, so changes take
+        // effect on the next frame with no explicit revision bump.
+        if (key.rfind("mask.", 0) == 0) {
+            std::string sub = key.substr(5);
+            float x, y, w, h;
+            int idx;
+            if (sub == "clear") {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled) continue;
+                    o.masks.clear();
+                    return "OK masks=0\n";
+                }
+                return "ERR no output\n";
+            }
+            if (sub == "add" || sub == "set") {
+                bool ok = sub == "add"
+                    ? sscanf_s(val.c_str(), "%f,%f,%f,%f", &x, &y, &w, &h) == 4
+                    : sscanf_s(val.c_str(), "%d,%f,%f,%f,%f", &idx, &x, &y, &w, &h) == 5;
+                if (!ok)
+                    return "ERR SET mask." + sub + " (want " +
+                           (sub == "add" ? "x,y,w,h" : "i,x,y,w,h") + " in 0..1)\n";
+                if (x < 0 || x > 1 || y < 0 || y > 1 || w < 0 || w > 1 || h < 0 || h > 1)
+                    return "ERR SET mask." + sub + " (values 0..1)\n";
+                std::string rep;
+                {
+                    std::lock_guard<std::mutex> lk(g_cfgMutex);
+                    for (auto& o : g_cfg.outputs) {
+                        if (!o.enabled) continue;
+                        // fit the rectangle so it stays on screen
+                        w = std::min(w, 1.0f - x); h = std::min(h, 1.0f - y);
+                        if (sub == "add") {
+                            if (o.masks.size() >= MAX_MASKS)
+                                return "ERR SET mask.add (max 8 masks)\n";
+                            o.masks.push_back(MaskRect{ x, y, w, h });
+                        } else {
+                            if (idx < 0 || idx >= (int)o.masks.size())
+                                return "ERR SET mask.set (bad index)\n";
+                            o.masks[idx] = MaskRect{ x, y, w, h };
+                        }
+                        rep = "OK masks=" + std::to_string(o.masks.size()) + "\n";
+                        break;
+                    }
+                }
+                if (rep.empty()) return "ERR no output\n";
+                refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
+                return rep;
+            }
+            if (sub == "del") {
+                if (sscanf_s(val.c_str(), "%d", &idx) != 1)
+                    return "ERR SET mask.del (want i)\n";
+                std::string rep;
+                {
+                    std::lock_guard<std::mutex> lk(g_cfgMutex);
+                    for (auto& o : g_cfg.outputs) {
+                        if (!o.enabled) continue;
+                        if (idx < 0 || idx >= (int)o.masks.size())
+                            return "ERR SET mask.del (bad index)\n";
+                        o.masks.erase(o.masks.begin() + idx);
+                        rep = "OK masks=" + std::to_string(o.masks.size()) + "\n";
+                        break;
+                    }
+                }
+                if (rep.empty()) return "ERR no output\n";
+                refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
+                return rep;
+            }
+            return "ERR SET mask (add|set|del|clear)\n";
         }
         // grid density for every enabled output (REBUILDS each warp grid,
         // dropping manual point edits, same as the Configure dialog's Apply)
