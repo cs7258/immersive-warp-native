@@ -1895,7 +1895,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             wchar_t name[64] = L"";
             GetWindowTextW(g_cbPreset, name, 64);
             if (!name[0]) { setStatus(L"No preset selected."); return 0; }
-            setStatus(DeleteFileW(presetPath(toNarrowStr(name))) ? (std::wstring(L"Preset '") + name + L"' deleted.").c_str()
+            setStatus(DeleteFileW(presetPath(toNarrowStr(name)).c_str()) ? (std::wstring(L"Preset '") + name + L"' deleted.").c_str()
                                                                  : L"Delete failed.");
             refreshPresetCombo();
         } else if (id == IDC_CKENABLE && HIWORD(wp) == BN_CLICKED) {
