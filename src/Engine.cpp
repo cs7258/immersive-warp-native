@@ -46,6 +46,15 @@ cbuffer FrameCB : register(b0) {
     float contrast;
     float pad0;
     float2 imgFit;          // uv scale for aspect-preserving letterbox
+    float4 gains;           // left/right/top/bottom blend curve gain
+    float4 slopes;          // left/right/top/bottom blend curve slope
+}
+// parametric blend curve: f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1).
+// gain=0, slope=0 -> f(x)=x (the plain linear ramp); slope=1 -> hard step;
+// gain>0 keeps the overlap brighter (softer seam).
+float blendCurve(float x, float gain, float slope) {
+    float d = slope * (x - 1.0) + gain * x + 1.0;
+    return (gain + 1.0) * x / max(d, 1e-4);
 }
 // piecewise interpolation over advanced edge points: x=pos, y=fade, z=gamma
 void edgeParams(float4 pts[8], int count, float c, float baseF, float baseG,
@@ -77,13 +86,13 @@ float4 main(VOut i) : SV_Target {
     float a = 1;
     float fw, g;
     edgeParams(advL, advCounts.x, i.nom.y, LR.x, LR.y, fw, g);
-    if (fw > 0.001 && i.nom.x < fw) a *= pow(saturate(i.nom.x / fw), g);
+    if (fw > 0.001 && i.nom.x < fw) a *= pow(blendCurve(saturate(i.nom.x / fw), gains.x, slopes.x), g);
     edgeParams(advR, advCounts.y, i.nom.y, LR.z, LR.w, fw, g);
-    if (fw > 0.001 && i.nom.x > 1 - fw) a *= pow(saturate((1 - i.nom.x) / fw), g);
+    if (fw > 0.001 && i.nom.x > 1 - fw) a *= pow(blendCurve(saturate((1 - i.nom.x) / fw), gains.y, slopes.y), g);
     edgeParams(advT, advCounts.z, i.nom.x, TB.x, TB.y, fw, g);
-    if (fw > 0.001 && i.nom.y < fw) a *= pow(saturate(i.nom.y / fw), g);
+    if (fw > 0.001 && i.nom.y < fw) a *= pow(blendCurve(saturate(i.nom.y / fw), gains.z, slopes.z), g);
     edgeParams(advB, advCounts.w, i.nom.x, TB.z, TB.w, fw, g);
-    if (fw > 0.001 && i.nom.y > 1 - fw) a *= pow(saturate((1 - i.nom.y) / fw), g);
+    if (fw > 0.001 && i.nom.y > 1 - fw) a *= pow(blendCurve(saturate((1 - i.nom.y) / fw), gains.w, slopes.w), g);
 
     float3 c;
     float2 uv = (i.src - 0.5) * imgFit + 0.5;   // letterbox: keep source aspect
@@ -555,12 +564,12 @@ bool Engine::createDuplication(OutputCtx& oc) {
     // the previous one may still be alive in the render thread's in-flight
     // frame, which makes this fail with E_INVALIDARG -> retry briefly.
     HRESULT hr = E_FAIL;
-    for (int attempt = 0; attempt < 12; attempt++) {
+    for (int attempt = 0; attempt < 8; attempt++) {
         hr = o1->DuplicateOutput(m_dev, &oc.dupl);
         if (SUCCEEDED(hr)) break;
         if (hr != E_INVALIDARG && hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) break;
         if (attempt == 0) dbgLog("dupl: busy (previous duplication still alive), retrying");
-        Sleep(40);
+        Sleep(30);
     }
     oc.output1 = o1;
     out->Release();
@@ -872,6 +881,7 @@ struct FrameCBData {
     float masks[8][4];
     float color[4];
     float contrast; float pad0; float imgFit[2];
+    float gains[4]; float slopes[4];
 };
 static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
@@ -882,6 +892,10 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
     d.LR[2] = (cfg.edges & 2) ? cfg.blend[1].fade : 0.0f; d.LR[3] = cfg.blend[1].gamma;
     d.TB[0] = (cfg.edges & 4) ? cfg.blend[2].fade : 0.0f; d.TB[1] = cfg.blend[2].gamma;
     d.TB[2] = (cfg.edges & 8) ? cfg.blend[3].fade : 0.0f; d.TB[3] = cfg.blend[3].gamma;
+    for (int s = 0; s < 4; s++) {
+        d.gains[s] = cfg.blend[s].gain;
+        d.slopes[s] = cfg.blend[s].slope;
+    }
     for (int s = 0; s < 4; s++) {
         auto& src = cfg.adv[s];
         float(*dst)[4] = s == 0 ? d.advL : s == 1 ? d.advR : s == 2 ? d.advT : d.advB;
