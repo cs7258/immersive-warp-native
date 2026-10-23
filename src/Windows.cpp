@@ -7,6 +7,8 @@
 #include <shellapi.h>
 #include <cstdio>
 #include <cwchar>
+#include <map>
+#include <vector>
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -364,6 +366,24 @@ void createOutputWindows() {
         return displays.empty() ? RECT{0, 0, 1920, 1080} : displays[0].desktop;
     };
     int n = 0;
+    // tile grid index per enabled output (same physical ordering as
+    // applyLayoutLocked) so MAG hosts can mirror their tile's source window
+    std::map<std::wstring, std::pair<int, int>> tileOf;
+    {
+        int R = g_cfg.layoutR, C = g_cfg.layoutC;
+        struct Placed { RECT rc; const std::wstring* name; };
+        std::vector<Placed> pl;
+        for (auto& d : displays)
+            for (auto& o : g_cfg.outputs)
+                if (o.enabled && o.deviceName == d.deviceName)
+                    pl.push_back({ d.desktop, &o.deviceName });
+        std::sort(pl.begin(), pl.end(), [](const Placed& a, const Placed& b) {
+            if (a.rc.top / 100 != b.rc.top / 100) return a.rc.top < b.rc.top;
+            return a.rc.left < b.rc.left;
+        });
+        for (int k = 0; k < (int)pl.size(); k++)
+            tileOf[*pl[k].name] = { (R > 1) ? k / C : 0, (R > 1) ? k % C : (C > 1 ? k : 0) };
+    }
     for (size_t i = 0; i < displays.size(); i++) {
         OutputCfg* cfg = nullptr;
         for (auto& o : g_cfg.outputs)
@@ -424,9 +444,22 @@ void createOutputWindows() {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
             g_outWins.push_back({ hwnd, st });
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // NxN tile: the host mirrors THIS tile's source window - same
+            // geometry as the DXGI pipeline (screen x shows source
+            // x + c*(1-ov)), clamped to the source desktop.
             RECT src = sourceRect();
+            auto it = tileOf.find(cfg->deviceName);
+            int tr = it != tileOf.end() ? it->second.first : 0;
+            int tc = it != tileOf.end() ? it->second.second : 0;
+            float ovl = g_cfg.overlap / 100.0f;
+            LONG sw = src.right - src.left, sh = src.bottom - src.top;
+            RECT tile{
+                src.left + (LONG)(clampf(tc * (1.0f - ovl), 0.0f, 1.0f) * sw),
+                src.top + (LONG)(clampf(tr * (1.0f - ovl), 0.0f, 1.0f) * sh),
+                src.left + (LONG)(clampf(tc * (1.0f - ovl) + 1.0f, 0.0f, 1.0f) * sw),
+                src.top + (LONG)(clampf(tr * (1.0f - ovl) + 1.0f, 0.0f, 1.0f) * sh) };
             if (magEngineInit())
-                magAttachOutput(hwnd, src);
+                magAttachOutput(hwnd, tile);
             else
                 dbgLogLine("magEngineInit failed - mag output stays black");
             continue;   // the render thread owns nothing in MAG mode
@@ -1133,7 +1166,20 @@ static void syncLayoutCombos() {
 }
 
 static void applyLayoutUI(int R, int C, int ov) {      // UI thread
-    if (applyLayoutValue(R, C, ov)) syncLayoutCombos();
+    bool magTiles = false;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        magTiles = g_cfg.engine == 1;
+    }
+    if (applyLayoutValue(R, C, ov)) {
+        syncLayoutCombos();
+        if (magTiles) {
+            // MAG hosts carry the tile's source window in their magnifier
+            // source rect: layout/overlap changes mean a window rebuild
+            destroyOutputWindows();
+            createOutputWindows();
+        }
+    }
     refreshStatusBar();
 }
 
