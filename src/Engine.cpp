@@ -402,6 +402,14 @@ Engine::OutputCtx::~OutputCtx() {
     if (overlayVB) overlayVB->Release();
 }
 
+// wstring -> narrow, for log lines only (device names are ASCII)
+static std::string narrow(const std::wstring& w) {
+    std::string s;
+    s.reserve(w.size());
+    for (wchar_t c : w) s.push_back(c < 128 ? (char)c : '?');
+    return s;
+}
+
 // HRESULT as 8 hex digits (a plain cast to unsigned long prints garbage:
 // negative HRESULTs sign-extend to 0x2147942487 style numbers in the log)
 static std::string hresultHex(HRESULT hr) {
@@ -476,28 +484,23 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
 bool Engine::createDuplication(OutputCtx& oc) {
     auto displays = enumerateDisplays();
     const DisplayInfo* src = nullptr;
+    bool preview = g_previewMode.load();
     auto isOutputDisplay = [](const DisplayInfo& d) {
         for (auto& o : g_cfg.outputs)
             if (o.enabled && o.deviceName == d.deviceName) return true;
         return false;
     };
-    if (g_previewMode.load() && oc.displayIdx >= 0 && oc.displayIdx < (int)displays.size()) {
-        // windowed preview: the output window is small and marked
-        // WDA_EXCLUDEFROMCAPTURE, so capturing its own display does NOT recurse
-        if (g_previewNoCapture.load()) {
-            dbgLog("dupl: preview mode but capture exclusion unavailable -> no capture");
-            return false;
-        }
-        src = &displays[oc.displayIdx];
-    }
-    // explicit source from the console "Source:" combo / CMDNET SET source=
-    if (!src && !g_cfg.sourceDev.empty()) {
+    dbgLog(std::string("dupl: pick for displayIdx=") + std::to_string(oc.displayIdx) +
+           " preview=" + (preview ? "1" : "0") +
+           " displays=" + std::to_string(displays.size()) +
+           " requested='" + narrow(g_cfg.sourceDev) + "'");
+    // 1) explicit source (console combo / CMDNET SET source=) wins, as long as
+    //    it is not one of the output displays (that would film ourselves)
+    if (!g_cfg.sourceDev.empty()) {
         for (auto& d : displays) {
             if (!sameDisplayName(d.deviceName, g_cfg.sourceDev)) continue;
             if (isOutputDisplay(d)) {
-                // capturing a display that also shows an output would film
-                // ourselves -> fall back to auto instead of a feedback loop
-                dbgLog("dupl: requested source is an enabled output -> auto instead");
+                dbgLog("dupl: requested source is an enabled output -> recursion guard");
                 break;
             }
             src = &d;
@@ -505,7 +508,15 @@ bool Engine::createDuplication(OutputCtx& oc) {
                    std::to_string((int)(&d - displays.data())));
             break;
         }
-        if (!src) dbgLog("dupl: requested source not found (or rejected), falling back to auto");
+        if (!src) dbgLog("dupl: requested source not usable, falling back");
+    } else if (preview && oc.displayIdx >= 0 && oc.displayIdx < (int)displays.size()) {
+        // 2) windowed preview: the output window is small and marked
+        // WDA_EXCLUDEFROMCAPTURE, so capturing its own display does NOT recurse
+        if (g_previewNoCapture.load()) {
+            dbgLog("dupl: preview mode but capture exclusion unavailable -> no capture");
+            return false;
+        }
+        src = &displays[oc.displayIdx];
     }
     for (auto& d : displays) {
         if (src) break;
