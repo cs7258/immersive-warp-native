@@ -91,6 +91,15 @@ struct AppConfig {
     // output). A non-empty value pins the desktop that gets warped, which is
     // what the original's Source page does on multi-screen rigs.
     std::wstring sourceDev;
+    // NxN tiled layout of the enabled outputs: output k sits at
+    // (row = k / layoutC, col = k % layoutC) after sorting by desktop
+    // position, and shows the source window [col*(1-ov), col*(1-ov)+1] etc.
+    // overlap ov is a percentage of one projector width/height (0..40).
+    int layoutR = 1, layoutC = 1;
+    int overlap = 0;
+    // warp engine. 0 = DXGI Desktop Duplication; the other entries in the
+    // engine dropdown are placeholders and always snap back to 0.
+    int engine = 0;
 
     OutputCfg* findByDevice(const std::wstring& dev) {
         for (auto& o : outputs) if (o.deviceName == dev) return &o;
@@ -137,6 +146,10 @@ void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all ou
 void cycleBlendEdges();        // global hotkey F12: cycle blended edges
 void toggleSnapshot();         // global hotkey Ctrl+F3: freeze / resume capture
 void openColorDialogEx();      // global hotkey D: color adjustment dialog
+// apply an R x C tiled layout with the given overlap percent (0..40):
+// regenerates the warp grid of every enabled output and sets the blend-edge
+// mask so only interior boundaries blend. Safe from any thread (marshals to UI).
+void setLayout(int R, int C, int overlapPct);
 void notifyOutputRaised();     // output window raised itself; keep control window above
 void destroyOutputWindows();
 void setCalibrationMode(bool on);

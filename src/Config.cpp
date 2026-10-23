@@ -91,6 +91,10 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "sampling=" << g_cfg.sampling << "\n";
     os << "autostart=" << g_cfg.autostart << "\n";
     os << "source=" << toUtf8(g_cfg.sourceDev) << "\n";
+    os << "layoutR=" << g_cfg.layoutR << "\n";
+    os << "layoutC=" << g_cfg.layoutC << "\n";
+    os << "overlap=" << g_cfg.overlap << "\n";
+    os << "engine=" << g_cfg.engine << "\n";
     os << "subdivide=" << g_cfg.subdivide << "\n";
     os << "outputs=" << g_cfg.outputs.size() << "\n";
     for (auto& o : g_cfg.outputs) {
@@ -152,6 +156,10 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "sampling") c.sampling = atoi(val.c_str());
         else if (key == "autostart") c.autostart = atoi(val.c_str());
         else if (key == "source") c.sourceDev = fromUtf8(val);
+        else if (key == "layoutR") c.layoutR = atoi(val.c_str());
+        else if (key == "layoutC") c.layoutC = atoi(val.c_str());
+        else if (key == "overlap") c.overlap = atoi(val.c_str());
+        else if (key == "engine") c.engine = atoi(val.c_str());
         else if (key == "subdivide") c.subdivide = atoi(val.c_str());
         else if (key == "outputs") c.outputs.resize((size_t)atoi(val.c_str()));
         else if (key == "dev") {

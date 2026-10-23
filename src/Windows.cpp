@@ -316,6 +316,7 @@ static HWND g_ckEnable = nullptr, g_ckTest = nullptr, g_ckAdv = nullptr;
 static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
 static HWND g_ckNet = nullptr;
 static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
+static HWND g_cbLayout = nullptr, g_cbOvl = nullptr, g_cbEng = nullptr;
 static HWND g_cbSrc = nullptr;
 // capture source combo: index 0 = auto, index i>0 = g_srcDevs[i]
 static std::vector<std::wstring> g_srcDevs;
@@ -329,8 +330,12 @@ static std::vector<std::wstring> g_srcDevs;
 // cross-thread capture-source change (CMDNET runs on the socket thread).
 // constexpr so it can be used as a switch case label.
 constexpr UINT WM_SRCSET = WM_APP + 9;
+constexpr UINT WM_LAYSET = WM_APP + 10;
 static DWORD uiThreadId = 0;
 constexpr UINT WM_TRAYICON = WM_APP + 7;
+static std::mutex g_layMsgMutex;
+struct LayMsg { int r = 0, c = 0, ov = 0; };
+static LayMsg g_layMsg;
 
 // ---------------- tray icon ----------------
 static NOTIFYICONDATAW g_nid{};
@@ -577,6 +582,9 @@ void notifyOutputRaised() {
 #define IDC_CKAUTO    1020   // start with Windows
 #define IDC_CBSAMP    1021   // sampling quality dropdown
 #define IDC_CBSRC     1022   // capture source display dropdown
+#define IDC_CBLAYOUT  1023   // NxN tiled layout dropdown
+#define IDC_CBOVL     1024   // tile overlap percent dropdown
+#define IDC_CBENG     1025   // warp engine dropdown
 
 static void refreshList() {
     if (!g_list) return;
@@ -673,6 +681,99 @@ void setSourceDisplay(const std::wstring& dev) {
         return;
     }
     applySourceDisplay(dev);
+}
+
+// ---- NxN tiled layout -------------------------------------------------------
+// Regenerates the warp grid of every enabled output so the wall shows one
+// continuous source: output k (sorted by desktop position) sits at
+// (row=k/R, col=k/C) and shows the source window
+//   x in [col*(1-ov), col*(1-ov)+1], y likewise for rows,
+// where ov = overlap/100. Points outside [0,1] fall off the projector and are
+// cropped by the rasterizer. Interior boundaries get their blend edge enabled.
+static void applyLayoutLocked() {   // g_cfgMutex held
+    int R = g_cfg.layoutR, C = g_cfg.layoutC;
+    float ov = g_cfg.overlap / 100.0f;
+    auto displays = enumerateDisplays();
+    // enabled outputs in physical order (top-to-bottom, left-to-right) so the
+    // tile grid matches how the projectors hang on the wall
+    struct Placed { RECT rc; OutputCfg* o; };
+    std::vector<Placed> outs;
+    for (auto& d : displays)
+        for (auto& o : g_cfg.outputs)
+            if (o.enabled && o.deviceName == d.deviceName)
+                outs.push_back({ d.desktop, &o });
+    std::sort(outs.begin(), outs.end(), [](const Placed& a, const Placed& b) {
+        if (a.rc.top / 100 != b.rc.top / 100) return a.rc.top < b.rc.top;
+        return a.rc.left < b.rc.left;
+    });
+    for (int k = 0; k < (int)outs.size(); k++) {
+        OutputCfg& o = *outs[k].o;
+        int r = (R > 1) ? k / C : 0, c = (R > 1) ? k % C : (C > 1 ? k : 0);
+        o.initIdentity();
+        float offX = c * (1.0f - ov), offY = r * (1.0f - ov);
+        for (size_t i = 0; i < o.points.size(); i += 2) {
+            o.points[i] -= offX;
+            o.points[i + 1] -= offY;
+        }
+        // blend only on interior boundaries of the tile grid
+        o.edges = (c > 0 ? 1 : 0) | (c < C - 1 ? 2 : 0)
+                | (r > 0 ? 4 : 0) | (r < R - 1 ? 8 : 0);
+        if (R == 1 && C == 1) o.edges = 15;   // no layout: keep all edges on
+    }
+    g_rev++;
+}
+
+static bool applyLayoutValue(int R, int C, int ov) {   // value update, any thread
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    if (g_cfg.layoutR == R && g_cfg.layoutC == C && g_cfg.overlap == ov) return false;
+    g_cfg.layoutR = R;
+    g_cfg.layoutC = C;
+    g_cfg.overlap = ov;
+    applyLayoutLocked();
+    return true;
+}
+
+// combo resync, UI thread
+static void syncLayoutCombos() {
+    if (!g_cbLayout) return;
+    int R, C;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        R = g_cfg.layoutR; C = g_cfg.layoutC;
+        ComboBox_SetCurSel(g_cbOvl, g_cfg.overlap / 5);
+        ComboBox_SetCurSel(g_cbEng, g_cfg.engine);
+    }
+    wchar_t key[8];
+    _snwprintf_s(key, _TRUNCATE, L"%dx%d", C, R);
+    int n = (int)ComboBox_GetCount(g_cbLayout);
+    for (int i = 0; i < n; i++) {
+        wchar_t t[8];
+        ComboBox_GetLBText(g_cbLayout, i, t);
+        if (wcscmp(t, key) == 0) { ComboBox_SetCurSel(g_cbLayout, i); break; }
+    }
+}
+
+static void applyLayoutUI(int R, int C, int ov) {      // UI thread
+    if (applyLayoutValue(R, C, ov)) syncLayoutCombos();
+    refreshStatusBar();
+}
+
+void setLayout(int R, int C, int overlapPct) {
+    if (R < 1) R = 1; if (R > 4) R = 4;
+    if (C < 1) C = 1; if (C > 4) C = 4;
+    if (overlapPct < 0) overlapPct = 0;
+    if (overlapPct > 40) overlapPct = 40;
+    // CMDNET runs on the socket thread: the grid edit itself is mutex-safe,
+    // but combo/window updates belong to the UI thread (non-blocking post)
+    if (g_ctl && uiThreadId && GetCurrentThreadId() != uiThreadId) {
+        if (applyLayoutValue(R, C, overlapPct)) {
+            std::lock_guard<std::mutex> lk(g_layMsgMutex);
+            g_layMsg = { R, C, overlapPct };
+            PostMessageW(g_ctl, WM_LAYSET, 0, 0);
+        }
+        return;
+    }
+    applyLayoutUI(R, C, overlapPct);
 }
 
 // ---- color adjustment dialog (brightness / contrast / gamma R G B) ----
@@ -882,12 +983,50 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         CreateWindowW(L"STATIC", L"(auto = first display that is not an output)",
             WS_CHILD | WS_VISIBLE | SS_LEFT, 374, 458, 200, 32,
             hwnd, nullptr, nullptr, nullptr);
+        // NxN tiled layout + overlap + warp engine
+        CreateWindowW(L"STATIC", L"Layout:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 494, 50, 18,
+            hwnd, nullptr, nullptr, nullptr);
+        g_cbLayout = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            62, 490, 74, 220,
+            hwnd, (HMENU)IDC_CBLAYOUT, nullptr, nullptr);
+        for (int R = 1; R <= 4; R++)
+            for (int C = 1; C <= 4; C++)
+                if (R * C > 1) {
+                    wchar_t t[8];
+                    _snwprintf_s(t, _TRUNCATE, L"%dx%d", C, R);
+                    ComboBox_AddString(g_cbLayout, t);
+                }
+        CreateWindowW(L"STATIC", L"Overlap:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 148, 494, 56, 18,
+            hwnd, nullptr, nullptr, nullptr);
+        g_cbOvl = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            206, 490, 66, 220,
+            hwnd, (HMENU)IDC_CBOVL, nullptr, nullptr);
+        for (int p = 0; p <= 40; p += 5) {
+            wchar_t t[8];
+            wsprintfW(t, L"%d%%", p);
+            ComboBox_AddString(g_cbOvl, t);
+        }
+        CreateWindowW(L"STATIC", L"Engine:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 286, 494, 48, 18,
+            hwnd, nullptr, nullptr, nullptr);
+        g_cbEng = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            336, 490, 238, 220,
+            hwnd, (HMENU)IDC_CBENG, nullptr, nullptr);
+        ComboBox_AddString(g_cbEng, L"Desktop Duplication (DXGI)");
+        ComboBox_AddString(g_cbEng, L"DWM Magnification (n/a)");
+        ComboBox_AddString(g_cbEng, L"NVAPI clone (n/a)");
+        ComboBox_AddString(g_cbEng, L"DOPP (n/a)");
         // structured status block (Projector / Mode / Color balancing / edges)
         g_statusInfo = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 492, 545, 76,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 526, 545, 76,
             hwnd, nullptr, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 564, 545, 40,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 598, 545, 40,
             hwnd, nullptr, nullptr, nullptr);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -902,12 +1041,22 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
         }
         populateSourceCombo();   // locks g_cfgMutex itself
+        syncLayoutCombos();
         trayInit(hwnd);
         refreshStatusBar();
         return 0;
     }
     case WM_SRCSET: {   // capture source changed from the socket thread
         rebuildForSource();
+        return 0;
+    }
+    case WM_LAYSET: {   // tiled layout changed from the socket thread
+        LayMsg m;
+        {
+            std::lock_guard<std::mutex> lk(g_layMsgMutex);
+            m = g_layMsg;
+        }
+        applyLayoutUI(m.r, m.c, m.ov);
         return 0;
     }
     case WM_COMMAND: {
@@ -963,6 +1112,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             Engine::inst().setSampling(g_cfg.sampling);
             ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
             ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
+            syncLayoutCombos();
             if (!g_cfg.imagePath.empty() && engineLoadImage(g_cfg.imagePath)) {
                 const wchar_t* base = g_cfg.imagePath.c_str();
                 for (const wchar_t* p = g_cfg.imagePath.c_str(); *p; p++)
@@ -1103,6 +1253,37 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             else wsprintfW(msg, L"Capture source pinned to %s (outputs rebuilt).", dev.c_str());
             setStatus(msg);
             setSourceDisplay(dev);
+        } else if (id == IDC_CBLAYOUT && HIWORD(wp) == CBN_SELCHANGE) {
+            wchar_t t[8] = L"1x1";
+            ComboBox_GetLBText(g_cbLayout, ComboBox_GetCurSel(g_cbLayout), t);
+            int C = t[0] - L'0', R = t[2] - L'0', ov;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                ov = g_cfg.overlap;
+            }
+            applyLayoutUI(R, C, ov);
+            wchar_t msg[96];
+            wsprintfW(msg, L"Layout %dx%d applied (%d projectors): warp grids rebuilt.",
+                      C, R, R * C);
+            setStatus(msg);
+        } else if (id == IDC_CBOVL && HIWORD(wp) == CBN_SELCHANGE) {
+            int R, C;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                R = g_cfg.layoutR; C = g_cfg.layoutC;
+            }
+            int ov = ComboBox_GetCurSel(g_cbOvl) * 5;
+            applyLayoutUI(R, C, ov);
+            wchar_t msg[96];
+            wsprintfW(msg, L"Tile overlap %d%% applied: warp grids rebuilt.", ov);
+            setStatus(msg);
+        } else if (id == IDC_CBENG && HIWORD(wp) == CBN_SELCHANGE) {
+            int sel = ComboBox_GetCurSel(g_cbEng);
+            if (sel != 0) {
+                // placeholders: only Desktop Duplication exists in this build
+                ComboBox_SetCurSel(g_cbEng, 0);
+                setStatus(L"Only Desktop Duplication is available in this build.");
+            }
         } else if (id == IDM_TRAY_SHOW) {
             if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
             else { ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); }
@@ -1166,7 +1347,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterClassW(&wc);
     uiThreadId = GetCurrentThreadId();
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 580, 660,
+        WS_OVERLAPPEDWINDOW, 100, 100, 580, 700,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);

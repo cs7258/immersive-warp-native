@@ -84,6 +84,19 @@ static std::string dispatch(std::string line) {
         if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
         if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
         if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
+        if (k == "layout") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK layout=" + std::to_string(g_cfg.layoutC) + "x" +
+                   std::to_string(g_cfg.layoutR) + "\n";
+        }
+        if (k == "overlap") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK overlap=" + std::to_string(g_cfg.overlap) + "\n";
+        }
+        if (k == "engine") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK engine=" + std::string(g_cfg.engine == 0 ? "desktopduplication" : "unknown") + "\n";
+        }
         if (k == "source") {
             std::wstring cur = currentSourceDevice();
             return "OK source=" + (cur.empty() ? std::string("auto") : shortDev(cur)) + "\n";
@@ -200,6 +213,30 @@ static std::string dispatch(std::string line) {
             setSourceDisplay(dev);
             std::wstring cur = currentSourceDevice();
             return "OK source=" + (cur.empty() ? std::string("auto") : shortDev(cur)) + "\n";
+        }
+        // NxN tiled layout, e.g. "SET layout=2x2" / "SET overlap=15"
+        // (setLayout locks g_cfgMutex itself; the grid rebuild bumps g_rev so
+        // the render thread rebuilds every mesh on the next frame)
+        if (key == "layout") {
+            int C = 0, R = 0;
+            if (sscanf_s(val.c_str(), "%dx%d", &C, &R) != 2 || C < 1 || R < 1 || C > 4 || R > 4)
+                return "ERR SET layout (want WxH, each 1..4)\n";
+            setLayout(R, C, g_cfg.overlap);
+            return "OK layout=" + std::to_string(C) + "x" + std::to_string(R) + "\n";
+        }
+        if (key == "overlap") {
+            int ov = atoi(val.c_str());
+            if (ov < 0 || ov > 40) return "ERR SET overlap (want 0..40)\n";
+            setLayout(g_cfg.layoutR, g_cfg.layoutC, ov);
+            return "OK overlap=" + std::to_string(ov) + "\n";
+        }
+        if (key == "engine") {
+            if (val == "0" || val == "desktopduplication" || val == "dxgi") {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.engine = 0;
+                return "OK engine=desktopduplication\n";
+            }
+            return "ERR SET engine (only desktopduplication in this build)\n";
         }
         static const char* sides[4] = { "left", "right", "top", "bottom" };
         {

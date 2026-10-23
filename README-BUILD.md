@@ -24,13 +24,14 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 1. 投影仪扩展桌面接入 Windows
 2. 控制台列表中选中显示器 → "Toggle selected as projector"
 3. "Source:" 选择捕获源桌面（默认 `Auto` = 第一个「不是输出」的显示器；多屏机器上可指定具体某个桌面作为画面来源，改动后输出窗口自动重建）
-4. "Start Output" 启动全屏输出（先勾 Test pattern 显示测试图）
-5. "Configure alignment" 或 F3 进入校准：
+4. 多台投影仪做拼接墙时，用 "Layout:" 选 NxN 平铺（如 `2x2`），"Overlap:" 设相邻重叠带宽（0–40%）：程序按显示器物理位置把启用的输出排进网格，每台只显示源桌面对应窗口，内部边界自动设为融合边。注意这会重置各输出的 warp 网格，先 Layout 再校准
+5. "Start Output" 启动全屏输出（先勾 Test pattern 显示测试图）
+6. "Configure alignment" 或 F3 进入校准：
    - 拖绿色控制点做几何校正（方向键微调，Shift+方向键大步）
    - F10 切到融合模式：拖红点调融合宽度，滚轮调 gamma，Ctrl+滚轮调 gain，Shift+滚轮调 slope（融合曲线参数，默认 0/0 = 线性斜坡）
    - 勾选 "Advanced blending" 后为蓝点（每边多个）
    - Esc 退出校准
-6. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载
+7. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载
 
 ## 快捷键（全局，任何窗口有焦点都生效）
 
@@ -72,6 +73,9 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/各边 fade·gamma·gain·slope） |
 | `GET displays;` | `OK displays=2;DISPLAY1=1920x1080*;DISPLAY2=1920x1080;` | 列出显示器拓扑（`*` = 主显示器），便于节目控制端挑捕获源 |
 | `SET source=DISPLAY2;` / `SET source=auto;` | `OK source=DISPLAY2` | 指定捕获源桌面（auto = 第一个非输出的显示器）。改动会重建输出窗口；若指定的显示器本身是输出，引擎按防递归规则回退自动选择 |
+| `GET layout;` / `SET layout=2x2;` | `OK layout=2x2` | NxN 平铺布局：按物理位置（先上后下、先左后右）把启用的输出排进网格，第 (r,c) 格只显示源桌面对应窗口，出界部分被裁掉。会重建所有 warp 网格并把内部边界设为融合边 |
+| `GET overlap;` / `SET overlap=15;` | `OK overlap=15` | 相邻投影仪的重叠带宽（单台投影画面的百分比，0–40）。改变时重建 warp 网格，与 layout 配合使用 |
+| `GET engine;` / `SET engine=dxgi;` | `OK engine=desktopduplication` | 查询/选择 warp 引擎；当前构建只有 Desktop Duplication，其余为占位 |
 | `AUTOSTART ON;\|AUTOSTART OFF;` | `OK autostart=on` | 开机自启（写入 HKCU Run，无需管理员） |
 | 其他 | `ERR UNKNOWN` | 未知命令 |
 
