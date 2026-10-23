@@ -874,6 +874,7 @@ static std::string dispatch(std::string line) {
             if (!applied && key == "testpattern") {
                 g_cfg.testPattern = (val == "ON" || val == "1" || val == "true");
                 applied = true;
+                requestMagTestSync();   // engine=1: GDI overlays follow
             }
             if (!applied && key == "probe") {
                 g_probe.store(val == "ON" || val == "1" || val == "true");
