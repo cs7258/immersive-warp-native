@@ -418,8 +418,12 @@ static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
 static HWND g_cbLayout = nullptr, g_cbOvl = nullptr, g_cbEng = nullptr;
 static HWND g_cbSrc = nullptr;
 static HWND g_cbPreset = nullptr;   // named presets (shared with CMDNET)
+static HWND g_cbTarget = nullptr;   // per-output command target (mirrors SET out=)
 // capture source combo: index 0 = auto, index i>0 = g_srcDevs[i]
 static std::vector<std::wstring> g_srcDevs;
+// target combo: index 0 = auto, index i>0 = g_tgtShort[i] ("DISPLAY2")
+static std::vector<std::string> g_tgtShort;
+static bool g_tgtBusy = false;      // suppress CBN_SELCHANGE during programmatic fill
 
 // tray ids must not collide with control ids 1001..1021
 #define IDM_TRAY_SHOW  2001
@@ -724,6 +728,7 @@ void notifyOutputRaised() {
 #define IDC_PRESETSAVE 1028
 #define IDC_PRESETLOAD 1029
 #define IDC_PRESETDEL  1030
+#define IDC_CBTARGET   1031   // per-output command target dropdown (SET out=)
 
 static void refreshList() {
     if (!g_list) return;
@@ -803,6 +808,7 @@ static void rebuildForSource() {
         createOutputWindows();
     }
     if (g_cbSrc) populateSourceCombo();   // resync (normalises DISPLAY2 -> \\.\DISPLAY2)
+    refreshTargetComboUI();
     refreshStatusBar();
 }
 
@@ -1639,6 +1645,38 @@ static void refreshPresetCombo() {
     ComboBox_SetCurSel(g_cbPreset, 0);
 }
 
+// Console "Target:" dropdown: one entry per enabled output plus AUTO.
+// Reads the shared command target (cmdGetTarget), so network and UI always
+// agree. Safe on the socket thread (CMDNET SET out= calls it) -- it takes
+// g_cfgMutex itself; never call it while that mutex is held.
+void refreshTargetComboUI() {
+    if (!g_cbTarget) return;
+    g_tgtBusy = true;
+    ComboBox_ResetContent(g_cbTarget);
+    g_tgtShort.clear();
+    ComboBox_AddString(g_cbTarget, L"Auto (first enabled output)");
+    g_tgtShort.push_back("");
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs) {
+            if (!o.enabled) continue;
+            std::wstring s = o.deviceName;
+            size_t p = s.find(L"\\\\.\\");     // "\\.\DISPLAY2" -> "DISPLAY2"
+            if (p != std::wstring::npos) s = s.substr(p + 4);
+            wchar_t line[192];
+            wsprintfW(line, L"%s", s.c_str());
+            ComboBox_AddString(g_cbTarget, line);
+            g_tgtShort.push_back(toNarrowStr(s.c_str()));
+        }
+    }
+    std::string cur = cmdGetTarget();
+    int sel = 0;
+    for (size_t i = 0; i < g_tgtShort.size(); i++)
+        if (_stricmp(g_tgtShort[i].c_str(), cur.c_str()) == 0) { sel = (int)i; break; }
+    ComboBox_SetCurSel(g_cbTarget, sel);
+    g_tgtBusy = false;
+}
+
 // shared by Load Config and preset load: resync all UI + engine state after
 // loadConfig() swapped g_cfg. Must be called WITHOUT g_cfgMutex held.
 static void applyLoadedConfig() {
@@ -1651,6 +1689,7 @@ static void applyLoadedConfig() {
     ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
     ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
     syncLayoutCombos();
+    refreshTargetComboUI();   // enabled outputs may have changed with the config
     if (!g_cfg.imagePath.empty() && engineLoadImage(g_cfg.imagePath)) {
         const wchar_t* base = g_cfg.imagePath.c_str();
         for (const wchar_t* p = g_cfg.imagePath.c_str(); *p; p++)
@@ -1818,12 +1857,20 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         CreateWindowW(L"STATIC", L"(CMDNET shared)",
             WS_CHILD | WS_VISIBLE | SS_LEFT, 550, 528, 84, 18,
             hwnd, nullptr, nullptr, nullptr);
+        // per-output command target (mirrors CMDNET "SET out=")
+        CreateWindowW(L"STATIC", L"Target:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 560, 52, 18,
+            hwnd, nullptr, nullptr, nullptr);
+        g_cbTarget = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            64, 556, 210, 220,
+            hwnd, (HMENU)IDC_CBTARGET, nullptr, nullptr);
         // structured status block (Projector / Mode / Color balancing / edges)
         g_statusInfo = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 562, 620, 76,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 594, 620, 76,
             hwnd, nullptr, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 636, 620, 40,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 668, 620, 40,
             hwnd, nullptr, nullptr, nullptr);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -1839,6 +1886,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         }
         populateSourceCombo();   // locks g_cfgMutex itself
         syncLayoutCombos();
+        refreshTargetComboUI();
         trayInit(hwnd);
         refreshPresetCombo();
         refreshStatusBar();
@@ -2096,6 +2144,20 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 ComboBox_SetCurSel(g_cbEng, 0);
                 setStatus(L"Only Desktop Duplication is available in this build.");
             }
+        } else if (id == IDC_CBTARGET && HIWORD(wp) == CBN_SELCHANGE) {
+            // user picked a command target -> share it with CMDNET (SET out=)
+            if (!g_tgtBusy && g_cbTarget) {
+                int sel = ComboBox_GetCurSel(g_cbTarget);
+                if (sel >= 0 && sel < (int)g_tgtShort.size()) {
+                    cmdSetTarget(g_tgtShort[sel]);
+                    std::string t = cmdGetTarget();
+                    std::wstring w(t.begin(), t.end());
+                    wchar_t msg[128];
+                    wsprintfW(msg, L"Command target: %s", w.empty() ? L"AUTO" : w.c_str());
+                    setStatus(msg);
+                    refreshStatusBar();
+                }
+            }
         } else if (id >= IDM_TRAY_PRESET && id < IDM_TRAY_PRESET + TRAY_PRESET_MAX) {
             std::wstring nm;
             if (presetNameByIndex(id - IDM_TRAY_PRESET, nm) &&
@@ -2170,7 +2232,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterClassW(&wc);
     uiThreadId = GetCurrentThreadId();
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
-        WS_OVERLAPPEDWINDOW, 100, 100, 650, 744,
+        WS_OVERLAPPEDWINDOW, 100, 100, 650, 780,
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);

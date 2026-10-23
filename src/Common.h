@@ -175,6 +175,13 @@ bool queryAutostart();
 void setSourceDisplay(const std::wstring& dev);
 std::wstring currentSourceDevice();   // "" when auto
 
+// per-output command target ("SET out=DISPLAY2" / console "Target:" combo).
+// Empty string = auto (masks/fade -> first enabled output, grid -> all).
+// Shared storage, so the network command and the dropdown stay in sync.
+void cmdSetTarget(const std::string& dev);   // "" = auto
+std::string cmdGetTarget();
+void refreshTargetComboUI();                 // resync the console dropdown
+
 inline float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
 
 // "\\.\DISPLAY2" and "DISPLAY2" denote the same output (CMDNET / config files

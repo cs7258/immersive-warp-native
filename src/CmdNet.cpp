@@ -103,6 +103,17 @@ static std::string currentTarget() {
     return g_cmdTarget;
 }
 
+// shared with the console "Target:" combo (Windows.cpp): one storage, both
+// entry points stay in sync. Empty string = auto.
+void cmdSetTarget(const std::string& dev) {
+    std::lock_guard<std::mutex> lk(g_cmdTargetMutex);
+    g_cmdTarget = dev;
+}
+std::string cmdGetTarget() {
+    std::lock_guard<std::mutex> lk(g_cmdTargetMutex);
+    return g_cmdTarget;
+}
+
 // resolve the target under g_cfgMutex (caller holds it). Matches the short
 // device name ("DISPLAY2") or the label text, case-insensitive.
 static OutputCfg* targetOutputLocked() {
@@ -462,8 +473,8 @@ static std::string dispatch(std::string line) {
         // a typo fails here instead of on the next command.
         if (key == "out") {
             if (val == "AUTO" || val.empty()) {
-                std::lock_guard<std::mutex> lk(g_cmdTargetMutex);
-                g_cmdTarget.clear();
+                cmdSetTarget("");
+                refreshTargetComboUI();   // keep the console dropdown in sync
                 return "OK out=auto\n";
             }
             {
@@ -477,8 +488,8 @@ static std::string dispatch(std::string line) {
                 }
                 if (!found) return "ERR SET out (no such output: " + val + ")\n";
             }
-            std::lock_guard<std::mutex> lk(g_cmdTargetMutex);
-            g_cmdTarget = val;
+            cmdSetTarget(val);
+            refreshTargetComboUI();
             return "OK out=" + val + "\n";
         }
         // NxN tiled layout, e.g. "SET layout=2x2" / "SET overlap=15"

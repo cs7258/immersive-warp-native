@@ -86,7 +86,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET config;` | `OK sampling=8;…;out0.dev=DISPLAY1;out0.rows=10;out0.left.fade=0.150;out0.masks=1 0.1,0.2,0.3,0.4;…;calib=off;out=auto` | **全量状态导出**：全局键 + 每输出一个 `outN.*` 块（网格密度、edges、四边融合参数、颜色调节、掩码列表——矩形间用空格分隔），与 STATUS 同为 `key=value;` 配对格式，一次往返镜像全部 UI 状态 |
 | `GET displays;` | `OK displays=2;DISPLAY1=1920x1080*;DISPLAY2=1920x1080;` | 列出显示器拓扑（`*` = 主显示器），便于节目控制端挑捕获源 |
 | `SET source=DISPLAY2;` / `SET source=auto;` | `OK source=DISPLAY2` | 指定捕获源桌面（auto = 第一个非输出的显示器）。改动会重建输出窗口；若指定的显示器本身是输出，引擎按防递归规则回退自动选择 |
-| `GET out;` / `SET out=DISPLAY2;` / `SET out=auto;` | `OK out=DISPLAY2` | **per-output 定向**：设定后续 per-output 命令（masks、各边 fade/gamma/gain/slope、rows/cols、flip/rotate、edges 的 GET/SET）只作用于该输出（按显示器名或 label 匹配，名字须存在否则 ERR）。auto = 旧默认（掩码/融合写第一台启用输出，网格操作写全部） |
+| `GET out;` / `SET out=DISPLAY2;` / `SET out=auto;` | `OK out=DISPLAY2` | **per-output 定向**：设定后续 per-output 命令（masks、各边 fade/gamma/gain/slope、rows/cols、flip/rotate、edges 的 GET/SET）只作用于该输出（按显示器名或 label 匹配，名字须存在否则 ERR）。auto = 旧默认（掩码/融合写第一台启用输出，网格操作写全部）。与控制台 "Target:" 下拉共享同一存储，任一入口修改另一侧实时同步 |
 | `GET outputs;` | `OK outputs=2;DISPLAY1;DISPLAY2;` | 列出启用输出的短设备名（旧解析端只读首个数字不受影响） |
 | `GET layout;` / `SET layout=2x2;` | `OK layout=2x2` | NxN 平铺布局：按物理位置（先上后下、先左后右）把启用的输出排进网格，第 (r,c) 格只显示源桌面对应窗口，出界部分被裁掉。会重建所有 warp 网格并把内部边界设为融合边 |
 | `GET overlap;` / `SET overlap=15;` | `OK overlap=15` | 相邻投影仪的重叠带宽（单台投影画面的百分比，0–40）。改变时重建 warp 网格，与 layout 配合使用 |
