@@ -23,13 +23,14 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 
 1. 投影仪扩展桌面接入 Windows
 2. 控制台列表中选中显示器 → "Toggle selected as projector"
-3. "Start Output" 启动全屏输出（先勾 Test pattern 显示测试图）
-4. "Configure alignment" 或 F3 进入校准：
+3. "Source:" 选择捕获源桌面（默认 `Auto` = 第一个「不是输出」的显示器；多屏机器上可指定具体某个桌面作为画面来源，改动后输出窗口自动重建）
+4. "Start Output" 启动全屏输出（先勾 Test pattern 显示测试图）
+5. "Configure alignment" 或 F3 进入校准：
    - 拖绿色控制点做几何校正（方向键微调，Shift+方向键大步）
    - F10 切到融合模式：拖红点调融合宽度，滚轮调 gamma
    - 勾选 "Advanced blending" 后为蓝点（每边多个）
    - Esc 退出校准
-5. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载
+6. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载
 
 ## 快捷键（全局，任何窗口有焦点都生效）
 

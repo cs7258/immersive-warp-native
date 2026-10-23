@@ -226,6 +226,11 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 void createOutputWindows() {
+    // Idempotent: main() starts the outputs and the UI can ask again (preview
+    // toggle, Start Output). A second call used to stack a duplicate window on
+    // the same display, and the second DuplicateOutput on that display then
+    // failed with E_INVALIDARG -> black output.
+    if (!g_outWins.empty()) destroyOutputWindows();
     WNDCLASSW wc{};
     wc.lpfnWndProc = OutputWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
@@ -235,7 +240,8 @@ void createOutputWindows() {
 
     auto displays = enumerateDisplays();
     dbgLogLine("createOutputWindows: displays=" + std::to_string(displays.size()) +
-               " preview=" + std::to_string((int)g_previewMode.load()));
+               " preview=" + std::to_string((int)g_previewMode.load()) +
+               " tid=" + std::to_string((long)GetCurrentThreadId()));
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     int n = 0;
     for (size_t i = 0; i < displays.size(); i++) {
