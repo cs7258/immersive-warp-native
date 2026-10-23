@@ -678,11 +678,12 @@ static void refreshInplaceStyles() {
     }
 }
 
-void setCalibrationMode(bool on) {
-    bool was = g_calib.exchange(on);
-    if (was == on) return;
-    // Esc is captured globally only while calibrating, so it never
-    // interferes with normal Escape usage in other apps
+// Hotkey registration must happen on the thread that pumps messages (the UI
+// thread): hotkeys registered elsewhere post WM_HOTKEY into a queue nobody
+// reads. Called from setCalibrationMode (UI thread) and the WM_CALIBSET
+// handler (CMDNET path). Idempotent: duplicate register/unregister attempts
+// simply fail and are ignored.
+void calibrationHotkeysSync(bool on) {
     if (on) {
         RegisterHotKey(nullptr, 3, 0, VK_ESCAPE);
         // D opens the advanced RGB dialog, exactly like the original. Only
@@ -692,6 +693,18 @@ void setCalibrationMode(bool on) {
         UnregisterHotKey(nullptr, 3);
         UnregisterHotKey(nullptr, 6);
     }
+}
+
+void requestCalibrationSync() {
+    // socket thread: the state atom is already updated, the UI thread only
+    // owns the hotkey (un)registration + the follow-up UI refresh
+    if (g_ctl) PostMessageW(g_ctl, WM_CALIBSET, 0, 0);
+}
+
+void setCalibrationMode(bool on) {
+    bool was = g_calib.exchange(on);
+    if (was == on) return;
+    calibrationHotkeysSync(on);
     refreshInplaceStyles();   // drop / restore click-through (no-op if off)
     refreshStatusBar();
 }
@@ -2540,6 +2553,14 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             return 0;
         }
         break;
+    }
+    case WM_CALIBSET: {   // calibration on/off from the socket thread:
+        // the state atom is already set; only the hotkeys (and the UI sync)
+        // must run here, on the thread that owns the message loop
+        calibrationHotkeysSync(g_calib.load());
+        refreshInplaceStyles();
+        refreshStatusBar();
+        return 0;
     }
     case WM_TIMER:                     // 1s status refresh (fps/uptime live)
         if (wp == 1 && g_statusInfo) refreshStatusBar();

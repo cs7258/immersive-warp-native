@@ -410,13 +410,20 @@ static std::string dispatch(std::string line) {
 
     if (cmd == "CALIB") {
         bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_calib.load();
-        setCalibrationMode(want);
+        g_calib.store(want);
+        // hotkeys belong to the UI thread's message loop - never register
+        // them here (WM_HOTKEY would land in the socket thread's queue)
+        requestCalibrationSync();
+        refreshStatusBar();
         return std::string("OK calib=") + (g_calib.load() ? "on" : "off") + "\n";
     }
 
     if (cmd == "MODE") {
         if (arg != "WARP" && arg != "BLEND") return "ERR MODE WARP|BLEND\n";
-        if (!g_calib.load()) setCalibrationMode(true);   // mode only exists inside calibration
+        if (!g_calib.load()) {             // mode only exists inside calibration
+            g_calib.store(true);
+            requestCalibrationSync();
+        }
         int want = (arg == "BLEND") ? 1 : 0;
         if (g_calibMode.load() != want) switchSubModeAll();
         return std::string("OK mode=") + (g_calibMode.load() == 1 ? "blend" : "warp") + "\n";

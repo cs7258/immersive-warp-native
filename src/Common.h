@@ -127,6 +127,12 @@ extern AppConfig g_cfg;
 extern std::mutex g_cfgMutex;
 extern std::atomic<int> g_rev;        // config revision, bumped on every edit
 extern std::atomic<bool> g_calib;     // calibration mode active
+// Register/UnregisterHotKey MUST run on the thread with the message loop (the
+// UI thread) - registering from the socket thread would post WM_HOTKEY into a
+// queue nobody pumps. CMDNET dispatches through this posted message.
+constexpr UINT WM_CALIBSET = WM_APP + 12;   // wp=0, lp = desired g_calib value
+void calibrationHotkeysSync(bool on);       // idempotent, UI thread only
+void requestCalibrationSync();              // any thread: post WM_CALIBSET
 extern std::atomic<bool> g_running;
 // Ctrl+F3 snapshot mode: freeze the captured desktop into a still frame so
 // alignment can be done on a stable image (matches the original's
