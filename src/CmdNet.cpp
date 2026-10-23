@@ -108,7 +108,7 @@ static std::string dispatch(std::string line) {
             for (auto& o : g_cfg.outputs) {
                 if (!o.enabled) continue;
                 char b[40];
-                sprintf_s(b, "OK masks=%d;", (int)std::min(o.masks.size(), (size_t)MAX_MASKS));
+                sprintf_s(b, "OK masks=%d;", (int)(std::min)(o.masks.size(), (size_t)MAX_MASKS));
                 std::string s = b;
                 for (auto& m : o.masks) {
                     sprintf_s(b, "%.3f,%.3f,%.3f,%.3f;", m.x, m.y, m.w, m.h);
@@ -313,7 +313,7 @@ static std::string dispatch(std::string line) {
                     for (auto& o : g_cfg.outputs) {
                         if (!o.enabled) continue;
                         // fit the rectangle so it stays on screen
-                        w = std::min(w, 1.0f - x); h = std::min(h, 1.0f - y);
+                        w = (std::min)(w, 1.0f - x); h = (std::min)(h, 1.0f - y);
                         if (sub == "add") {
                             if (o.masks.size() >= MAX_MASKS)
                                 return "ERR SET mask.add (max 8 masks)\n";
