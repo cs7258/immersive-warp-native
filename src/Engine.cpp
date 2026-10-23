@@ -586,8 +586,16 @@ void Engine::resizeSwapChain(OutputCtx& oc, UINT w, UINT h) {
 void Engine::detachAll() {
     // shared_ptr: each ctx is released once the render thread's in-flight
     // frame snapshot drops its reference — never while it is being drawn
-    std::lock_guard<std::mutex> lk(m_outsMutex);
-    m_outs.clear();
+    unsigned long long seq0 = m_frameSeq.load();
+    {
+        std::lock_guard<std::mutex> lk(m_outsMutex);
+        m_outs.clear();
+    }
+    // Wait for the render thread to finish the frame it may be in: only then
+    // is the last reference to the old ctx gone and its IDXGIOutputDuplication
+    // released. Without this the next DuplicateOutput on the same output can
+    // still see the old duplicator and fail with E_INVALIDARG.
+    for (int i = 0; i < 80 && m_frameSeq.load() == seq0; i++) Sleep(2);   // <=160ms
 }
 
 void Engine::shutdown() {
@@ -1034,4 +1042,8 @@ void Engine::renderAll() {
         }
         drawOutput(*oc, *cfg);
     }
+    // frame boundary marker: detachAll() waits for this to advance so a ctx
+    // dropped from m_outs is really gone (duplication released) before the
+    // next attach creates a new one on the same output
+    m_frameSeq++;
 }

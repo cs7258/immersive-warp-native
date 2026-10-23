@@ -102,4 +102,8 @@ private:
     std::vector<std::shared_ptr<OutputCtx>> m_outs;
     std::mutex m_outsMutex;
     UINT m_frameCount = 0;
+    // bumped once per rendered frame; detachAll waits for one bump so the
+    // render thread's in-flight snapshot (and its reference to a released ctx)
+    // is gone before a new duplication is created on the same output
+    std::atomic<unsigned long long> m_frameSeq{ 0 };
 };
