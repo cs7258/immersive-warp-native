@@ -646,24 +646,37 @@ static LRESULT CALLBACK MagBlendWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return DefWindowProcW(hwnd, msg, wp, lp);   // painted at creation/sync
 }
 
-// edges mask + per-side blend params for one output (by OutWinState), under
-// lock. Side order L/R/T/B = 0..3, matching BlendSide.
-static bool magBlendInfo(OutWinState* st, int& edges, float fade[4],
-                         float gam[4], float gn[4], float sl[4]) {
+// per-output blend parameters snapshot (by OutWinState), under lock. Side
+// order L/R/T/B = 0..3, matching BlendSide. Advanced points follow the
+// shader's gating: only when advancedBlend is on AND the side's edge bit is
+// set, capped at MAX_ADV entries.
+struct MagBlendParams {
+    int edges = 0;
+    float fade[4] = {}, gam[4] = {}, gn[4] = {}, sl[4] = {};
+    AdvPoint adv[4][MAX_ADV];
+    int advN[4] = {};
+};
+
+static bool magBlendInfo(OutWinState* st, MagBlendParams& p) {
     if (!st) return false;
     auto displays = enumerateDisplays();
     if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return false;
-    edges = 0;
-    for (int s = 0; s < 4; s++) { fade[s] = 0; gam[s] = 1; gn[s] = 0; sl[s] = 0; }
+    p = MagBlendParams{};
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     for (auto& o : g_cfg.outputs)
         if (o.enabled && o.deviceName == displays[st->displayIdx].deviceName) {
-            edges = o.edges;
+            p.edges = o.edges;
+            bool advOn = g_cfg.advancedBlend;
             for (int s = 0; s < 4; s++) {
-                fade[s] = o.blend[s].fade;
-                gam[s] = o.blend[s].gamma;
-                gn[s] = o.blend[s].gain;
-                sl[s] = o.blend[s].slope;
+                p.fade[s] = o.blend[s].fade;
+                p.gam[s] = o.blend[s].gamma;
+                p.gn[s] = o.blend[s].gain;
+                p.sl[s] = o.blend[s].slope;
+                if (advOn && (o.edges & (1 << s))) {
+                    int n = (int)(std::min)(o.adv[s].size(), (size_t)MAX_ADV);
+                    for (int i = 0; i < n; i++) p.adv[s][i] = o.adv[s][i];
+                    p.advN[s] = n;
+                }
             }
             return true;
         }
@@ -678,11 +691,30 @@ static float magBlendCurve(float x, float gain, float slope) {
     return (gain + 1.0f) * x / d;
 }
 
+// CPU mirror of the shader's edgeParams(): piecewise-linear fade/gamma along
+// the edge coordinate c over the advanced points (pos, fade, gamma).
+static void magEdgeParams(const AdvPoint* pts, int n, float c,
+                          float baseF, float baseG, float& fw, float& g) {
+    fw = baseF; g = baseG;
+    if (n <= 0) return;
+    if (c <= pts[0].pos) { fw = pts[0].fade; g = pts[0].gamma; return; }
+    for (int i = 0; i < n - 1; i++) {
+        if (c <= pts[i + 1].pos) {
+            float d = pts[i + 1].pos - pts[i].pos;
+            float t = (c - pts[i].pos) / (d > 1e-5f ? d : 1e-5f);
+            fw = pts[i].fade + (pts[i + 1].fade - pts[i].fade) * t;
+            g = pts[i].gamma + (pts[i + 1].gamma - pts[i].gamma) * t;
+            return;
+        }
+    }
+    fw = pts[n - 1].fade; g = pts[n - 1].gamma;
+}
+
 static void paintMagBlend(HWND ov, HWND host) {
     OutWinState* st = (OutWinState*)GetWindowLongPtrW(host, GWLP_USERDATA);
-    int edges = 0;
-    float fade[4], gam[4], gn[4], sl[4];
-    magBlendInfo(st, edges, fade, gam, gn, sl);
+    MagBlendParams p;
+    magBlendInfo(st, p);
+    int edges = p.edges;
     RECT wr{};
     GetWindowRect(host, &wr);
     int w = wr.right - wr.left, h = wr.bottom - wr.top;
@@ -703,23 +735,38 @@ static void paintMagBlend(HWND ov, HWND host) {
         auto* px = (unsigned*)bits;
         for (int y = 0; y < h; y++) {
             unsigned* row = px + (size_t)y * w;
+            float ny = (y + 0.5f) / h;
             for (int x = 0; x < w; x++) {
                 // transmitted weight per pixel = product of the participating
                 // sides' pow(blendCurve(t), gamma) - exactly the shader's
-                // multiplication; the overlay paints black with alpha
-                // 1 - weight so content * (1 - alpha) == content * weight
+                // multiplication (normalized pixel-center coords); the
+                // overlay paints black with alpha 1 - weight so
+                // content * (1 - alpha) == content * weight
+                float nx = (x + 0.5f) / w;
                 float wt = 1.0f;
-                if ((edges & 1) && fade[0] > 0 && x < fade[0] * w)
-                    wt *= powf(magBlendCurve(x / (fade[0] * w), gn[0], sl[0]), gam[0]);
-                if ((edges & 2) && fade[1] > 0) {
-                    float t = (w - 1 - x) / (fade[1] * w);
-                    if (t < 1) wt *= powf(magBlendCurve(t, gn[1], sl[1]), gam[1]);
+                if (edges & 1) {
+                    float fw, g;
+                    magEdgeParams(p.adv[0], p.advN[0], ny, p.fade[0], p.gam[0], fw, g);
+                    if (fw > 0.001f && nx < fw)
+                        wt *= powf(magBlendCurve(nx / fw, p.gn[0], p.sl[0]), g);
                 }
-                if ((edges & 4) && fade[2] > 0 && y < fade[2] * h)
-                    wt *= powf(magBlendCurve(y / (fade[2] * h), gn[2], sl[2]), gam[2]);
-                if ((edges & 8) && fade[3] > 0) {
-                    float t = (h - 1 - y) / (fade[3] * h);
-                    if (t < 1) wt *= powf(magBlendCurve(t, gn[3], sl[3]), gam[3]);
+                if (edges & 2) {
+                    float fw, g;
+                    magEdgeParams(p.adv[1], p.advN[1], ny, p.fade[1], p.gam[1], fw, g);
+                    if (fw > 0.001f && nx > 1 - fw)
+                        wt *= powf(magBlendCurve((1 - nx) / fw, p.gn[1], p.sl[1]), g);
+                }
+                if (edges & 4) {
+                    float fw, g;
+                    magEdgeParams(p.adv[2], p.advN[2], nx, p.fade[2], p.gam[2], fw, g);
+                    if (fw > 0.001f && ny < fw)
+                        wt *= powf(magBlendCurve(ny / fw, p.gn[2], p.sl[2]), g);
+                }
+                if (edges & 8) {
+                    float fw, g;
+                    magEdgeParams(p.adv[3], p.advN[3], nx, p.fade[3], p.gam[3], fw, g);
+                    if (fw > 0.001f && ny > 1 - fw)
+                        wt *= powf(magBlendCurve((1 - ny) / fw, p.gn[3], p.sl[3]), g);
                 }
                 float a = 1.0f - wt;
                 if (a < 0) a = 0;
@@ -761,13 +808,20 @@ static void syncMagBlendOverlays() {
         int mine = -1;
         for (size_t i = 0; i < g_magBlends.size(); i++)
             if (GetWindow(g_magBlends[i], GW_OWNER) == p.first) { mine = (int)i; break; }
-        // no fade content for this output (mask 0 or all fades 0): no overlay
-        int edges = 0; float fade[4], gam[4], gn[4], sl[4];
-        bool info = magBlendInfo((OutWinState*)GetWindowLongPtrW(p.first, GWLP_USERDATA),
-                                 edges, fade, gam, gn, sl);
-        bool content = info && edges != 0 &&
-            ((edges & 1 && fade[0] > 0) || (edges & 2 && fade[1] > 0) ||
-             (edges & 4 && fade[2] > 0) || (edges & 8 && fade[3] > 0));
+        // no fade content for this output (no participating side carries a
+        // band - base fade or advanced points - ): no overlay
+        MagBlendParams bp;
+        bool info = magBlendInfo((OutWinState*)GetWindowLongPtrW(p.first, GWLP_USERDATA), bp);
+        bool content = info;
+        if (content) {
+            content = false;
+            for (int s = 0; s < 4 && !content; s++) {
+                if (!(bp.edges & (1 << s))) continue;
+                if (bp.fade[s] > 0) { content = true; break; }
+                for (int i = 0; i < bp.advN[s]; i++)
+                    if (bp.adv[s][i].fade > 0) { content = true; break; }
+            }
+        }
         if (!content) {
             if (mine >= 0) {
                 magRemoveFilter(g_magBlends[mine]);
@@ -3012,9 +3066,14 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             syncMagTestOverlays(on);   // no-op outside engine=1
             invalidateToolbarToggles();   // Test button checked frame
         } else if (id == IDC_CKADV && HIWORD(wp) == BN_CLICKED) {
-            std::lock_guard<std::mutex> lk(g_cfgMutex);
-            g_cfg.advancedBlend = Button_GetCheck(g_ckAdv) == BST_CHECKED;
-            g_rev++;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.advancedBlend = Button_GetCheck(g_ckAdv) == BST_CHECKED;
+                g_rev++;
+            }
+            // MAG blend overlays change appearance with/without the advanced
+            // curves - resync them (no-op outside engine=1)
+            requestMagBlendSync();
         } else if (id == IDC_CKPREVIEW && HIWORD(wp) == BN_CLICKED) {
             bool on = Button_GetCheck(g_ckPreview) == BST_CHECKED;
             g_previewMode.store(on);
