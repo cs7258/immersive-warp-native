@@ -1050,8 +1050,9 @@ static void cfgReloadMasks() {
         int idx = 1;
         for (auto& m : o->masks) {
             wchar_t t[96];
-            wsprintfW(t, L"#%d  X %.1f%%  Y %.1f%%  %.1f%% x %.1f%%", idx++,
-                      m.x * 100.0f, m.y * 100.0f, m.w * 100.0f, m.h * 100.0f);
+            // wsprintfW has no %f support -> CRT formatter (same trap as the status bar)
+            _snwprintf_s(t, _TRUNCATE, L"#%d  X %.1f%%  Y %.1f%%  %.1f%% x %.1f%%", idx++,
+                         m.x * 100.0f, m.y * 100.0f, m.w * 100.0f, m.h * 100.0f);
             ListBox_AddString(lb, t);
         }
     }
