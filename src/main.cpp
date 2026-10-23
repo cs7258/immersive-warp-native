@@ -7,6 +7,9 @@
 // exception code + offset-in-module into debug.log so a failing build can be
 // diagnosed from the test machine alone.
 static LONG WINAPI iwnExcHandler(EXCEPTION_POINTERS* ep) {
+    // 0x406D1388 is the MSVC thread-name exception (std::thread debug helper):
+    // harmless, never a failure
+    if (ep->ExceptionRecord->ExceptionCode == 0x406D1388) return EXCEPTION_CONTINUE_SEARCH;
     HMODULE m = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -29,6 +32,7 @@ static LONG WINAPI iwnExcHandler(EXCEPTION_POINTERS* ep) {
 }
 
 static void renderLoop() {
+    dbgLogLine("renderLoop tid=" + std::to_string((long)GetCurrentThreadId()));
     while (g_running.load()) {
         Engine::inst().renderAll();
         Sleep(6);

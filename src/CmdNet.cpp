@@ -337,6 +337,7 @@ static std::string dispatch(std::string line) {
 }
 
 static void handleClient(SOCKET s) {
+    dbgLogLine("cmdnet client tid=" + std::to_string((long)GetCurrentThreadId()));
     std::string buf;
     char tmp[256];
     while (g_netRun.load()) {
