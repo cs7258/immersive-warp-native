@@ -351,6 +351,41 @@ static std::string dispatch(std::string line) {
                 refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
                 return rep;
             }
+            // batch import, replacing the whole list: rects are separated by
+            // SPACES because ';' terminates the command on the wire
+            if (sub == "load") {
+                std::vector<MaskRect> add;
+                size_t pos = 0;
+                while (pos <= val.size()) {
+                    size_t sp = val.find(' ', pos);
+                    std::string t = val.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos);
+                    if (!t.empty()) {
+                        float mx, my, mw, mh;
+                        if (sscanf_s(t.c_str(), "%f,%f,%f,%f", &mx, &my, &mw, &mh) != 4 ||
+                            mx < 0 || mx > 1 || my < 0 || my > 1 || mw < 0 || mw > 1 || mh < 0 || mh > 1)
+                            return "ERR SET mask.load (rects x,y,w,h in 0..1, space separated)\n";
+                        mw = (std::min)(mw, 1.0f - mx); mh = (std::min)(mh, 1.0f - my);
+                        add.push_back(MaskRect{ mx, my, mw, mh });
+                    }
+                    if (sp == std::string::npos) break;
+                    pos = sp + 1;
+                }
+                if (add.size() > MAX_MASKS)
+                    return "ERR SET mask.load (max 8 masks)\n";
+                std::string rep;
+                {
+                    std::lock_guard<std::mutex> lk(g_cfgMutex);
+                    for (auto& o : g_cfg.outputs) {
+                        if (!o.enabled) continue;
+                        o.masks = add;
+                        rep = "OK masks=" + std::to_string(o.masks.size()) + "\n";
+                        break;
+                    }
+                }
+                if (rep.empty()) return "ERR no output\n";
+                refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
+                return rep;
+            }
             if (sub == "del") {
                 if (sscanf_s(val.c_str(), "%d", &idx) != 1)
                     return "ERR SET mask.del (want i)\n";
@@ -370,7 +405,7 @@ static std::string dispatch(std::string line) {
                 refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
                 return rep;
             }
-            return "ERR SET mask (add|set|del|clear)\n";
+            return "ERR SET mask (add|set|load|del|clear)\n";
         }
         // grid density for every enabled output (REBUILDS each warp grid,
         // dropping manual point edits, same as the Configure dialog's Apply)
