@@ -365,6 +365,13 @@ bool Engine::setTestImage(int id) {
 
 bool engineLoadImage(const std::wstring& path) { return Engine::inst().loadImage(path); }
 bool engineHasImage() { return Engine::inst().hasImage(); }
+
+// GET perf diagnostics: uptime starts at module load (close enough to process
+// start for a health readout; no dependency on where main() puts its timer)
+static ULONGLONG g_perfStartTick = GetTickCount64();
+double engineFps() { return Engine::inst().fps(); }
+unsigned long long engineFrames() { return Engine::inst().frames(); }
+unsigned long long engineUptimeMs() { return GetTickCount64() - g_perfStartTick; }
 bool engineSetTestImage(int id) { return Engine::inst().setTestImage(id); }
 
 // ---------------- debug log (%APPDATA%\ImmersiveWarpNative\debug.log) ----------------
@@ -1096,4 +1103,16 @@ void Engine::renderAll() {
     // dropped from m_outs is really gone (duplication released) before the
     // next attach creates a new one on the same output
     m_frameSeq++;
+
+    // rolling fps: measure frames over a >=1s window, publish as x10 fixed
+    // point (render thread is the only writer)
+    m_fpsAccum++;
+    ULONGLONG nowTick = GetTickCount64();
+    if (!m_fpsTick) m_fpsTick = nowTick;
+    ULONGLONG el = nowTick - m_fpsTick;
+    if (el >= 1000) {
+        m_fpsX10.store((unsigned)((m_fpsAccum * 10000ULL) / el));
+        m_fpsAccum = 0;
+        m_fpsTick = nowTick;
+    }
 }

@@ -27,6 +27,10 @@ public:
 
     void renderAll();                  // one frame over all outputs (called from render thread)
 
+    // diagnostics for CMDNET "GET perf" (remote health monitoring)
+    unsigned long long frames() const { return m_frameSeq.load(); }
+    double fps() const { return m_fpsX10.load() / 10.0; }   // rolling 1s window
+
 private:
     Engine() = default;
 
@@ -106,4 +110,8 @@ private:
     // render thread's in-flight snapshot (and its reference to a released ctx)
     // is gone before a new duplication is created on the same output
     std::atomic<unsigned long long> m_frameSeq{ 0 };
+    // rolling fps: render thread is the only writer, GET perf reads atomically
+    std::atomic<unsigned> m_fpsX10{ 0 };   // frames per second, fixed point x10
+    unsigned m_fpsAccum = 0;               // frames since the last fps window
+    ULONGLONG m_fpsTick = 0;               // window start (GetTickCount64 ms)
 };

@@ -146,6 +146,22 @@ static std::string dispatch(std::string line) {
         if (k == "calib")    return std::string("OK calib=")    + (g_calib.load() ? "on" : "off") + "\n";
         if (k == "mode")     return std::string("OK mode=")     + (g_calibMode.load() == 1 ? "blend" : "warp") + "\n";
         if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
+        // remote health monitoring: one line, key=value; pairs (STATUS style)
+        if (k == "perf") {
+            int nOut = 0;
+            bool running;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (auto& o : g_cfg.outputs) if (o.enabled) nOut++;
+                running = g_cfg.enabled || g_cfg.previewMode;
+            }
+            char buf[160];
+            // fps is fractional -> CRT snprintf (wsprintf has no %f)
+            _snprintf_s(buf, _TRUNCATE, "OK perf=uptime=%llu;frames=%llu;fps=%.1f;outputs=%d;running=%d\n",
+                        (unsigned long long)(engineUptimeMs() / 1000),
+                        engineFrames(), engineFps(), nOut, running ? 1 : 0);
+            return buf;
+        }
         if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
         if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
         if (k == "layout") {

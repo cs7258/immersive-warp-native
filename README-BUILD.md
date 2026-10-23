@@ -80,6 +80,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET presets;` | `OK presets=NAME1;NAME2` / `OK presets=none` | 列出全部已保存预设 |
 | `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
 | `SET left.gain=0.8;` / `SET left.slope=0.3;` | `OK left.gain=0.8` | 融合曲线增益/陡度（gain 0–2、slope 0–1；0/0 = 线性斜坡，slope=1 为硬切换） |
+| `GET perf;` | `OK perf=uptime=123;frames=4567;fps=59.9;outputs=1;running=1` | 运行健康诊断：进程运行秒数、累计渲染帧数、滚动 1 秒平均帧率（空闲/无输出时 0.0）、启用输出数、是否运行中（enabled 或 preview） |
 | `SET testpattern=off;` | `OK testpattern=off` | 切换测试图 |
 | `GET color;` / `SET color=1.2,1.0,0.8,1.5,0.9;` | `OK color=1.200,1.000,0.800,1.500,0.900` | 命令目标输出的色彩调节：gammaR,gammaG,gammaB（0.2–3.0）+ bright,contrast（0.2–2.0），越界自动限幅到滑杆范围；遵循 `SET out=` 定向 |
 | `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/out/各边 fade·gamma·gain·slope） |

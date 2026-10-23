@@ -141,6 +141,11 @@ void registerAndCreateControlWindow(HINSTANCE hInst);
 // image source (WIC decode); empty path clears back to pattern/capture
 bool engineLoadImage(const std::wstring& path);
 bool engineHasImage();
+
+// engine diagnostics for CMDNET "GET perf" (remote health monitoring)
+double engineFps();                      // rolling 1s average, 0 before first window
+unsigned long long engineFrames();       // frames rendered since start
+unsigned long long engineUptimeMs();     // ms since process start
 bool engineSetTestImage(int id);   // built-in test image library (0..3)
 void createOutputWindows();
 // render-thread bridge: the in-progress right-drag mask rectangle (true when
