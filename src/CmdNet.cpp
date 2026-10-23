@@ -97,6 +97,10 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return "OK engine=" + std::string(g_cfg.engine == 0 ? "desktopduplication" : "unknown") + "\n";
         }
+        if (k == "curved") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return std::string("OK curved=") + (g_cfg.curved ? "on" : "off") + "\n";
+        }
         if (k == "rows" || k == "cols") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             for (auto& o : g_cfg.outputs)
@@ -249,6 +253,15 @@ static std::string dispatch(std::string line) {
                 return "OK engine=desktopduplication\n";
             }
             return "ERR SET engine (only desktopduplication in this build)\n";
+        }
+        // curved vs bilinear mesh interpolation (Catmull-Rom needs 4x4+ grids)
+        if (key == "curved") {
+            if (val != "ON" && val != "OFF" && val != "1" && val != "0")
+                return "ERR SET curved (ON or OFF)\n";
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            g_cfg.curved = (val == "ON" || val == "1") ? 1 : 0;
+            g_rev++;   // render thread rebuilds every mesh on the next frame
+            return std::string("OK curved=") + (g_cfg.curved ? "on" : "off") + "\n";
         }
         // grid density for every enabled output (REBUILDS each warp grid,
         // dropping manual point edits, same as the Configure dialog's Apply)

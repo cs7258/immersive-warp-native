@@ -715,7 +715,10 @@ void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
             int ci = std::min((int)fc, std::max(cols - 2, 0));
             float tc = cols > 1 ? fc - ci : 0;
             float dx, dy;
-            if (rows >= 4 && cols >= 4) {
+            // curved mode: Catmull-Rom through the control points (needs a 4x4+
+            // grid to have neighbour points on both sides; below that bilinear
+            // is the only well-defined interpolation)
+            if (g_cfg.curved && rows >= 4 && cols >= 4) {
                 // Catmull-Rom: outer lerp must return ROW ri at tr=0 and ROW ri+1
                 // at tr=1, so the four rows are (ri-1, ri, ri+1, ri+2)
                 float c0 = catmull(pt(cfg, ri - 1, ci - 1, 0), pt(cfg, ri - 1, ci, 0), pt(cfg, ri - 1, ci + 1, 0), pt(cfg, ri - 1, ci + 2, 0), tc);

@@ -909,6 +909,7 @@ static int g_cfgSel = 0;          // index into g_cfg.outputs shown in the combo
 #define CFG_FLIPV    2114
 #define CFG_ROT90    2115
 #define CFG_GRESET   2116
+#define CFG_CURVED   2117
 // blending page
 #define CFG_SIDE     2120
 #define CFG_FADE     2121
@@ -974,6 +975,8 @@ static void cfgReloadGeometry() {
     SetWindowTextW(GetDlgItem(g_cfgPanel[2], CFG_HORIZ), t);
     wsprintfW(t, L"%d", o->rows);
     SetWindowTextW(GetDlgItem(g_cfgPanel[2], CFG_VERT), t);
+    Button_SetCheck(GetDlgItem(g_cfgPanel[2], CFG_CURVED),
+                    g_cfg.curved ? BST_CHECKED : BST_UNCHECKED);
 }
 
 static void cfgReloadBlend() {
@@ -1098,9 +1101,13 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 254, 44, 114, 26, p, (HMENU)CFG_ROT90, nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"Reset grid", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 10, 78, 114, 26, p, (HMENU)CFG_GRESET, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Curved grid (Catmull-Rom)",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 132, 80, 220, 22, p,
+                (HMENU)CFG_CURVED, nullptr, nullptr);
             CreateWindowW(L"STATIC",
-                L"Curved / Linear grid and per-point Move modes live on the output\n"
-                L"window (F3 calibration): drag green points, arrow keys fine-tune.",
+                L"Curved: Catmull-Rom interpolation between control points\n"
+                L"(needs Horiz/Vert >= 4, linear below). Per-point Move modes\n"
+                L"live on the output window (F3): drag green points, arrows nudge.",
                 WS_CHILD | WS_VISIBLE, 10, 120, 360, 40, p, nullptr, nullptr, nullptr);
         }
         // --- Blending page (index 3) ---
@@ -1242,6 +1249,15 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 OutputCfg* o = cfgOutput();
                 if (o) { o->initIdentity(); g_rev++; }
+            }
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_CURVED) {   // curved (Catmull-Rom) vs bilinear mesh
+            bool on = Button_GetCheck(GetDlgItem(g_cfgPanel[2], CFG_CURVED)) == BST_CHECKED;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                if (g_cfg.curved != (on ? 1 : 0)) { g_cfg.curved = on ? 1 : 0; g_rev++; }
             }
             refreshStatusBar();
             return 0;

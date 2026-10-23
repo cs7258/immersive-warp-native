@@ -96,6 +96,7 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "overlap=" << g_cfg.overlap << "\n";
     os << "engine=" << g_cfg.engine << "\n";
     os << "subdivide=" << g_cfg.subdivide << "\n";
+    os << "curved=" << g_cfg.curved << "\n";
     os << "outputs=" << g_cfg.outputs.size() << "\n";
     for (auto& o : g_cfg.outputs) {
         os << "dev=" << toUtf8(o.deviceName) << "\n";
@@ -161,6 +162,7 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "overlap") c.overlap = atoi(val.c_str());
         else if (key == "engine") c.engine = atoi(val.c_str());
         else if (key == "subdivide") c.subdivide = atoi(val.c_str());
+        else if (key == "curved") c.curved = atoi(val.c_str());
         else if (key == "outputs") c.outputs.resize((size_t)atoi(val.c_str()));
         else if (key == "dev") {
             cur = nullptr;

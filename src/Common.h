@@ -83,6 +83,7 @@ struct AppConfig {
     std::wstring imagePath;
     int testImg = -1;                 // built-in test image library (0..3), -1 = none
     int subdivide = 8;                // mesh subdivision per control cell
+    int curved = 0;                   // 1 = Catmull-Rom curved grid interp (needs rows>=4 && cols>=4), 0 = bilinear
     int cmdnet = 0;                   // CMDNET ASCII TCP show-control service on/off
     int cmdnetPort = 5252;            // CMDNET listen port (loopback only)
     int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x

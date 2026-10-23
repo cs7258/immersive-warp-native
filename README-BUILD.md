@@ -86,6 +86,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET rows=8;` / `SET cols=16;` | `OK rows=8` | 重建所有启用输出的控制点网格（3–24；**会丢弃手工校正点**，与对话框 Apply 一致） |
 | `SET flip=H;` / `SET flip=V;` | `OK flip=H` | 所有启用输出水平/垂直镜像（对已校正的点阵做变换） |
 | `SET rotate=90;` / `SET rotate=-90;` | `OK rotate=90` | 所有启用输出旋转 90°（顺/逆时针） |
+| `GET curved;` / `SET curved=on;` | `OK curved=on` | 弯曲网格：控制点间 Catmull-Rom 插值（需 Horiz/Vert ≥ 4，否则自动回退双线性）。off = 双线性（默认） |
 | `AUTOSTART ON;\|AUTOSTART OFF;` | `OK autostart=on` | 开机自启（写入 HKCU Run，无需管理员） |
 | 其他 | `ERR UNKNOWN` | 未知命令 |
 
