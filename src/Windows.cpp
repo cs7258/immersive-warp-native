@@ -752,6 +752,7 @@ void notifyOutputRaised() {
 #define IDC_PRESETDEL  1030
 #define IDC_CBTARGET   1031   // per-output command target dropdown (SET out=)
 #define IDC_TABS       1032   // main-console tab strip
+#define IDC_CKINPLACE  1033   // in-place overlay (fullscreen click-through)
 
 static void refreshList() {
     if (!g_list) return;
