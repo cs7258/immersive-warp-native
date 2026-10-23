@@ -226,10 +226,13 @@ static std::string dispatch(std::string line) {
     }
 
     // SET <side>.<field>=<value>  e.g. "SET left.fade=0.2" / "SET testpattern=off"
+    // A value-less form ("SET mask.clear") is also accepted for actions that
+    // take no argument; keys that need a value reject an empty val themselves.
     if (cmd == "SET") {
         size_t eq = arg.find('=');
-        if (eq == std::string::npos) return "ERR SET side.field=value\n";
-        std::string key = arg.substr(0, eq), val = arg.substr(eq + 1);
+        std::string key = (eq == std::string::npos) ? arg : arg.substr(0, eq);
+        std::string val = (eq == std::string::npos) ? "" : arg.substr(eq + 1);
+        if (key.empty()) return "ERR SET side.field=value\n";
         for (auto& c : key) c = (char)tolower((unsigned char)c);
         // Set the capture source: rebuilds the outputs, so it must run without
         // holding g_cfgMutex (setSourceDisplay locks internally).
