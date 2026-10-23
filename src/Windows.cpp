@@ -436,6 +436,19 @@ static bool g_tgtBusy = false;      // suppress CBN_SELCHANGE during programmati
 
 // Main-console tab strip: controls are tagged to a page at creation time and
 // shown/hidden together (1:1 with the original's multi-page console).
+// menu bar ids (File/View/Warping/Help). Must stay outside 1001..1034 and the
+// tray ranges (2001..2004, 2200..2231). Defined BEFORE showTab (which marks
+// the View items) - the C2065 recurrence guard.
+#define IDM_FILE_LOAD  2101
+#define IDM_FILE_SAVE  2102
+#define IDM_FILE_EXIT  2103
+#define IDM_VIEW_DISP  2111   // +0..3 = the four pages
+#define IDM_VIEW_HIDE  2115
+#define IDM_WARP_ALIGN 2121
+#define IDM_WARP_EDGES 2122
+#define IDM_WARP_SNAP  2123
+#define IDM_WARP_TEST  2124
+#define IDM_HELP_ABOUT 2131
 static std::vector<HWND> g_pages[4];
 static HWND g_tab = nullptr;
 static HWND g_schematic = nullptr;   // Displays page output schematic (owner-draw)
@@ -764,19 +777,7 @@ void notifyOutputRaised() {
 #define IDC_TABS       1032   // main-console tab strip
 #define IDC_CKINPLACE  1033   // in-place overlay (fullscreen click-through)
 #define IDC_SCHEMATIC  1034   // Displays page: owner-drawn output schematic
-
-// menu bar ids (File/View/Warping/Help). Must stay outside 1001..1034 and the
-// tray ranges (2001..2004, 2200..2231).
-#define IDM_FILE_LOAD  2101
-#define IDM_FILE_SAVE  2102
-#define IDM_FILE_EXIT  2103
-#define IDM_VIEW_DISP  2111   // +0..3 = the four pages
-#define IDM_VIEW_HIDE  2115
-#define IDM_WARP_ALIGN 2121
-#define IDM_WARP_EDGES 2122
-#define IDM_WARP_SNAP  2123
-#define IDM_WARP_TEST  2124
-#define IDM_HELP_ABOUT 2131
+// (menu bar IDM_* ids live above showTab, see the note there)
 
 static void refreshList() {
     if (!g_list) return;
