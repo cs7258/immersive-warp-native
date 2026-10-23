@@ -82,6 +82,10 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET layout;` / `SET layout=2x2;` | `OK layout=2x2` | NxN 平铺布局：按物理位置（先上后下、先左后右）把启用的输出排进网格，第 (r,c) 格只显示源桌面对应窗口，出界部分被裁掉。会重建所有 warp 网格并把内部边界设为融合边 |
 | `GET overlap;` / `SET overlap=15;` | `OK overlap=15` | 相邻投影仪的重叠带宽（单台投影画面的百分比，0–40）。改变时重建 warp 网格，与 layout 配合使用 |
 | `GET engine;` / `SET engine=dxgi;` | `OK engine=desktopduplication` | 查询/选择 warp 引擎；当前构建只有 Desktop Duplication，其余为占位 |
+| `GET rows;` / `GET cols;` | `OK rows=10` | 查询（第一个启用的）输出的控制点网格密度 |
+| `SET rows=8;` / `SET cols=16;` | `OK rows=8` | 重建所有启用输出的控制点网格（3–24；**会丢弃手工校正点**，与对话框 Apply 一致） |
+| `SET flip=H;` / `SET flip=V;` | `OK flip=H` | 所有启用输出水平/垂直镜像（对已校正的点阵做变换） |
+| `SET rotate=90;` / `SET rotate=-90;` | `OK rotate=90` | 所有启用输出旋转 90°（顺/逆时针） |
 | `AUTOSTART ON;\|AUTOSTART OFF;` | `OK autostart=on` | 开机自启（写入 HKCU Run，无需管理员） |
 | 其他 | `ERR UNKNOWN` | 未知命令 |
 

@@ -1163,8 +1163,8 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 244, 78, 120, 26, p, (HMENU)CFG_MCLEAR, nullptr, nullptr);
             CreateWindowW(L"STATIC",
                 L"Mask rectangles render black on the output (up to 8).\n"
-                L"Move/resize masks by editing the config file for now:\n"
-                L"each line mask=i:x:y:w:h (normalized 0..1).",
+                L"Position/size can be tuned by editing the saved config:\n"
+                L"mask=x,y,w,h (normalized 0..1, saved on Save Config).",
                 WS_CHILD | WS_VISIBLE, 10, 184, 360, 60, p, nullptr, nullptr, nullptr);
         }
         // --- Bezels / Align / Help placeholders (0, 1, 6) ---

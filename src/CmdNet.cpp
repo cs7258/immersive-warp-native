@@ -97,6 +97,14 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return "OK engine=" + std::string(g_cfg.engine == 0 ? "desktopduplication" : "unknown") + "\n";
         }
+        if (k == "rows" || k == "cols") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            for (auto& o : g_cfg.outputs)
+                if (o.enabled)
+                    return "OK " + k + "=" +
+                           std::to_string(k == "rows" ? o.rows : o.cols) + "\n";
+            return "ERR no output\n";
+        }
         if (k == "source") {
             std::wstring cur = currentSourceDevice();
             return "OK source=" + (cur.empty() ? std::string("auto") : shortDev(cur)) + "\n";
@@ -241,6 +249,61 @@ static std::string dispatch(std::string line) {
                 return "OK engine=desktopduplication\n";
             }
             return "ERR SET engine (only desktopduplication in this build)\n";
+        }
+        // grid density for every enabled output (REBUILDS each warp grid,
+        // dropping manual point edits, same as the Configure dialog's Apply)
+        if (key == "rows" || key == "cols") {
+            int n = atoi(val.c_str());
+            if (n < 3 || n > 24) return "ERR SET " + key + " (3..24)\n";
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled) continue;
+                    if (key == "rows") o.rows = n; else o.cols = n;
+                    o.initIdentity();
+                }
+                g_rev++;
+            }
+            refreshStatusBar();
+            return "OK " + key + "=" + val + "\n";
+        }
+        // grid transforms on every enabled output (same math as the dialog)
+        if (key == "flip") {
+            if (val != "H" && val != "V") return "ERR SET flip (H or V)\n";
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled) continue;
+                    found = true;
+                    for (size_t i = 0; i < o.points.size(); i += 2) {
+                        if (val == "H") o.points[i] = 1.0f - o.points[i];
+                        else            o.points[i + 1] = 1.0f - o.points[i + 1];
+                    }
+                }
+                if (found) g_rev++;
+            }
+            if (!found) return "ERR no output\n";
+            refreshStatusBar();
+            return "OK flip=" + val + "\n";
+        }
+        if (key == "rotate") {
+            if (val != "90" && val != "-90" && val != "270")
+                return "ERR SET rotate (90, -90 or 270)\n";
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled) continue;
+                    for (size_t i = 0; i < o.points.size(); i += 2) {
+                        float x = o.points[i], y = o.points[i + 1];
+                        if (val == "90")  { o.points[i] = 1.0f - y; o.points[i + 1] = x; }
+                        else              { o.points[i] = y; o.points[i + 1] = 1.0f - x; }
+                    }
+                }
+                g_rev++;
+            }
+            refreshStatusBar();
+            return "OK rotate=" + val + "\n";
         }
         static const char* sides[4] = { "left", "right", "top", "bottom" };
         {
