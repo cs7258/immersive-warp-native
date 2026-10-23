@@ -102,7 +102,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET outputs;` | `OK outputs=2;DISPLAY1;DISPLAY2;` | 列出启用输出的短设备名（旧解析端只读首个数字不受影响） |
 | `GET layout;` / `SET layout=2x2;` | `OK layout=2x2` | NxN 平铺布局：按物理位置（先上后下、先左后右）把启用的输出排进网格，第 (r,c) 格只显示源桌面对应窗口，出界部分被裁掉。会重建所有 warp 网格并把内部边界设为融合边 |
 | `GET overlap;` / `SET overlap=15;` | `OK overlap=15` | 相邻投影仪的重叠带宽（单台投影画面的百分比，0–40）。改变时重建 warp 网格，与 layout 配合使用 |
-| `GET engine;` / `SET engine=dxgi;` | `OK engine=desktopduplication` | 查询/选择 warp 引擎；当前构建只有 Desktop Duplication，其余为占位 |
+| `GET engine;` / `SET engine=DXGI;` / `SET engine=MAG;` | `OK engine=desktopduplication` / `OK engine=mag` | 查询/选择 warp 引擎。**DXGI** = Desktop Duplication + 网格校正/融合管线；**MAG** = DWM Magnification host 窗口（1:1 桌面镜像，无网格——1x1 主屏异型镜像/桌面融合用，自身窗口经 filter list 从镜像内容中排除，防无限递归）。切换会重建输出窗口；MAG 引擎下校准（F3）不可用并提示 |
 | `GET rows;` / `GET cols;` | `OK rows=10` | 查询（第一个启用的）输出的控制点网格密度 |
 | `SET rows=8;` / `SET cols=16;` | `OK rows=8` | 重建所有启用输出的控制点网格（3–24；**会丢弃手工校正点**，与对话框 Apply 一致） |
 | `GET warp;` / `GET warp=r,c;` / `SET point=r,c,x,y;` | `OK point=1,1,0.1500,0.1200` | 远程校正单个控制点：`GET warp` 全量导出（`rows;cols;` + 每点 `x,y` 空格分隔，行优先），`GET warp=r,c` / `SET point=r,c,x,y` 读写单点（0 基，归一化坐标，允许 -0.5–1.5 梯形出界）；遵循 `SET out=` 定向 |

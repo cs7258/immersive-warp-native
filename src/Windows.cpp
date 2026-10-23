@@ -28,6 +28,14 @@ struct OutWinState {
     float pendX0 = 0, pendY0 = 0, pendX1 = 0, pendY1 = 0;
 };
 static const wchar_t* OUT_CLASS = L"IWN_OutputWnd";
+static const wchar_t* MAG_CLASS = L"IWN_MagWnd";   // engine=1 magnifier host
+
+// Magnifier host proc: the Magnification API paints through the default
+// window procedure, we only keep click-to-raise disabled like DXGI outputs.
+static LRESULT CALLBACK MagWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
 static std::vector<std::pair<HWND, OutWinState*>> g_outWins;
 
 static OutputCfg* cfgForWindowNoLock(OutWinState* st) {
@@ -321,12 +329,40 @@ void createOutputWindows() {
     wc.lpszClassName = OUT_CLASS;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
+    WNDCLASSW mc{};
+    mc.lpfnWndProc = MagWndProc;
+    mc.hInstance = GetModuleHandleW(nullptr);
+    mc.lpszClassName = MAG_CLASS;
+    RegisterClassW(&mc);
 
     auto displays = enumerateDisplays();
     dbgLogLine("createOutputWindows: displays=" + std::to_string(displays.size()) +
                " preview=" + std::to_string((int)g_previewMode.load()) +
+               " engine=" + std::to_string(g_cfg.engine) +
                " tid=" + std::to_string((long)GetCurrentThreadId()));
     std::lock_guard<std::mutex> lk(g_cfgMutex);
+    // source desktop rectangle for the Magnification hosts: pinned source,
+    // else the first display that is not an enabled output; a single-display
+    // machine mirrors the primary monitor (hosts are filter-excluded so no
+    // infinite-mirror recursion)
+    auto sourceRect = [&]() -> RECT {
+        std::wstring src = g_cfg.sourceDev;
+        if (src.empty()) {
+            for (auto& d : displays) {
+                bool isOut = false;
+                for (auto& o : g_cfg.outputs)
+                    if (o.enabled && o.deviceName == d.deviceName) { isOut = true; break; }
+                if (!isOut) { src = d.deviceName; break; }
+            }
+        }
+        if (!src.empty())
+            for (auto& d : displays)
+                if (d.deviceName == src) return d.desktop;
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(MonitorFromPoint(POINT{}, MONITOR_DEFAULTTOPRIMARY), &mi))
+            return mi.rcMonitor;
+        return displays.empty() ? RECT{0, 0, 1920, 1080} : displays[0].desktop;
+    };
     int n = 0;
     for (size_t i = 0; i < displays.size(); i++) {
         OutputCfg* cfg = nullptr;
@@ -367,6 +403,34 @@ void createOutputWindows() {
         RECT r = displays[i].desktop;
         bool preview = g_previewMode.load();
         bool inplace = g_inplace.load();
+        if (g_cfg.engine == 1) {
+            // DWM Magnification host window: WS_EX_LAYERED is required by
+            // the API. In-place keeps its click-through semantics; the mag
+            // feed never shows our own windows (filter list in MagEngine).
+            HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+                                        WS_EX_LAYERED |
+                                        (inplace && !g_calib.load() ? WS_EX_TRANSPARENT : 0),
+                MAG_CLASS, title.c_str(), WS_POPUP | WS_VISIBLE,
+                r.left, r.top, r.right - r.left, r.bottom - r.top,
+                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (inplace) {
+                // same capture-exclusion as DXGI in-place (belt and braces;
+                // the mag filter list already covers the recursion case)
+                typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
+                auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                                   "SetWindowDisplayAffinity");
+                if (fn) fn(hwnd, 0x11);
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
+            g_outWins.push_back({ hwnd, st });
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            RECT src = sourceRect();
+            if (magEngineInit())
+                magAttachOutput(hwnd, src);
+            else
+                dbgLogLine("magEngineInit failed - mag output stays black");
+            continue;   // the render thread owns nothing in MAG mode
+        }
         if (preview) {
             // windowed preview: 60% of the monitor, centered. Combined with
             // WDA_EXCLUDEFROMCAPTURE this allows live desktop warping on a
@@ -410,6 +474,7 @@ void createOutputWindows() {
 
 void destroyOutputWindows() {
     dbgLogLine("destroyOutputWindows: " + std::to_string(g_outWins.size()) + " window(s)");
+    magDetachAll();   // no-op outside engine=1
     for (auto& p : g_outWins) DestroyWindow(p.first);
     g_outWins.clear();
     Engine::inst().detachAll();
@@ -625,10 +690,14 @@ void refreshStatusBar() {
     // [n] = which projector is being edited (1-based). refreshList() resets the
     // listbox selection, so fall back to 1 instead of showing [0].
     int cur = (sel >= 0 && sel < nProj) ? sel + 1 : (nProj > 0 ? 1 : 0);
-    wsprintfW(l1, L"Projector: %d [%d]%s%s", nProj, cur,
-              g_previewMode.load() ? L"   Preview: ON" : L"",
-              g_inplace.load() ? (g_calib.load() ? L"   In-place: CALIB (click-through bypassed)"
-                                                 : L"   In-place: ON") : L"");
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        wsprintfW(l1, L"Projector: %d [%d]%s%s%s", nProj, cur,
+                  g_previewMode.load() ? L"   Preview: ON" : L"",
+                  g_inplace.load() ? (g_calib.load() ? L"   In-place: CALIB (click-through bypassed)"
+                                                     : L"   In-place: ON") : L"",
+                  g_cfg.engine == 1 ? L"   Engine: MAG" : L"");
+    }
     // wsprintfW (user32) has no floating point support -> use the CRT here
     _snwprintf_s(l2, 160, _TRUNCATE, L"Mode: %s   Snapshot: %s",
                  nProj == 0 ? L"- (no projector assigned)"
@@ -710,6 +779,14 @@ void setCalibrationMode(bool on) {
 }
 
 void toggleCalibration() {
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        if (g_cfg.engine == 1 && !g_calib.load()) {
+            // MAG mode has no mesh: warp/blend calibration is meaningless
+            setStatus(L"Calibration needs the Desktop Duplication engine (pick it in the engine dropdown).");
+            return;
+        }
+    }
     if (g_calib.load()) {
         setCalibrationMode(false);
         setStatus(L"Calibration OFF.");
@@ -962,6 +1039,23 @@ void setSourceDisplay(const std::wstring& dev) {
 
 void requestInplaceRestyle() {
     // post from any thread; the console handles WM_INPLACESET on the UI thread
+    if (g_ctl) PostMessageW(g_ctl, WM_INPLACESET, 0, 0);
+}
+
+void refreshEngineComboUI() {
+    // socket thread safe: PostMessage-based, mirrors refreshTargetComboUI's
+    // intent (UI follows shared state without re-triggering CBN_SELCHANGE -
+    // CB_SETCURSEL alone never fires the notification)
+    if (g_ctl && g_cbEng)
+        PostMessageW(g_cbEng, CB_SETCURSEL,
+                     g_cfg.engine == 1 ? 1 : 0, 0);
+}
+
+void requestOutputRebuild() {
+    // engine switches (SET engine=) and any other state that changes WHAT the
+    // output windows are: destroy + recreate on the UI thread. Reuses the
+    // WM_INPLACESET entry point - it is already an idempotent rebuild that
+    // also resyncs the overlay checkbox.
     if (g_ctl) PostMessageW(g_ctl, WM_INPLACESET, 0, 0);
 }
 
@@ -2147,7 +2241,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             466, 420, 152, 220,
             hwnd, (HMENU)IDC_CBENG, nullptr, nullptr);
         ComboBox_AddString(g_cbEng, L"Desktop Duplication (DXGI)");
-        ComboBox_AddString(g_cbEng, L"DWM Magnification (n/a)");
+        ComboBox_AddString(g_cbEng, L"DWM Magnification (mirror)");
         ComboBox_AddString(g_cbEng, L"NVAPI clone (n/a)");
         ComboBox_AddString(g_cbEng, L"DOPP (n/a)");
         // structured status block (Projector / Mode / Color balancing / edges
@@ -2160,6 +2254,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             hwnd, nullptr, nullptr, nullptr);
         applyDarkThemeRecursive(hwnd);   // DarkMode_Explorer on every child
         syncInplaceUI(hwnd);             // initial View-menu check state
+        magSetConsoleWindow(hwnd);       // console excluded from the mag feed
         showTab(PAGE_DISPLAYS);
         SetTimer(hwnd, 1, 1000, nullptr);   // 1s: refresh Engine fps/uptime line
         {
@@ -2290,8 +2385,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             setStatus(L"Output stopped.");
         } else if (id == IDC_CALIB && HIWORD(wp) == BN_CLICKED) {
             if (g_outWins.empty()) createOutputWindows();
-            setCalibrationMode(true);
-            setStatus(L"Calibration ON: drag green points (warp), F10 = blend mode, Esc = exit.");
+            toggleCalibration();
         } else if (id == IDC_SAVE && HIWORD(wp) == BN_CLICKED) {
             setStatus(saveConfig(L"") ? L"Config saved." : L"Save failed.");
         } else if (id == IDC_LOAD && HIWORD(wp) == BN_CLICKED) {
@@ -2491,10 +2585,23 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             setStatus(msg);
         } else if (id == IDC_CBENG && HIWORD(wp) == CBN_SELCHANGE) {
             int sel = ComboBox_GetCurSel(g_cbEng);
-            if (sel != 0) {
-                // placeholders: only Desktop Duplication exists in this build
-                ComboBox_SetCurSel(g_cbEng, 0);
-                setStatus(L"Only Desktop Duplication is available in this build.");
+            if (sel != 0 && sel != 1) {
+                // remaining entries are placeholders
+                ComboBox_SetCurSel(g_cbEng, g_cfg.engine == 1 ? 1 : 0);
+                setStatus(L"Only Desktop Duplication and DWM Magnification are available in this build.");
+            } else if (sel >= 0 && sel != g_cfg.engine) {
+                {
+                    std::lock_guard<std::mutex> lk(g_cfgMutex);
+                    g_cfg.engine = sel;
+                    g_rev++;
+                }
+                // engine change means a different kind of output window:
+                // rebuild (idempotent - handles both DXGI and MAG paths)
+                destroyOutputWindows();
+                createOutputWindows();
+                setStatus(sel == 1
+                    ? L"Engine: DWM Magnification (1:1 desktop mirror, no mesh warp)."
+                    : L"Engine: Desktop Duplication (warp + blend pipeline).");
             }
         } else if (id == IDC_CBTARGET && HIWORD(wp) == CBN_SELCHANGE) {
             // user picked a command target -> share it with CMDNET (SET out=)
@@ -2538,8 +2645,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_KEYDOWN:
         if (wp == VK_F3) {
             if (g_outWins.empty()) createOutputWindows();
-            setCalibrationMode(true);
-            setStatus(L"Calibration ON.");
+            toggleCalibration();
         } else if (wp == VK_F12) {
             cycleBlendEdges();     // console has focus: plain F12 works here
         } else if (wp == VK_F10) {

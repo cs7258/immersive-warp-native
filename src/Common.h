@@ -99,8 +99,9 @@ struct AppConfig {
     // overlap ov is a percentage of one projector width/height (0..40).
     int layoutR = 1, layoutC = 1;
     int overlap = 0;
-    // warp engine. 0 = DXGI Desktop Duplication; the other entries in the
-    // engine dropdown are placeholders and always snap back to 0.
+    // warp engine. 0 = DXGI Desktop Duplication (full warp/blend pipeline),
+    // 1 = DWM Magnification host windows (1:1 desktop mirror, no mesh warp;
+    // same mechanism the original uses as its DWM engine).
     int engine = 0;
 
     OutputCfg* findByDevice(const std::wstring& dev) {
@@ -120,6 +121,18 @@ extern std::atomic<bool> g_inplace;
 // post WM_INPLACESET to the console so it restyles the output windows
 // (implemented in Windows.cpp; safe from any thread)
 void requestInplaceRestyle();
+void requestOutputRebuild();   // any thread: destroy+recreate output windows on the UI thread
+void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
+
+// ---- DWM Magnification engine (src/MagEngine.cpp) --------------------
+// engine=1: output windows are magnifier hosts mirroring the source
+// desktop 1:1 (DWM-composited, no capture session, no render thread).
+bool magEngineAvailable();                     // MagInitialize succeeded
+bool magEngineInit();                          // idempotent process-wide init
+void magEngineShutdown();                      // idempotent uninit
+bool magAttachOutput(HWND host, const RECT& srcDesktop); // source rect + recursion filter
+void magSetConsoleWindow(HWND ctl);            // console is excluded from the feed too
+void magDetachAll();                           // clear sources, uninit
 // set when WDA_EXCLUDEFROMCAPTURE is unavailable: capturing our own display
 // would recursively film the output window, so capture is disabled instead
 extern std::atomic<bool> g_previewNoCapture;

@@ -177,7 +177,7 @@ static std::string dispatch(std::string line) {
         }
         if (k == "engine") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
-            return "OK engine=" + std::string(g_cfg.engine == 0 ? "desktopduplication" : "unknown") + "\n";
+            return "OK engine=" + std::string(g_cfg.engine == 1 ? "mag" : "desktopduplication") + "\n";
         }
         if (k == "curved") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -201,7 +201,7 @@ static std::string dispatch(std::string line) {
                 s += "layout=" + std::to_string(g_cfg.layoutC) + "x" + std::to_string(g_cfg.layoutR) + ";";
                 s += "overlap=" + std::to_string(g_cfg.overlap) + ";";
                 s += std::string("curved=") + (g_cfg.curved ? "on" : "off") + ";";
-                s += std::string("engine=") + (g_cfg.engine == 0 ? "desktopduplication" : "unknown") + ";";
+                s += std::string("engine=") + (g_cfg.engine == 1 ? "mag" : "desktopduplication") + ";";
                 int n = 0;
                 for (auto& o : g_cfg.outputs) {
                     char p[8];
@@ -364,12 +364,13 @@ static std::string dispatch(std::string line) {
         // layout/overlap/curved/masks/testpattern/source. Keys are appended at
         // the end, so older parsers reading "key=value;" pairs keep working.
         int edges = 15, outs = 0, masks = 0;
-        int layoutC = 1, layoutR = 1, overlap = 0;
+        int layoutC = 1, layoutR = 1, overlap = 0, eng = 0;
         bool curved = false, tp = false;
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             layoutC = g_cfg.layoutC; layoutR = g_cfg.layoutR; overlap = g_cfg.overlap;
             curved = g_cfg.curved != 0; tp = g_cfg.testPattern;
+            eng = g_cfg.engine;
             for (auto& o : g_cfg.outputs) if (o.enabled) {
                 outs++;
                 if (outs == 1) { edges = o.edges; masks = (int)o.masks.size(); }
@@ -390,7 +391,8 @@ static std::string dispatch(std::string line) {
                ";source=" + (src.empty() ? std::string("auto") : shortDev(src)) +
                ";out=" + (tgt.empty() ? std::string("auto") : tgt) +
                ";probe=" + std::string(g_probe.load() ? "on" : "off") +
-               ";inplace=" + std::string(g_inplace.load() ? "on" : "off") + "\n";
+               ";inplace=" + std::string(g_inplace.load() ? "on" : "off") +
+               ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
     // in-place overlay: fullscreen click-through output over the desktop (the
@@ -567,12 +569,22 @@ static std::string dispatch(std::string line) {
             return "OK overlap=" + std::to_string(ov) + "\n";
         }
         if (key == "engine") {
-            if (val == "0" || val == "DXGI" || val == "DESKTOPDUPLICATION") {
+            // MAG mode is a different kind of output window: the shared
+            // state flips here, the UI thread rebuilds the windows (empty
+            // selection means toggle-back to 0 - idempotent either way).
+            int want = -1;
+            if (val == "0" || val == "DXGI" || val == "DESKTOPDUPLICATION") want = 0;
+            else if (val == "1" || val == "MAG" || val == "MAGNIFICATION" || val == "DWM") want = 1;
+            if (want < 0) return "ERR SET engine (desktopduplication or mag)\n";
+            {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
-                g_cfg.engine = 0;
-                return "OK engine=desktopduplication\n";
+                g_cfg.engine = want;
+                g_rev++;
             }
-            return "ERR SET engine (only desktopduplication in this build)\n";
+            requestOutputRebuild();
+            refreshEngineComboUI();
+            return std::string("OK engine=") +
+                   (want == 1 ? "mag" : "desktopduplication") + "\n";
         }
         // curved vs bilinear mesh interpolation (Catmull-Rom needs 4x4+ grids)
         if (key == "curved") {
