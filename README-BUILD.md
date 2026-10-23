@@ -67,7 +67,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | 命令 | 应答 | 说明 |
 |---|---|---|
 | `PING;` | `OK` | 连通性 |
-| `STATUS;` | `calib=off;mode=warp;edges=ALL;snapshot=off;outputs=1` | 当前状态 |
+| `STATUS;` | `calib=off;mode=warp;edges=ALL;snapshot=off;outputs=1;layout=1x1;overlap=0;curved=off;masks=0;testpattern=on;source=auto` | 一次性状态摘要（后 6 项为扩展字段，追加在末尾，旧解析端按 `key=value;` 配对读取不受影响） |
 | `CALIB ON;\|CALIB OFF;` | `OK calib=on` | 进入/退出校准（同 F3） |
 | `MODE WARP;\|MODE BLEND;` | `OK mode=blend` | 校准模式切换（同 F10，未校准时自动进入校准） |
 | `EDGES ALL;` / `EDGES L;` / `EDGES T+B;` | `OK edges=T+B` | 直接设置参与融合的边（ALL/L/R/T/B/NONE 及 `+` 组合） |

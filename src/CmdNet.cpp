@@ -178,16 +178,33 @@ static std::string dispatch(std::string line) {
     }
 
     if (cmd == "STATUS") {
-        int edges = 15, outs = 0;
+        // one-shot summary for a show controller: the five original keys plus
+        // layout/overlap/curved/masks/testpattern/source. Keys are appended at
+        // the end, so older parsers reading "key=value;" pairs keep working.
+        int edges = 15, outs = 0, masks = 0;
+        int layoutC = 1, layoutR = 1, overlap = 0;
+        bool curved = false, tp = false;
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
-            for (auto& o : g_cfg.outputs) if (o.enabled) { outs++; if (outs == 1) edges = o.edges; }
+            layoutC = g_cfg.layoutC; layoutR = g_cfg.layoutR; overlap = g_cfg.overlap;
+            curved = g_cfg.curved != 0; tp = g_cfg.testPattern;
+            for (auto& o : g_cfg.outputs) if (o.enabled) {
+                outs++;
+                if (outs == 1) { edges = o.edges; masks = (int)o.masks.size(); }
+            }
         }
+        std::wstring src = currentSourceDevice();   // locks g_cfgMutex itself
         return "calib=" + std::string(g_calib.load() ? "on" : "off") +
                ";mode=" + std::string(g_calibMode.load() == 1 ? "blend" : "warp") +
                ";edges=" + edgesName(edges) +
                ";snapshot=" + std::string(g_snapshot.load() ? "on" : "off") +
-               ";outputs=" + std::to_string(outs) + "\n";
+               ";outputs=" + std::to_string(outs) +
+               ";layout=" + std::to_string(layoutC) + "x" + std::to_string(layoutR) +
+               ";overlap=" + std::to_string(overlap) +
+               ";curved=" + std::string(curved ? "on" : "off") +
+               ";masks=" + std::to_string(masks) +
+               ";testpattern=" + std::string(tp ? "on" : "off") +
+               ";source=" + (src.empty() ? std::string("auto") : shortDev(src)) + "\n";
     }
 
     if (cmd == "CALIB") {
