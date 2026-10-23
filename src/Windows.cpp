@@ -263,6 +263,29 @@ void createOutputWindows() {
         auto* st = new OutWinState();
         st->displayIdx = (int)i;
         st->subMode = g_calibMode.load();
+        // Window title identifies the window for show-control / test tooling:
+        // "<label>   [src DISPLAY2]". Auto resolves to the first display that
+        // is not an enabled output; pinned source shows as-is. g_cfg.sourceDev
+        // is read directly because we already hold g_cfgMutex here
+        // (currentSourceDevice() would lock it again -> deadlock).
+        std::wstring title = cfg->label.empty() ? cfg->deviceName : cfg->label;
+        {
+            std::wstring src = g_cfg.sourceDev;
+            if (src.empty()) {
+                for (auto& d : displays) {
+                    bool isOut = false;
+                    for (auto& o : g_cfg.outputs)
+                        if (o.enabled && o.deviceName == d.deviceName) { isOut = true; break; }
+                    if (!isOut) { src = d.deviceName; break; }
+                }
+            }
+            if (!src.empty()) {
+                std::wstring shortSrc = src;
+                size_t p = shortSrc.find(L"\\\\.\\");
+                if (p != std::wstring::npos) shortSrc = shortSrc.substr(p + 4);
+                title += L"   [src " + shortSrc + L"]";
+            }
+        }
         RECT r = displays[i].desktop;
         bool preview = g_previewMode.load();
         if (preview) {
@@ -277,7 +300,7 @@ void createOutputWindows() {
         // WS_EX_NOACTIVATE: clicking the output never raises it above the
         // console and never steals keyboard focus (hotkeys handle F3/F10/Esc)
         HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, OUT_CLASS,
-            cfg->label.c_str(), WS_POPUP | WS_VISIBLE,
+            title.c_str(), WS_POPUP | WS_VISIBLE,
             r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
             GetModuleHandleW(nullptr), nullptr);
         if (preview) {

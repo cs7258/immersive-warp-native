@@ -23,7 +23,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 
 1. 投影仪扩展桌面接入 Windows
 2. 控制台列表中选中显示器 → "Toggle selected as projector"
-3. "Source:" 选择捕获源桌面（默认 `Auto` = 第一个「不是输出」的显示器；多屏机器上可指定具体某个桌面作为画面来源，改动后输出窗口自动重建）
+3. "Source:" 选择捕获源桌面（默认 `Auto` = 第一个「不是输出」的显示器；多屏机器上可指定具体某个桌面作为画面来源，改动后输出窗口自动重建）。输出窗口标题带捕获源标记 `<label>   [src DISPLAY2]`，便于节目控制/测试工具按标题识别窗口
 4. 多台投影仪做拼接墙时，用 "Layout:" 选 NxN 平铺（如 `2x2`），"Overlap:" 设相邻重叠带宽（0–40%）：程序按显示器物理位置把启用的输出排进网格，每台只显示源桌面对应窗口，内部边界自动设为融合边。注意这会重置各输出的 warp 网格，先 Layout 再校准
 5. "Start Output" 启动全屏输出（先勾 Test pattern 显示测试图）
 6. "Configure alignment" 或 F3 进入校准：
