@@ -179,6 +179,9 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return "OK engine=" + std::string(g_cfg.engine == 1 ? "mag" : "desktopduplication") + "\n";
         }
+        if (k == "dispchange") {
+            return "OK dispchange=" + std::to_string(g_dispChange.load()) + "\n";
+        }
         if (k == "curved") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return std::string("OK curved=") + (g_cfg.curved ? "on" : "off") + "\n";
@@ -586,6 +589,14 @@ static std::string dispatch(std::string line) {
             refreshEngineComboUI();
             return std::string("OK engine=") +
                    (want == 1 ? "mag" : "desktopduplication") + "\n";
+        }
+        // manual rebuild of the output windows - the same deferred path
+        // WM_DISPLAYCHANGE takes (also handy after a dock/undock on-site)
+        if (key == "rebuild") {
+            if (val != "1" && val != "ON" && val != "TRUE")
+                return "ERR SET rebuild (1 or ON)\n";
+            requestOutputRebuild();
+            return "OK rebuild\n";
         }
         // curved vs bilinear mesh interpolation (Catmull-Rom needs 4x4+ grids)
         if (key == "curved") {

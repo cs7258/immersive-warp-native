@@ -940,6 +940,9 @@ constexpr UINT WM_LAYSET = WM_APP + 10;
 constexpr UINT WM_INPLACESET = WM_APP + 11;   // in-place overlay toggled off-thread
 constexpr UINT WM_MAGTEST = WM_APP + 14;      // test pattern changed off-thread
 constexpr UINT WM_TGTREFRESH = WM_APP + 15;   // refresh the Target combo (off-thread)
+constexpr UINT WM_DISPCHANGE = WM_APP + 16;   // deferred output rebuild after
+                                              // WM_DISPLAYCHANGE (the handler
+                                              // must not do heavy work inline)
 static DWORD uiThreadId = 0;
 constexpr UINT WM_TRAYICON = WM_APP + 7;
 static std::mutex g_layMsgMutex;
@@ -2894,6 +2897,20 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (!g_outWins.empty()) { destroyOutputWindows(); createOutputWindows(); }
         // checkbox + View menu follow whichever entry point toggled it
         syncInplaceUI(hwnd);
+        return 0;
+    }
+    case WM_DISPLAYCHANGE:  // resolution change / monitor hotplug: count it
+        g_dispChange++;     // here, do the heavy rebuild on the repost below
+        PostMessageW(hwnd, WM_DISPCHANGE, wp, lp);
+        return 0;
+    case WM_DISPCHANGE: {   // deferred: outputs live on coordinates/sizes that
+        // may no longer exist (DXGI duplications die on mode change anyway,
+        // MAG hosts keep stale rects) - rebuild them while still running
+        dbgLogLine("WM_DISPCHANGE: rebuilding outputs, dispChange=" +
+                   std::to_string(g_dispChange.load()));
+        if (!g_outWins.empty()) { destroyOutputWindows(); createOutputWindows(); }
+        refreshStatusBar();
+        setStatus(L"Display change: output windows rebuilt.");
         return 0;
     }
     case WM_MAGTEST: {      // test pattern toggled from the socket thread

@@ -159,6 +159,10 @@ extern std::atomic<bool> g_snapshot;
 // a calibration camera can detect where each grid point actually landed and
 // feed the measured positions back through SET warp.load (auto-alignment)
 extern std::atomic<bool> g_probe;
+// WM_DISPLAYCHANGE counter (resolution change / monitor hotplug). The console
+// window reposts itself into a deferred rebuild of the output windows; the
+// counter is read back via GET dispchange for test/observability.
+extern std::atomic<int> g_dispChange;
 
 struct DisplayInfo {
     std::wstring deviceName, label;
