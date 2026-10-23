@@ -386,6 +386,30 @@ static std::string rectStr(const RECT& r) {
     return b;
 }
 
+// Frees every COM object owned by an output. The shared_ptr in m_outs means
+// this only runs once the render thread has finished the frame that used it.
+Engine::OutputCtx::~OutputCtx() {
+    if (dupl) dupl->Release();
+    if (output1) output1->Release();
+    if (srv) srv->Release();
+    if (frameTex) frameTex->Release();
+    if (rtv) rtv->Release();
+    if (backBuf) backBuf->Release();
+    if (swap) swap->Release();
+    if (meshVB) meshVB->Release();
+    if (meshIB) meshIB->Release();
+    if (frameCB) frameCB->Release();
+    if (overlayVB) overlayVB->Release();
+}
+
+// HRESULT as 8 hex digits (a plain cast to unsigned long prints garbage:
+// negative HRESULTs sign-extend to 0x2147942487 style numbers in the log)
+static std::string hresultHex(HRESULT hr) {
+    char b[16];
+    sprintf_s(b, "0x%08lX", (unsigned long)(unsigned int)hr);
+    return b;
+}
+
 bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     auto displays = enumerateDisplays();
     if (displayIdx < 0 || displayIdx >= (int)displays.size()) return false;
@@ -513,11 +537,22 @@ bool Engine::createDuplication(OutputCtx& oc) {
     if (FAILED(out->QueryInterface(__uuidof(IDXGIOutput1), (void**)&o1))) {
         out->Release(); srcAdapter->Release(); return false;
     }
-    HRESULT hr = o1->DuplicateOutput(m_dev, &oc.dupl);
+    // Only one duplication per output exists at a time. Right after a rebuild
+    // the previous one may still be alive in the render thread's in-flight
+    // frame, which makes this fail with E_INVALIDARG -> retry briefly.
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 12; attempt++) {
+        hr = o1->DuplicateOutput(m_dev, &oc.dupl);
+        if (SUCCEEDED(hr)) break;
+        if (hr != E_INVALIDARG && hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) break;
+        if (attempt == 0) dbgLog("dupl: busy (previous duplication still alive), retrying");
+        Sleep(40);
+    }
     oc.output1 = o1;
     out->Release();
     srcAdapter->Release();
-    dbgLog("dupl: source ok hr=0x" + std::to_string((unsigned long)hr));
+    dbgLog(std::string("dupl: ") + (SUCCEEDED(hr) ? "source ok" : "source FAILED") +
+           " hr=" + hresultHex(hr));
     return SUCCEEDED(hr);
 }
 

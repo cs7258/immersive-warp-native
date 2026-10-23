@@ -50,6 +50,11 @@ private:
         ID3D11Buffer* overlayVB = nullptr;
         UINT overlayLineVtx = 0;   // drawn as LINELIST
         UINT overlayTriVtx = 0;    // drawn as TRIANGLELIST, starts after line verts
+        // Releases every COM object. Runs when the last shared_ptr goes away,
+        // i.e. the render thread is no longer drawing this ctx. Without it a
+        // rebuild (preview toggle, source change) leaked the duplication and
+        // the next DuplicateOutput on the same output failed with E_INVALIDARG.
+        ~OutputCtx();
     };
 
     bool compileShaders();
