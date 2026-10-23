@@ -134,6 +134,7 @@ std::vector<DisplayInfo> enumerateDisplays();
 // config persistence (simple text format)
 bool saveConfig(const std::wstring& path);
 bool loadConfig(const std::wstring& path);
+std::wstring presetPath(const std::string& name);  // %APPDATA%\...\presets\<NAME>.cfg
 
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);

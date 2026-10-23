@@ -66,6 +66,16 @@ static std::wstring fromUtf8(const std::string& s) {
     return w;
 }
 
+// named presets live next to config.txt (SAVEAS / LOADAS show-control commands);
+// the name is validated by the caller (A-Z 0-9 _ -, so no path traversal)
+std::wstring presetPath(const std::string& name) {
+    wchar_t path[MAX_PATH];
+    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path);
+    std::wstring dir = std::wstring(path) + L"\\ImmersiveWarpNative\\presets";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\" + fromUtf8(name) + L".cfg";
+}
+
 static void writeSide(std::ostream& os, const char* name, const BlendSide& s, const std::vector<AdvPoint>& adv) {
     os << name << ".fade=" << s.fade << "\n" << name << ".gamma=" << s.gamma << "\n";
     os << name << ".gain=" << s.gain << "\n" << name << ".slope=" << s.slope << "\n";

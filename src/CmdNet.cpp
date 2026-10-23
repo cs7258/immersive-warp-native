@@ -8,6 +8,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "Common.h"
+#include "Engine.h"
 #include <thread>
 #include <cstdlib>
 #include <cctype>
@@ -46,8 +47,7 @@ static std::string edgesName(int m) {
 
 static int edgesMask(const std::string& v) {
     if (v == "ALL")  return 15;
-    if (v == "NONE") return 0;
-    // compound forms like "L+T" / "LEFT+RIGHT"
+    if (v == "NONE") return 0;    // compound forms like "L+T" / "LEFT+RIGHT"
     int m = 0;
     size_t pos = 0;
     while (pos <= v.size()) {
@@ -62,6 +62,30 @@ static int edgesMask(const std::string& v) {
         pos = plus + 1;
     }
     return m;
+}
+
+// GET presets: names of all saved presets (without the .cfg extension)
+static std::string listPresets() {
+    wchar_t path[MAX_PATH];
+    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path);
+    std::wstring dir = std::wstring(path) + L"\\ImmersiveWarpNative\\presets";
+    std::string out = "OK presets=";
+    bool first = true;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*.cfg").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::string s = toNarrow(fd.cFileName);
+            if (s.size() > 4 && s.rfind(".cfg") == s.size() - 4) s = s.substr(0, s.size() - 4);
+            if (!first) out += ";";
+            out += s;
+            first = false;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (first) out += "none";
+    return out + "\n";
 }
 
 static std::string dispatch(std::string line) {
@@ -118,6 +142,7 @@ static std::string dispatch(std::string line) {
             }
             return "ERR no output\n";
         }
+        if (k == "presets") return listPresets();
         if (k == "rows" || k == "cols") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             for (auto& o : g_cfg.outputs)
@@ -235,6 +260,43 @@ static std::string dispatch(std::string line) {
     }
 
     if (cmd == "SAVE") return saveConfig(L"") ? "OK saved\n" : "ERR SAVE\n";
+
+    // shared tail of LOAD / LOADAS: resync the state the UI's Load button also
+    // refreshes. loadConfig has already released g_cfgMutex by the time this
+    // runs, and refreshStatusBar locks it itself -> call it unlocked.
+    auto finishLoad = [&](const std::string& what) -> std::string {
+        g_previewMode.store(g_cfg.previewMode);
+        Engine::inst().setSampling(g_cfg.sampling);
+        Engine::inst().setTestImage(g_cfg.testImg);   // <0 clears the overlay
+        if (!g_cfg.imagePath.empty()) engineLoadImage(g_cfg.imagePath);
+        int outs = 0;
+        refreshStatusBar();
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            for (auto& o : g_cfg.outputs) if (o.enabled) outs++;
+        }
+        return "OK loaded " + what + ";outputs=" + std::to_string(outs) + "\n";
+    };
+
+    if (cmd == "LOAD") {
+        if (!loadConfig(L"")) return "ERR LOAD (no config file)\n";
+        return finishLoad("default");
+    }
+    if (cmd == "SAVEAS" || cmd == "LOADAS") {
+        // preset name: A-Z 0-9 '_' '-' only (dispatch uppercases the whole
+        // line), max 32 chars -> no path traversal possible
+        bool okName = !arg.empty() && arg.size() <= 32;
+        for (char c : arg)
+            if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+                okName = false;
+        if (!okName) return "ERR " + cmd + " name (A-Z 0-9 _ -, max 32)\n";
+        if (cmd == "SAVEAS") {
+            if (!saveConfig(presetPath(arg))) return "ERR SAVEAS (write failed)\n";
+            return "OK saved preset=" + arg + "\n";
+        }
+        if (!loadConfig(presetPath(arg))) return "ERR LOADAS (no such preset)\n";
+        return finishLoad("preset=" + arg);
+    }
 
     if (cmd == "AUTOSTART") {
         bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !queryAutostart();
