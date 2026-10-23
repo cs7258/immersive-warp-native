@@ -3,11 +3,13 @@
 #include <windowsx.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <uxtheme.h>
 #include <shellapi.h>
 #include <cstdio>
 #include <cwchar>
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 // ------------------------------------------------------------------
 // Output windows (fullscreen per display) + calibration interaction
@@ -436,13 +438,21 @@ static bool g_tgtBusy = false;      // suppress CBN_SELCHANGE during programmati
 // shown/hidden together (1:1 with the original's multi-page console).
 static std::vector<HWND> g_pages[4];
 static HWND g_tab = nullptr;
+static HWND g_schematic = nullptr;   // Displays page output schematic (owner-draw)
 enum { PAGE_DISPLAYS = 0, PAGE_WARP, PAGE_IMAGE, PAGE_SETTINGS, PAGE_COUNT };
 static void showTab(int pg) {
     if (pg < 0 || pg >= PAGE_COUNT) pg = 0;
     for (int i = 0; i < PAGE_COUNT; i++)
         for (HWND h : g_pages[i])
             ShowWindow(h, i == pg ? SW_SHOW : SW_HIDE);
-    // dark accent on the status line mirrors the original's orange highlights
+    // keep the View menu radio marks in step with the tab strip
+    if (g_ctl) {
+        if (HMENU m = GetMenu(g_ctl)) {
+            for (int i = 0; i < PAGE_COUNT; i++)
+                CheckMenuItem(m, IDM_VIEW_DISP + i, MF_BYCOMMAND |
+                              (i == pg ? MF_CHECKED : MF_UNCHECKED));
+        }
+    }
 }
 
 // tray ids must not collide with control ids 1001..1021
@@ -753,6 +763,20 @@ void notifyOutputRaised() {
 #define IDC_CBTARGET   1031   // per-output command target dropdown (SET out=)
 #define IDC_TABS       1032   // main-console tab strip
 #define IDC_CKINPLACE  1033   // in-place overlay (fullscreen click-through)
+#define IDC_SCHEMATIC  1034   // Displays page: owner-drawn output schematic
+
+// menu bar ids (File/View/Warping/Help). Must stay outside 1001..1034 and the
+// tray ranges (2001..2004, 2200..2231).
+#define IDM_FILE_LOAD  2101
+#define IDM_FILE_SAVE  2102
+#define IDM_FILE_EXIT  2103
+#define IDM_VIEW_DISP  2111   // +0..3 = the four pages
+#define IDM_VIEW_HIDE  2115
+#define IDM_WARP_ALIGN 2121
+#define IDM_WARP_EDGES 2122
+#define IDM_WARP_SNAP  2123
+#define IDM_WARP_TEST  2124
+#define IDM_HELP_ABOUT 2131
 
 static void refreshList() {
     if (!g_list) return;
@@ -770,6 +794,7 @@ static void refreshList() {
             ListBox_AddString(g_list, line);
         }
     }
+    if (g_schematic) InvalidateRect(g_schematic, nullptr, TRUE);
     refreshStatusBar();
 }
 
@@ -1737,13 +1762,120 @@ static void applyLoadedConfig() {
     refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
 }
 
+// ---------------- menu bar (File/View/Warping/Help, 1:1 with the original) ----------------
+static HMENU buildMenuBar() {
+    HMENU mb = CreateMenu();
+    HMENU mFile = CreatePopupMenu();
+    AppendMenuW(mFile, MF_STRING, IDM_FILE_LOAD, L"Load Config");
+    AppendMenuW(mFile, MF_STRING, IDM_FILE_SAVE, L"Save Config");
+    AppendMenuW(mFile, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(mFile, MF_STRING, IDM_FILE_EXIT, L"Exit");
+    AppendMenuW(mb, MF_POPUP, (UINT_PTR)mFile, L"&File");
+
+    HMENU mView = CreatePopupMenu();
+    static const wchar_t* pageNames[PAGE_COUNT] =
+        { L"Displays", L"Warp && Blend", L"Image && Test", L"Settings" };
+    for (int i = 0; i < PAGE_COUNT; i++)
+        AppendMenuW(mView, MF_STRING, IDM_VIEW_DISP + i, pageNames[i]);
+    AppendMenuW(mView, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(mView, MF_STRING, IDM_VIEW_HIDE, L"Hide console to tray");
+    AppendMenuW(mb, MF_POPUP, (UINT_PTR)mView, L"&View");
+
+    HMENU mWarp = CreatePopupMenu();
+    AppendMenuW(mWarp, MF_STRING, IDM_WARP_ALIGN, L"Configure alignment\tF3");
+    AppendMenuW(mWarp, MF_STRING, IDM_WARP_EDGES, L"Cycle blend edges\tCtrl+F12");
+    AppendMenuW(mWarp, MF_STRING, IDM_WARP_SNAP, L"Snapshot freeze\tCtrl+F3");
+    AppendMenuW(mWarp, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(mWarp, MF_STRING, IDM_WARP_TEST, L"Test pattern");
+    AppendMenuW(mb, MF_POPUP, (UINT_PTR)mWarp, L"&Warping");
+
+    HMENU mHelp = CreatePopupMenu();
+    AppendMenuW(mHelp, MF_STRING, IDM_HELP_ABOUT, L"About...");
+    AppendMenuW(mb, MF_POPUP, (UINT_PTR)mHelp, L"&Help");
+    return mb;
+}
+
+// full dark mode for the common controls (DarkMode_Explorer, Win10 1809+;
+// a plain no-op on older systems or unsupported controls)
+static void applyDarkThemeRecursive(HWND root) {
+    EnumChildWindows(root, [](HWND h, LPARAM) -> BOOL {
+        SetWindowTheme(h, L"DarkMode_Explorer", nullptr);
+        return TRUE;
+    }, 0);
+    if (g_tab) SetWindowTheme(g_tab, L"DarkMode_Explorer", nullptr);
+}
+
+// ---------------- Displays page schematic (owner-drawn static) ----------------
+// Dark panel with one dashed rectangle per display at its real relative
+// position/size: dashed orange + [PROJECTOR] for enabled outputs, dashed gray
+// for displays that only take part as capture source.
+static void drawDisplaySchematic(DRAWITEMSTRUCT* dis) {
+    HDC dc = dis->hDC;
+    RECT rc = dis->rcItem;
+    HBRUSH bg = CreateSolidBrush(RGB(24, 24, 28));
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    auto displays = enumerateDisplays();
+    std::vector<bool> proj(displays.size(), false);
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (size_t i = 0; i < displays.size(); i++)
+            for (auto& o : g_cfg.outputs)
+                if (o.enabled && o.deviceName == displays[i].deviceName) { proj[i] = true; break; }
+    }
+    if (displays.empty()) return;
+    LONG x0 = MAXLONG, y0 = MAXLONG, x1 = -MAXLONG, y1 = -MAXLONG;
+    for (auto& d : displays) {
+        x0 = (std::min)(x0, d.desktop.left);  y0 = (std::min)(y0, d.desktop.top);
+        x1 = (std::max)(x1, d.desktop.right); y1 = (std::max)(y1, d.desktop.bottom);
+    }
+    LONG vw = x1 - x0, vh = y1 - y0;
+    if (vw < 1 || vh < 1) return;
+    int pad = 8;
+    int aw = rc.right - rc.left - 2 * pad, ah = rc.bottom - rc.top - 2 * pad;
+    float s = (std::min)(aw / (float)vw, ah / (float)vh);
+    HPEN penP = CreatePen(PS_DASH, 1, RGB(232, 148, 10));
+    HPEN penN = CreatePen(PS_DASH, 1, RGB(120, 120, 128));
+    HFONT f = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    HGDIOBJ op = SelectObject(dc, penN), of = SelectObject(dc, f);
+    HBRUSH hollow = (HBRUSH)GetStockObject(NULL_BRUSH);
+    SetBkMode(dc, TRANSPARENT);
+    for (size_t i = 0; i < displays.size(); i++) {
+        RECT& d = displays[i].desktop;
+        int l = rc.left + pad + (int)((d.left - x0) * s);
+        int t = rc.top + pad + (int)((d.top - y0) * s);
+        int r = rc.left + pad + (int)((d.right - x0) * s);
+        int b = rc.top + pad + (int)((d.bottom - y0) * s);
+        if (r - l < 3) r = l + 3;
+        if (b - t < 3) b = t + 3;
+        SelectObject(dc, proj[i] ? penP : penN);
+        SelectObject(dc, hollow);
+        Rectangle(dc, l, t, r, b);
+        SetTextColor(dc, proj[i] ? RGB(232, 148, 10) : RGB(160, 160, 168));
+        wchar_t lbl[192];
+        wsprintfW(lbl, L"%s%s%s", displays[i].label.c_str(),
+                  displays[i].primary ? L" [Primary]" : L"",
+                  proj[i] ? L"  [PROJECTOR]" : L"");
+        RECT tr = { l + 3, t + 2, r - 2, t + 18 };
+        DrawTextW(dc, lbl, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    SelectObject(dc, op);
+    SelectObject(dc, of);
+    DeleteObject(penP);
+    DeleteObject(penN);
+    DeleteObject(f);
+}
+
 static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        // 1:1 with the original console: multi-page tab strip on top, always-
-        // visible bottom strip (Configure alignment + Enable Desktop warping +
-        // warp-engine selector) + status block. Controls keep their dialog ids;
-        // pages only toggle visibility, so WM_COMMAND automation still works.
+        // 1:1 with the original console: menu bar on top, multi-page tab strip,
+        // always-visible bottom strip (Configure alignment + Enable Desktop
+        // warping + warp-engine selector) + status block. Controls keep their
+        // dialog ids; pages only toggle visibility, so WM_COMMAND automation
+        // still works.
+        SetMenu(hwnd, buildMenuBar());   // File / View / Warping / Help
         g_tab = CreateWindowW(WC_TABCONTROLW, L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS,
             6, 8, 622, 396, hwnd, (HMENU)IDC_TABS, nullptr, nullptr);
@@ -1787,6 +1919,11 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             L"In-place overlay (fullscreen, click-through)",
             WS_CHILD | BS_AUTOCHECKBOX, 16, 296, 320, 24,
             hwnd, (HMENU)IDC_CKINPLACE, nullptr, nullptr));
+        // output schematic: one dashed box per display at its real relative
+        // position, orange for enabled projectors (owner-draw via WM_DRAWITEM)
+        add(PAGE_DISPLAYS, g_schematic = CreateWindowW(L"STATIC", L"outputs",
+            WS_CHILD | SS_OWNERDRAW, 16, 322, 612, 78,
+            hwnd, (HMENU)IDC_SCHEMATIC, nullptr, nullptr));
 
         // --- Warp & Blend page
         add(PAGE_WARP, CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
@@ -1935,6 +2072,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         g_status = CreateWindowW(L"STATIC", L"Ready.",
             WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 514, 612, 32,
             hwnd, nullptr, nullptr, nullptr);
+        applyDarkThemeRecursive(hwnd);   // DarkMode_Explorer on every child
         showTab(PAGE_DISPLAYS);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -1981,6 +2119,52 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_COMMAND: {
         int id = LOWORD(wp);
+        if (id >= IDM_FILE_LOAD && id <= IDM_HELP_ABOUT) {
+            // menu bar commands (HIWORD(wp) is 0 for menus, so these are
+            // handled in their own branch before the control chain)
+            if (id == IDM_FILE_LOAD) {
+                setStatus(loadConfig(L"") ? L"Config loaded." : L"Load failed (no file?).");
+                applyLoadedConfig();
+            } else if (id == IDM_FILE_SAVE) {
+                setStatus(saveConfig(L"") ? L"Config saved." : L"Save failed.");
+            } else if (id == IDM_FILE_EXIT) {
+                DestroyWindow(hwnd);
+            } else if (id >= IDM_VIEW_DISP && id < IDM_VIEW_DISP + PAGE_COUNT) {
+                int pg = id - IDM_VIEW_DISP;
+                TabCtrl_SetCurSel(g_tab, pg);
+                showTab(pg);
+            } else if (id == IDM_VIEW_HIDE) {
+                ShowWindow(hwnd, SW_HIDE);
+            } else if (id == IDM_WARP_ALIGN) {
+                if (g_outWins.empty()) createOutputWindows();
+                setCalibrationMode(true);
+                setStatus(L"Calibration ON: drag green points (warp), F10 = blend mode, Esc = exit.");
+            } else if (id == IDM_WARP_EDGES) {
+                cycleBlendEdges();
+            } else if (id == IDM_WARP_SNAP) {
+                toggleSnapshot();
+            } else if (id == IDM_WARP_TEST) {
+                bool on = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_cfgMutex);
+                    g_cfg.testPattern = !g_cfg.testPattern;
+                    on = g_cfg.testPattern != 0;
+                    g_rev++;
+                }
+                Button_SetCheck(g_ckTest, on ? BST_CHECKED : BST_UNCHECKED);
+                setStatus(on ? L"Test pattern ON." : L"Test pattern OFF.");
+            } else if (id == IDM_HELP_ABOUT) {
+                MessageBoxW(hwnd,
+                    L"Immersive Warp Native\n"
+                    L"Native reimplementation of Immersive Display PRO.\n\n"
+                    L"Desktop Duplication capture, mesh warp, edge blending,\n"
+                    L"masks, CMDNET show control on 127.0.0.1:5252.\n\n"
+                    L"Hotkeys: F3 alignment, F10 warp/blend, Ctrl+F12 edges,\n"
+                    L"Ctrl+F3 snapshot, Esc exit calibration.",
+                    L"About Immersive Warp Native", MB_OK);
+            }
+            return 0;
+        }
         if (id == IDC_TOGGLE && HIWORD(wp) == BN_CLICKED) {
             int sel = ListBox_GetCurSel(g_list);
             if (sel >= 0) {
@@ -2288,6 +2472,11 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         }
         break;
     }
+    case WM_DRAWITEM: {                // Displays page output schematic
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
+        if (dis && dis->CtlID == IDC_SCHEMATIC) { drawDisplaySchematic(dis); return TRUE; }
+        break;
+    }
     case WM_CTLCOLORSTATIC: {          // dark theme: dark panels, light text,
         HDC dc = (HDC)wp;              // orange accent on the status line
         SetBkMode(dc, TRANSPARENT);
@@ -2351,6 +2540,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);
+    showTab(PAGE_DISPLAYS);   // now that g_ctl is set: mark the View menu item
     refreshList();
     // global hotkeys so calibration keys work no matter which window has focus
     RegisterHotKey(nullptr, 1, 0, VK_F3);            // enter/exit calibration

@@ -60,6 +60,13 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 - **窗口化预览**：勾选 "Windowed preview (single screen)" 后输出变为 60% 大小的可拖动窗口，并通过 `WDA_EXCLUDEFROMCAPTURE` 将自身从桌面捕获中排除——因此单显示器也能实时扭曲桌面画面且不产生画面递归（捕获帧中该窗口区域为黑，属预期行为）。Win10 2004 之前系统无此 API 时自动禁用捕获，回退测试图/图片源。
 - **原位覆盖（in-place overlay）**：Displays 页勾选 "In-place overlay (fullscreen, click-through)"（或 CMDNET `INPLACE ON`）后，输出窗口无边框铺满整台显示器、鼠标点击直接穿透到下面的桌面、且从捕获中排除——扭曲结果视觉上就是桌面本身，这就是 **1x1 主屏异型校正** 的日常用法。控制台始终置顶可随时关掉；做几何校准时建议先关覆盖（穿透状态拖不了控制点），校完再开。
 
+## 控制台 UI（复刻原版交互）
+
+- **多页布局**：Tab 条（Displays / Warp & Blend / Image & Test / Settings）+ 底部常驻条（Configure alignment / Enable Desktop warping / Engine 选择器）+ 结构化状态块，与原版控制台同构；View 菜单可切页并与 Tab 勾选联动。
+- **菜单栏**：File（Load/Save Config、Exit）、View（四页切换、Hide console to tray）、Warping（Configure alignment F3、Cycle blend edges Ctrl+F12、Snapshot freeze Ctrl+F3、Test pattern）、Help（About）。
+- **Displays 页输出示意图**：按显示器真实相对位置摆放的虚线框图——启用输出为橙色虚线框并标 `[PROJECTOR]`，未启用为灰色虚线框（对应原版的显示器示意区）。
+- **全套深色主题**：控制台窗口 + 全部子控件（列表/下拉/按钮/Tab）应用 `DarkMode_Explorer` 主题（Win10 1809+），配合深色背景与橙色状态行，观感对齐原版。
+
 ## CMDNET TCP 控制服务（演出集成）
 
 - 控制台勾选 "TCP control (CMDNET)" 或配置 `cmdnet=1` 后，监听 `127.0.0.1:5252`（仅本机回环，端口由 `cmdnetPort=` 配置）。
