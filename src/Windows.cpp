@@ -2214,6 +2214,108 @@ static void drawDisplaySchematic(DRAWITEMSTRUCT* dis) {
     DeleteObject(f);
 }
 
+// toolbar owner-draw: dark button, orange glyph, light label. The glyph set
+// echoes the original's icon strip (folder / floppy / checker / fullscreen /
+// crosshair / play / stop). Command ids are shared with the menu and the
+// pages, so only the LOOK is toolbar-specific.
+static bool isToolbarCmd(int id) {
+    return id == IDC_LOAD || id == IDC_SAVE || id == IDM_WARP_TEST ||
+           id == IDM_VIEW_INPLACE || id == IDC_CALIB ||
+           id == IDC_START || id == IDC_STOP;
+}
+
+static void drawToolbarGlyph(HDC dc, int id, int x, int y, int s) {
+    HBRUSH acc = CreateSolidBrush(RGB(232, 148, 10));   // orange accent
+    HBRUSH lite = CreateSolidBrush(RGB(200, 200, 205));
+    HBRUSH dark = CreateSolidBrush(RGB(60, 60, 66));
+    HGDIOBJ of = SelectObject(dc, acc);
+    HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+    switch (id) {
+    case IDC_LOAD: {                       // open folder
+        RECT body{ x, y + s / 3, x + s, y + s };
+        FillRect(dc, &body, acc);
+        RECT tab{ x, y, x + s / 2, y + s / 3 + 1 };
+        FillRect(dc, &tab, acc);
+        break;
+    }
+    case IDC_SAVE: {                       // floppy
+        RECT body{ x, y, x + s, y + s };
+        FillRect(dc, &body, lite);
+        RECT shut{ x + s / 4, y, x + 3 * s / 4, y + s / 3 };
+        FillRect(dc, &shut, dark);
+        RECT lbl{ x + s / 4, y + 2 * s / 3, x + 3 * s / 4, y + s };
+        FillRect(dc, &lbl, dark);
+        break;
+    }
+    case IDM_WARP_TEST: {                  // mini checkerboard
+        int c = s / 4;
+        for (int r = 0; r < 4; r++)
+            for (int k = 0; k < 4; k++) {
+                RECT cell{ x + k * c, y + r * c, x + (k + 1) * c, y + (r + 1) * c };
+                FillRect(dc, &cell, ((r + k) & 1) ? lite : acc);
+            }
+        break;
+    }
+    case IDM_VIEW_INPLACE: {               // dashed fullscreen over a dot
+        HPEN dash = CreatePen(PS_DASH, 1, RGB(232, 148, 10));
+        HGDIOBJ od = SelectObject(dc, dash);
+        SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, x, y, x + s, y + s);
+        SelectObject(dc, acc);
+        RECT dot{ x + s / 3, y + s / 3, x + 2 * s / 3, y + 2 * s / 3 };
+        FillRect(dc, &dot, acc);
+        SelectObject(dc, od);
+        DeleteObject(dash);
+        break;
+    }
+    case IDC_CALIB: {                      // crosshair
+        RECT h{ x, y + s / 2 - 1, x + s, y + s / 2 + 1 };
+        RECT v{ x + s / 2 - 1, y, x + s / 2 + 1, y + s };
+        FillRect(dc, &h, acc);
+        FillRect(dc, &v, acc);
+        SelectObject(dc, lite);
+        RECT c{ x + s / 3, y + s / 3, x + 2 * s / 3, y + 2 * s / 3 };
+        FillRect(dc, &c, lite);
+        break;
+    }
+    case IDC_START: {                      // play triangle
+        POINT tri[3] = { { x, y }, { x, y + s }, { x + s, y + s / 2 } };
+        HGDIOBJ ob = SelectObject(dc, acc);
+        Polygon(dc, tri, 3);
+        SelectObject(dc, ob);
+        break;
+    }
+    case IDC_STOP: {                       // stop square
+        RECT q{ x, y, x + s, y + s };
+        FillRect(dc, &q, acc);
+        break;
+    }
+    }
+    SelectObject(dc, of);
+    SelectObject(dc, op);
+    DeleteObject(acc);
+    DeleteObject(lite);
+    DeleteObject(dark);
+}
+
+static void drawToolbarButton(DRAWITEMSTRUCT* dis) {
+    HDC dc = dis->hDC;
+    RECT rc = dis->rcItem;
+    bool hot = (dis->itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
+    HBRUSH bg = CreateSolidBrush(hot ? RGB(70, 70, 78) : RGB(45, 45, 48));
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(220, 220, 225));
+    wchar_t lbl[64];
+    GetWindowTextW(dis->hwndItem, lbl, 64);
+    int s = 14;
+    drawToolbarGlyph(dc, dis->CtlID, rc.left + 8, rc.top + (rc.bottom - rc.top - s) / 2, s);
+    RECT tr{ rc.left + 8 + s + 6, rc.top, rc.right - 4, rc.bottom };
+    DrawTextW(dc, lbl, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (dis->itemState & ODS_FOCUS) DrawFocusRect(dc, &rc);
+}
+
 static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -2240,7 +2342,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         int tbx = 10;
         for (const auto& b : tbBtns) {
             CreateWindowW(L"BUTTON", b.label,
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                 tbx, 8, b.w, 26, hwnd, (HMENU)(INT_PTR)b.id, nullptr, nullptr);
             tbx += b.w + 6;
         }
@@ -2891,9 +2993,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_TIMER:                     // 1s status refresh (fps/uptime live)
         if (wp == 1 && g_statusInfo) refreshStatusBar();
         return 0;
-    case WM_DRAWITEM: {                // Displays page output schematic
+    case WM_DRAWITEM: {                // owner-draw: schematic + toolbar glyphs
         DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
         if (dis && dis->CtlID == IDC_SCHEMATIC) { drawDisplaySchematic(dis); return TRUE; }
+        if (dis && isToolbarCmd((int)dis->CtlID)) { drawToolbarButton(dis); return TRUE; }
         break;
     }
     case WM_CTLCOLORSTATIC: {          // dark theme: dark panels, light text,
