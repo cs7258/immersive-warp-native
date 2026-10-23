@@ -926,6 +926,12 @@ static int g_cfgSel = 0;          // index into g_cfg.outputs shown in the combo
 #define CFG_MADD     2141
 #define CFG_MDEL     2142
 #define CFG_MCLEAR   2143
+#define CFG_MX       2144   // edit: mask left,   percent 0..100
+#define CFG_MY       2145   // edit: mask top,    percent 0..100
+#define CFG_MW       2146   // edit: mask width,  percent 2..100
+#define CFG_MH       2147   // edit: mask height, percent 2..100
+#define CFG_MAPPLY   2148   // button: write edits into the selected mask
+#define CFG_MDEF     2149   // button: reset selected mask to 10%x10% at 0,0
 
 static const wchar_t* cfgTabs[7] = {
     L"Bezels", L"Align", L"Geometry", L"Blending", L"Color", L"Masking", L"Help"
@@ -1009,20 +1015,50 @@ static void cfgReloadColor() {
         SendMessageW(GetDlgItem(g_cfgPanel[4], CFG_CTB(i)), TBM_SETPOS, TRUE, (LPARAM)pos[i]);
 }
 
+static void cfgReloadMaskEdits() {   // fill X/Y/W/H edits from the list selection
+    if (!g_cfgPanel[5]) return;
+    HWND lb = GetDlgItem(g_cfgPanel[5], CFG_MLIST);
+    int sel = ListBox_GetCurSel(lb);
+    MaskRect m;
+    bool has = false;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        OutputCfg* o = cfgOutput();
+        if (o && sel >= 0 && sel < (int)o->masks.size()) { m = o->masks[sel]; has = true; }
+    }
+    wchar_t t[32];
+    _snwprintf_s(t, _TRUNCATE, L"%.1f", m.x * 100.0f); SetWindowTextW(GetDlgItem(g_cfgPanel[5], CFG_MX), t);
+    _snwprintf_s(t, _TRUNCATE, L"%.1f", m.y * 100.0f); SetWindowTextW(GetDlgItem(g_cfgPanel[5], CFG_MY), t);
+    _snwprintf_s(t, _TRUNCATE, L"%.1f", m.w * 100.0f); SetWindowTextW(GetDlgItem(g_cfgPanel[5], CFG_MW), t);
+    _snwprintf_s(t, _TRUNCATE, L"%.1f", m.h * 100.0f); SetWindowTextW(GetDlgItem(g_cfgPanel[5], CFG_MH), t);
+    // grey out the editor when nothing is selected
+    EnableWindow(GetDlgItem(g_cfgPanel[5], CFG_MAPPLY), has);
+    EnableWindow(GetDlgItem(g_cfgPanel[5], CFG_MDEF), has);
+}
+
 static void cfgReloadMasks() {
     if (!g_cfgPanel[5]) return;
     HWND lb = GetDlgItem(g_cfgPanel[5], CFG_MLIST);
+    int keep = ListBox_GetCurSel(lb);
     ListBox_ResetContent(lb);
-    std::lock_guard<std::mutex> lk(g_cfgMutex);
-    OutputCfg* o = cfgOutput();
-    if (!o) return;
-    int n = 1;
-    for (auto& m : o->masks) {
-        wchar_t t[96];
-        wsprintfW(t, L"#%d  x=%.2f y=%.2f  %dx%d%%", n++, m.x, m.y,
-                  (int)(m.w * 100), (int)(m.h * 100));
-        ListBox_AddString(lb, t);
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        OutputCfg* o = cfgOutput();
+        if (!o) return;
+        n = (int)o->masks.size();
+        int idx = 1;
+        for (auto& m : o->masks) {
+            wchar_t t[96];
+            wsprintfW(t, L"#%d  X %.1f%%  Y %.1f%%  %.1f%% x %.1f%%", idx++,
+                      m.x * 100.0f, m.y * 100.0f, m.w * 100.0f, m.h * 100.0f);
+            ListBox_AddString(lb, t);
+        }
     }
+    if (n == 0) keep = -1;
+    else if (keep < 0 || keep >= n) keep = n - 1;
+    if (keep >= 0) ListBox_SetCurSel(lb, keep);
+    cfgReloadMaskEdits();
 }
 
 static void cfgReloadAll() {
@@ -1161,18 +1197,38 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HWND p = g_cfgPanel[5];
             CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
                 WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL,
-                10, 10, 220, 160, p, (HMENU)CFG_MLIST, nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Add 10%x10%", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                244, 10, 120, 26, p, (HMENU)CFG_MADD, nullptr, nullptr);
+                10, 10, 200, 140, p, (HMENU)CFG_MLIST, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Add 10% x 10%", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                218, 10, 152, 24, p, (HMENU)CFG_MADD, nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"Delete selected", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                244, 44, 120, 26, p, (HMENU)CFG_MDEL, nullptr, nullptr);
+                218, 38, 152, 24, p, (HMENU)CFG_MDEL, nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"Clear all", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                244, 78, 120, 26, p, (HMENU)CFG_MCLEAR, nullptr, nullptr);
+                218, 66, 152, 24, p, (HMENU)CFG_MCLEAR, nullptr, nullptr);
+
+            CreateWindowW(L"STATIC", L"Mask rectangle (percent of screen):",
+                WS_CHILD | WS_VISIBLE, 10, 158, 240, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"X", WS_CHILD | WS_VISIBLE, 10, 186, 12, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.0",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 24, 183, 52, 22, p, (HMENU)CFG_MX, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Y", WS_CHILD | WS_VISIBLE, 84, 186, 12, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.0",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 98, 183, 52, 22, p, (HMENU)CFG_MY, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"W", WS_CHILD | WS_VISIBLE, 158, 186, 14, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10.0",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 174, 183, 52, 22, p, (HMENU)CFG_MW, nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"H", WS_CHILD | WS_VISIBLE, 234, 186, 14, 18, p, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10.0",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 250, 183, 52, 22, p, (HMENU)CFG_MH, nullptr, nullptr);
+
+            CreateWindowW(L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                10, 214, 110, 26, p, (HMENU)CFG_MAPPLY, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Reset 10%", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                128, 214, 110, 26, p, (HMENU)CFG_MDEF, nullptr, nullptr);
             CreateWindowW(L"STATIC",
                 L"Mask rectangles render black on the output (up to 8).\n"
-                L"Position/size can be tuned by editing the saved config:\n"
-                L"mask=x,y,w,h (normalized 0..1, saved on Save Config).",
-                WS_CHILD | WS_VISIBLE, 10, 184, 360, 60, p, nullptr, nullptr, nullptr);
+                L"Pick one in the list, type X/Y/W/H in percent and press Apply\n"
+                L"(values are clamped so the rectangle stays on screen).",
+                WS_CHILD | WS_VISIBLE, 10, 250, 360, 60, p, nullptr, nullptr, nullptr);
         }
         // --- Bezels / Align / Help placeholders (0, 1, 6) ---
         CreateWindowW(L"STATIC",
@@ -1295,13 +1351,16 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == CFG_MADD || id == CFG_MDEL || id == CFG_MCLEAR) {
+            int added = -1;
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 OutputCfg* o = cfgOutput();
                 if (o) {
                     if (id == CFG_MADD) {
-                        if (o->masks.size() < 8)
+                        if (o->masks.size() < MAX_MASKS) {
                             o->masks.push_back(MaskRect{});   // 10%x10% at top-left
+                            added = (int)o->masks.size() - 1;
+                        }
                     } else if (id == CFG_MDEL) {
                         int sel = ListBox_GetCurSel(GetDlgItem(g_cfgPanel[5], CFG_MLIST));
                         if (sel >= 0 && sel < (int)o->masks.size())
@@ -1313,6 +1372,39 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             cfgReloadMasks();
+            if (added >= 0) {   // select the mask we just created so it can be edited
+                ListBox_SetCurSel(GetDlgItem(g_cfgPanel[5], CFG_MLIST), added);
+                cfgReloadMaskEdits();
+            }
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_MAPPLY || id == CFG_MDEF) {
+            int sel = ListBox_GetCurSel(GetDlgItem(g_cfgPanel[5], CFG_MLIST));
+            float x = cfgEditF(g_cfgPanel[5], CFG_MX) / 100.0f;
+            float y = cfgEditF(g_cfgPanel[5], CFG_MY) / 100.0f;
+            float w = cfgEditF(g_cfgPanel[5], CFG_MW) / 100.0f;
+            float h = cfgEditF(g_cfgPanel[5], CFG_MH) / 100.0f;
+            if (id == CFG_MDEF) { x = 0.0f; y = 0.0f; w = 0.1f; h = 0.1f; }
+            w = clampf(w, 0.02f, 1.0f);
+            h = clampf(h, 0.02f, 1.0f);
+            x = clampf(x, 0.0f, 1.0f - w);   // keep the rectangle fully on screen
+            y = clampf(y, 0.0f, 1.0f - h);
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                OutputCfg* o = cfgOutput();
+                if (o && sel >= 0 && sel < (int)o->masks.size()) {
+                    MaskRect& m = o->masks[sel];
+                    m.x = x; m.y = y; m.w = w; m.h = h;
+                    g_rev++;
+                }
+            }
+            cfgReloadMasks();
+            refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_MLIST && HIWORD(wp) == LBN_SELCHANGE) {
+            cfgReloadMaskEdits();
             return 0;
         }
         if (id == IDCANCEL) { DestroyWindow(hwnd); return 0; }
