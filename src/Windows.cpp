@@ -1793,6 +1793,7 @@ void toggleWindowWarping() {
         g_cfg.enabled = on;
         g_rev++;
     }
+    dbgLogLine(std::string("toggleWindowWarping -> ") + (on ? "on" : "off"));
     if (on) createOutputWindows();
     else destroyOutputWindows();
     if (g_ckEnable)
@@ -4256,6 +4257,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         // toggle is a flip, so compare against the live value first and
         // only flip when it differs (idempotent, race-safe enough for a
         // human-paced MQTT command stream)
+        dbgLogLine("mqwarp: msg wp=" + std::to_string((unsigned long long)wp));
         bool want = wp != 0;
         bool cur;
         {
