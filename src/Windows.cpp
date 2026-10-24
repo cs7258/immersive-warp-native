@@ -2331,6 +2331,11 @@ static void colorSetSliders(const ColorAdj& c) {
         SendMessageW(g_tb[i], TBM_SETPOS, TRUE, (LPARAM)pos[i]);
 }
 
+// fwd: defined near applyDarkThemeRecursive below, used by all three dialog
+// procs (Color/Curve/Cfg) for the shared dark theme + 9pt font skin
+static HBRUSH dlgDarkCtl(UINT msg, HDC dc);
+static void applyDarkThemeRecursive(HWND root);
+
 static LRESULT CALLBACK ColorDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
