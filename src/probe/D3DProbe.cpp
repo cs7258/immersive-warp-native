@@ -175,6 +175,7 @@ int wmain(int argc, wchar_t** argv) {
                                              (unsigned int)(b * 255));
             for (int y = 0; y < 8; y++) row[y][x] = rgb;
         }
+        D3D11_BOX dst = {0, PH - 8, 0, PW, PH, 1};   // bottom bar rows only
         ctx->UpdateSubresource(pat, 0, &dst, row, PW * 4, 0);
         ID3D11Texture2D* back = nullptr;
         if (SUCCEEDED(sw->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back)) && back) {
