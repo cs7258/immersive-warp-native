@@ -236,6 +236,7 @@ bool snapEncodePng(const std::wstring& path, UINT w, UINT h,
 bool hookIpcInit();
 void hookIpcSet(bool enabled, const float corner[4][2], int gridN);
 bool hookIpcEnabled();
+unsigned hookIpcPassCount();   // Present detour hit counter (written by the DLL)
 
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);

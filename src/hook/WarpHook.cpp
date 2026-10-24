@@ -63,13 +63,13 @@ static IWNHookCfg* ensureCfg() {
     if (now - g_cfgLastTry < 1000) return nullptr;   // retry at 1 Hz
     g_cfgLastTry = now;
     g_cfgTries++;
-    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, IWN_HOOK_MAPPING_NAME);
+    HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, IWN_HOOK_MAPPING_NAME);
     if (!h) {
         if (g_cfgTries == 10)
             hookLog("cfg: mapping not found after 10 tries (host not running or name mismatch)");
         return nullptr;
     }
-    g_cfg = (IWNHookCfg*)MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(IWNHookCfg));
+    g_cfg = (IWNHookCfg*)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(IWNHookCfg));
     if (g_cfg && (g_cfg->magic != IWN_HOOK_MAGIC || g_cfg->size != sizeof(IWNHookCfg))) {
         hookLog("cfg: magic/size mismatch, ignoring host mapping");
         UnmapViewOfFile(g_cfg); g_cfg = nullptr;
@@ -372,6 +372,11 @@ static PFN_Present origPresentFor(IDXGISwapChain* sw) {
 }
 
 static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
+    // telemetry: count every detour hit in the shared mapping (the log file
+    // proved unreliable from the app's render thread). Interlocked so a
+    // multi-swapchain app stays consistent.
+    IWNHookCfg* cfgT = ensureCfg();
+    if (cfgT) InterlockedIncrement((volatile LONG*)&cfgT->reserved[0]);
     static bool firstCallLogged = false;
     if (!firstCallLogged) {
         firstCallLogged = true;

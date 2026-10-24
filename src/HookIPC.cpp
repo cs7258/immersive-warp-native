@@ -42,3 +42,8 @@ bool hookIpcEnabled() {
     std::lock_guard<std::mutex> lk(g_hookMutex);
     return g_hookView && g_hookView->enabled;
 }
+
+unsigned hookIpcPassCount() {
+    std::lock_guard<std::mutex> lk(g_hookMutex);
+    return g_hookView ? g_hookView->reserved[0] : 0;
+}
