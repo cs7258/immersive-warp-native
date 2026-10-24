@@ -83,9 +83,19 @@ std::string injectLaunch(const std::wstring& exe, const std::wstring& args,
 
     std::wstring cmdline = L"\"" + exe + L"\"";
     if (!args.empty()) { cmdline += L" " + args; }
+    // lpApplicationName does NOT get the PATH search treatment: a bare
+    // "notepad.exe" fails with ERROR_FILE_NOT_FOUND. Resolve via SearchPath
+    // when the caller passed no directory component (IWNInject demanded a
+    // full path; the CMDNET form is friendlier).
+    std::wstring full = exe;
+    if (exe.find_first_of(L"\\/:") == std::wstring::npos) {
+        wchar_t buf[MAX_PATH]; wchar_t* filePart = nullptr;
+        DWORD n = SearchPathW(nullptr, exe.c_str(), L".exe", MAX_PATH, buf, &filePart);
+        if (n > 0 && n < MAX_PATH) full.assign(buf, (size_t)n);
+    }
     STARTUPINFOW si = {}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
-    if (!CreateProcessW(exe.c_str(), &cmdline[0], nullptr, nullptr, FALSE,
+    if (!CreateProcessW(full.c_str(), &cmdline[0], nullptr, nullptr, FALSE,
                         CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
         return "ERR INJECT launch (CreateProcess gle=" + std::to_string(GetLastError()) + ")\n";
     }
