@@ -278,10 +278,18 @@ static PFN_Present patchSwapchainVt(IDXGISwapChain* sw) {
     PFN_Present orig = (PFN_Present)vt[13];
     vt[13] = (void*)&HookPresent;
     VirtualProtect(&vt[13], sizeof(void*), old, &old);
+    // verify the patch actually stuck
+    if (*(void**)&vt[13] == (void*)&HookPresent) {
+        char buf[96];
+        wsprintfA(buf, "Present vtable patched (vt=%p)", (void*)vt);
+        hookLog(buf);
+    } else {
+        hookLog("Present patch VERIFY FAILED - readback differs");
+        return orig;
+    }
     g_vts[g_vtCount].vt = vt;
     g_vts[g_vtCount].orig = orig;
     g_vtCount++;
-    hookLog("Present vtable patched (idx 13, new class)");
     return orig;
 }
 
@@ -362,6 +370,11 @@ static PFN_Present origPresentFor(IDXGISwapChain* sw) {
 }
 
 static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
+    static bool firstCallLogged = false;
+    if (!firstCallLogged) {
+        firstCallLogged = true;
+        hookLog("HookPresent invoked (first call)");
+    }
     PFN_Present orig = origPresentFor(sw);
     IWNHookCfg* cfg = ensureCfg();
     if (cfg && cfg->enabled && orig && sw) {
