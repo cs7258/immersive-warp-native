@@ -4050,6 +4050,13 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ComboBox_AddString(g_cbFps, L"30");
         ComboBox_AddString(g_cbFps, L"60");
         ComboBox_AddString(g_cbFps, L"120");
+        {
+            // startup selection: applyLoadedConfig only runs on Load paths,
+            // so the initial config value is applied here (cursel would
+            // otherwise sit at -1 until the first Load)
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            ComboBox_SetCurSel(g_cbFps, maxFpsIndex(g_cfg.maxfps));
+        }
 
         // --- bottom strip, always visible (mirrors the original's bottom bar).
         // The transient status line ("Ready." + one-shot messages) lives at the
