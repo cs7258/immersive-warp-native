@@ -35,12 +35,19 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 int wmain(int argc, wchar_t** argv) {
-    int secs = 0;
+    int secs = 0, late = 0;
     for (int i = 1; i < argc; i++)
         // case-insensitive: CMDNET dispatch uppercases the whole command
         // line, so "--secs" arrives as "--SECS"
         if (!lstrcmpiW(argv[i], L"--secs") && i + 1 < argc)
             secs = (int)wcstoul(argv[++i], nullptr, 10);
+        else if (!lstrcmpiW(argv[i], L"--late") && i + 1 < argc)
+            late = (int)wcstoul(argv[++i], nullptr, 10);
+    // --late N: sleep N seconds before creating the swapchain. The Profile
+    // watcher polls every 2s and its hook only catches swapchains created
+    // AFTER the DLL lands, so auto-inject tests need a late-creating target
+    // (games behave the same: process first, render window later).
+    if (late > 0) Sleep(late * 1000);
 
     WNDCLASSW wc = {};
     wc.lpfnWndProc = wndProc;
