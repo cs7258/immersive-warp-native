@@ -53,7 +53,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | 方向键 / Shift+方向键 | 微调选中的控制点（1px / 10px） |
 | 滚轮 | 融合模式下调该边 Gamma |
 
-状态栏（控制台底部）实时显示（1 秒刷新）：`Projector: N [i]` / 模式 / Snapshot / `Color balancing: R() G() B()` / 当前融合边 / 捕获源 / `Engine: 59.9 fps  N frames  uptime hh:mm:ss`（渲染健康，与 `GET perf` 同源）。
+状态栏（控制台底部）实时显示（1 秒刷新）：`Projector: N [i]` / 模式 / Snapshot / `Color balancing: R() G() B()` / 当前融合边 / 捕获源 / `Engine: 59.9 fps  frame 2.31 ms (cap 1.42 + draw 0.87)  uptime hh:mm:ss`（渲染健康与逐段帧耗时，与 `GET perf` 同源）。
 
 ## 单屏模式（无投影仪也能用）
 
@@ -91,7 +91,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
 | `SET left.gain=0.8;` / `SET left.slope=0.3;` | `OK left.gain=0.8` | 融合曲线增益/陡度（gain 0–2、slope 0–1；0/0 = 线性斜坡，slope=1 为硬切换） |
 | `SET left.chanr=1.5;` / `SET left.chang=0.8;` / `SET left.chanb=1.2;` | `OK left.chanr=1.5` | **R/G/B 分通道融合伽马**：该边权重变为逐通道 `pow(curve(t), gamma×chanC)`（chan 0.1–5，默认 1/1/1 与旧版逐像素一致），用于修平铺重叠区的色彩平衡。仅 DXGI 引擎在 shader 中生效；MAG 引擎 overlay 单 alpha 无法逐通道衰减桌面内容，保持标量权重（平台限制）。随配置持久化（`left.chan=R,G,B`），`GET config` 的 `outN.*.chan=` 可读 |
-| `GET perf;` | `OK perf=uptime=123;frames=4567;fps=59.9;outputs=1;running=1` | 运行健康诊断：进程运行秒数、累计渲染帧数、滚动 1 秒平均帧率（空闲/无输出时 0.0）、启用输出数、是否运行中（enabled 或 preview） |
+| `GET perf;` | `OK perf=uptime=123;frames=4567;fps=59.9;cap=1.42;draw=0.87;frame=2.31;outputs=1;running=1` | 运行健康诊断：运行秒数、累计帧数、滚动 1 秒平均帧率（空闲 0.0）、**逐段帧耗时 EMA（毫秒）**：cap=桌面捕获段、draw=网格+常量+Draw+Present 段、frame=整帧 renderAll（≥ cap+draw，差值为配置快照/自愈开销）、启用输出数、是否运行中 |
 | `PROBE ON;` / `PROBE OFF;` / `PROBE;` / `GET probe;` / `SET probe=on;` | `OK probe=on` | **相机对位探针**：在每个 warp 目标点画白色十字标记（含中心块，约 24px），校准相机检测十字实际落点后经 `SET warp.load=` 回灌修正。独立于校准模式（calib 关着也显示）；无参数 PROBE 为切换。MAG 引擎下为均匀 rows×cols 点阵分层 overlay（无 warp 网格，网格密度跟随 `SET rows/cols`） |
 | `INPLACE ON;` / `INPLACE OFF;` / `INPLACE;` / `GET inplace;` / `SET inplace=on;` | `OK inplace=on` | **原位覆盖（主屏异型校正输出）**：输出窗口无边框覆盖整台显示器 + `WS_EX_TRANSPARENT` 鼠标穿透 + `WDA_EXCLUDEFROMCAPTURE` 捕获排除——扭曲后的桌面看起来就是桌面本身（用户态复刻原版 DWM 桌面扭曲的视觉效果）。切换会重建输出窗口；校准时先关掉（穿透模式下无法拖控制点），控制台窗口置顶可随时操作；随配置持久化 |
 | `SET testpattern=off;` | `OK testpattern=off` | 切换测试图 |

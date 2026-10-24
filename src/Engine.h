@@ -30,6 +30,11 @@ public:
     // diagnostics for CMDNET "GET perf" (remote health monitoring)
     unsigned long long frames() const { return m_frameSeq.load(); }
     double fps() const { return m_fpsX10.load() / 10.0; }   // rolling 1s window
+    // per-stage frame timings, EMA smoothed, fixed point x100 ms
+    // (render thread is the only writer; GET perf reads atomically)
+    double capMs() const { return m_capMs100.load() / 100.0; }    // desktop duplication
+    double drawMs() const { return m_drawMs100.load() / 100.0; }  // mesh+CB+draw+present
+    double frameMs() const { return m_frameMs100.load() / 100.0; }// whole renderAll
 
 private:
     Engine() = default;
@@ -114,4 +119,8 @@ private:
     std::atomic<unsigned> m_fpsX10{ 0 };   // frames per second, fixed point x10
     unsigned m_fpsAccum = 0;               // frames since the last fps window
     ULONGLONG m_fpsTick = 0;               // window start (GetTickCount64 ms)
+    // per-stage frame timings: EMA over the last frames, x100 ms fixed point
+    std::atomic<unsigned> m_capMs100{ 0 };     // capture stage (desktop duplication)
+    std::atomic<unsigned> m_drawMs100{ 0 };    // mesh + CB + draw + present
+    std::atomic<unsigned> m_frameMs100{ 0 };   // whole renderAll pass
 };

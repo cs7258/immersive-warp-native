@@ -389,6 +389,23 @@ static ULONGLONG g_perfStartTick = GetTickCount64();
 double engineFps() { return Engine::inst().fps(); }
 unsigned long long engineFrames() { return Engine::inst().frames(); }
 unsigned long long engineUptimeMs() { return GetTickCount64() - g_perfStartTick; }
+double engineCapMs()   { return Engine::inst().capMs(); }
+double engineDrawMs()  { return Engine::inst().drawMs(); }
+double engineFrameMs() { return Engine::inst().frameMs(); }
+
+// QPC helpers for the per-stage frame timings below
+static double qpcMs(LARGE_INTEGER a, LARGE_INTEGER freq) {
+    LARGE_INTEGER b; QueryPerformanceCounter(&b);
+    return double(b.QuadPart - a.QuadPart) * 1000.0 / double(freq.QuadPart);
+}
+// publish one EMA sample (x100 ms fixed point, 1/8 integer smoothing so the
+// render thread only does a multiply and a store)
+static void emaPublish(std::atomic<unsigned>& slot, double ms) {
+    unsigned v = (unsigned)(ms * 100.0 + 0.5);
+    unsigned old = slot.load(std::memory_order_relaxed);
+    unsigned nw = old ? (unsigned)((old * 7ULL + v) / 8ULL) : v;
+    slot.store(nw, std::memory_order_relaxed);
+}
 bool engineSetTestImage(int id) { return Engine::inst().setTestImage(id); }
 
 // ---------------- debug log (%APPDATA%\ImmersiveWarpNative\debug.log) ----------------
@@ -1076,6 +1093,12 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
 }
 
 void Engine::renderAll() {
+    // per-stage profiling: capture (desktop duplication) vs draw (mesh+CB+
+    // present); config lookup and self-heal fall into neither and only show
+    // up as the frame total being slightly larger than cap+draw
+    LARGE_INTEGER freq{}, tFrame{}; QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&tFrame);
+    double capMs = 0, drawMs = 0;
     // snapshot the output list under lock; entries stay alive via shared_ptr
     // even if the UI thread destroys outputs while this frame is drawing
     std::vector<std::shared_ptr<OutputCtx>> outs;
@@ -1122,7 +1145,9 @@ void Engine::renderAll() {
         if (cw && ch && (cw != oc->w || ch != oc->h))
             resizeSwapChain(*oc, cw, ch);
 
+        LARGE_INTEGER tA; QueryPerformanceCounter(&tA);
         captureFrame(*oc);
+        capMs += qpcMs(tA, freq);
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             if (oc->meshRev != g_rev.load()) {
@@ -1132,12 +1157,19 @@ void Engine::renderAll() {
             updateFrameCB(*oc, *cfg);
             if (g_calib.load() || g_probe.load()) buildOverlay(*oc, *cfg);
         }
+        QueryPerformanceCounter(&tA);
         drawOutput(*oc, *cfg);
+        drawMs += qpcMs(tA, freq);
     }
     // frame boundary marker: detachAll() waits for this to advance so a ctx
     // dropped from m_outs is really gone (duplication released) before the
     // next attach creates a new one on the same output
     m_frameSeq++;
+
+    // publish the per-stage EMA timings (x100 ms fixed point, see Engine.h)
+    emaPublish(m_capMs100, capMs);
+    emaPublish(m_drawMs100, drawMs);
+    emaPublish(m_frameMs100, qpcMs(tFrame, freq));
 
     // rolling fps: measure frames over a >=1s window, publish as x10 fixed
     // point (render thread is the only writer)
