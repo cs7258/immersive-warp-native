@@ -2111,7 +2111,7 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             { L"R chan", CUV_CHANR, &g_cuvChanR },
             { L"G chan", CUV_CHANG, &g_cuvChanG },
             { L"B chan", CUV_CHANB, &g_cuvChanB } };
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < (int)(sizeof(prm) / sizeof(prm[0])); i++) {
             CreateWindowW(L"STATIC", prm[i].name, WS_CHILD | WS_VISIBLE,
                 246, 55 + i * 32, 44, 18, hwnd, nullptr, nullptr, nullptr);
             *prm[i].slot = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.000",
