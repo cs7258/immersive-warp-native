@@ -2010,6 +2010,8 @@ static HWND g_curveDlg = nullptr;
 static HWND g_cuvSide = nullptr, g_cuvGain = nullptr,
             g_cuvSlope = nullptr, g_cuvGamma = nullptr,
             g_cuvChanR = nullptr, g_cuvChanG = nullptr, g_cuvChanB = nullptr;
+static HWND g_cuvArea = nullptr;          // the owner-drawn plot (subclassed)
+static WNDPROC g_areaProcOld = nullptr;
 struct CurveSnap { float gain, slope, gamma, chanR, chanG, chanB; };
 static CurveSnap g_cuvSnap{ 0, 0, 1, 1, 1, 1 };   // painted snapshot: no lock in paint
 static std::vector<CurveSnap> g_cuvHist[4];  // per-side history, newest last
@@ -2091,6 +2093,44 @@ static void cuvApply() {
     g_cuvSnap = c;
     if (g_curveDlg) InvalidateRect(g_curveDlg, nullptr, TRUE);
     refreshStatusBar();
+}
+
+// mouse drag on the plot: shape the curve through the cursor by solving the
+// parametric curve equation for gain (slope/gamma keep their edit values):
+// w = pow(curve(t,gain,slope), gamma)  ->  cv = w^(1/gamma)  ->
+// gain = (t - cv*slope*(t-1) - cv) / (t*(cv-1)). Release commits like Apply.
+static LRESULT CALLBACK AreaProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_LBUTTONDOWN:
+    case WM_MOUSEMOVE: {
+        if (msg == WM_MOUSEMOVE && GetCapture() != h) break;
+        SetCapture(h);   // starts tracking on down, no-op if already captured
+        RECT rc;
+        GetClientRect(h, &rc);
+        int w = rc.right - rc.left, hh = rc.bottom - rc.top;
+        if (w < 4 || hh < 4) return 0;
+        float t = clampf((float)(short)LOWORD(lp) / (w - 1), 0.02f, 0.98f);
+        float wv = clampf(1.0f - (float)(short)HIWORD(lp) / (hh - 1), 0.0f, 1.0f);
+        float slope = clampf(cuvEditF(g_cuvSlope), 0.0f, 1.0f);
+        float gamma = clampf(cuvEditF(g_cuvGamma), 0.1f, 5.0f);
+        float cv = powf(wv, 1.0f / gamma);
+        float gain = g_cuvSnap.gain;
+        if (fabsf(cv - 1.0f) > 1e-3f)   // w~1 carries no gain information
+            gain = (t - cv * slope * (t - 1.0f) - cv) / (t * (cv - 1.0f));
+        gain = clampf(gain, 0.0f, 2.0f);
+        wchar_t txt[16];
+        _snwprintf_s(txt, _TRUNCATE, L"%.3f", gain);
+        SetWindowTextW(g_cuvGain, txt);
+        g_cuvSnap.gain = gain;   // live preview in the plot
+        if (g_curveDlg) InvalidateRect(g_curveDlg, nullptr, TRUE);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        if (GetCapture() == h) ReleaseCapture();
+        cuvApply();   // commit the dragged curve like the Apply button
+        return 0;
+    }
+    return CallWindowProc(g_areaProcOld, h, msg, wp, lp);
 }
 
 static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2210,6 +2250,7 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         g_curveDlg = nullptr;
         g_cuvSide = g_cuvGain = g_cuvSlope = g_cuvGamma = nullptr;
         g_cuvChanR = g_cuvChanG = g_cuvChanB = nullptr;
+        g_cuvArea = nullptr;
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -2236,9 +2277,15 @@ static void openCurveDialog(HINSTANCE hInst, HWND owner) {
     if (g_curveDlg) {
         // the plot + remaining buttons (created here so the dialog frame
         // exists before we ask for client-relative positions)
-        CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", nullptr,
+        HWND area = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", nullptr,
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
             10, 10, 220, 220, g_curveDlg, (HMENU)CUV_AREA, nullptr, nullptr);
+        // subclass the plot for drag interaction (capture the STATIC's proc)
+        if (area) {
+            g_cuvArea = area;
+            g_areaProcOld = (WNDPROC)SetWindowLongPtrW(area, GWLP_WNDPROC,
+                                                       (LONG_PTR)AreaProc);
+        }
         CreateWindowW(L"BUTTON", L"Apply",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 244, 100, 26,
             g_curveDlg, (HMENU)CUV_APPLY, nullptr, nullptr);
