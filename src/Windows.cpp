@@ -808,7 +808,7 @@ static void syncMagTestOverlays(bool on) {
         auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
                                            "SetWindowDisplayAffinity");
         if (fn) fn(ov, 0x11);
-        SetTimer(ov, 1, 60);   // scroll-band animation tick (~50 frames per 3 s cycle)
+        SetTimer(ov, 1, 60, nullptr);   // scroll-band animation tick (~50 frames per 3 s cycle)
         g_magTests.push_back(ov);
         magAddFilter(ov);
     }
