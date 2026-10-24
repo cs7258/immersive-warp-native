@@ -340,9 +340,9 @@ static HRESULT WINAPI HookCreateSwapChain(IUnknown* fac, IUnknown* dev,
     if (SUCCEEDED(hr) && out && *out) {
         patchSwapchainVt(*out);
         LONG c = InterlockedIncrement(&g_swapCount);
-        char buf[96];
-        wsprintfA(buf, "swapchain hooked via CreateSwapChain (#%d), vt=%p", (int)c,
-                  (void*)*(void***)*out);
+        char buf[128];
+        wsprintfA(buf, "swapchain hooked (#%d) obj=%p vt=%p", (int)c,
+                  (void*)*out, (void*)*(void***)*out);
         hookLog(buf);
     }
     return hr;
@@ -440,6 +440,22 @@ static DWORD WINAPI initThread(LPVOID) {
         std::lock_guard<std::mutex> lk(g_vtMutex);
         for (int i = 0; i < g_vtCount; i++) {
             void** vt = g_vts[i].vt;
+            // re-read the OBJECT's vptr: if dxgi swapped the vtable after
+            // creation, the object no longer dispatches through our patch
+            void* objVptr = g_vts[i].probe ? *(void* volatile*)g_vts[i].probe : nullptr;
+            static bool objVptrLogged = false;
+            if (objVptr != vt) {
+                char buf[128];
+                wsprintfA(buf, "OBJECT VPTR CHANGED: obj=%p now=%p patched=%p",
+                          (void*)g_vts[i].probe, objVptr, (void*)vt);
+                hookLog(buf);
+            } else if (!objVptrLogged) {
+                objVptrLogged = true;
+                char buf[160];
+                wsprintfA(buf, "vptr check: obj=%p vt=%p slot13=%p hook=%p",
+                          (void*)g_vts[i].probe, (void*)vt, vt[13], (void*)&HookPresent);
+                hookLog(buf);
+            }
             if (*(void* volatile*)&vt[13] != (void*)&HookPresent) {
                 DWORD old{};
                 if (VirtualProtect(&vt[13], sizeof(void*), PAGE_READWRITE, &old)) {
