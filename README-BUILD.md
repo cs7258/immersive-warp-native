@@ -56,7 +56,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | 方向键 / Shift+方向键 | 微调选中的控制点（1px / 10px） |
 | 滚轮 | 融合模式下调该边 Gamma |
 
-状态栏（控制台底部）实时显示（1 秒刷新）：`Projector: N [i]` / 模式 / Snapshot / Preview / In-place / Engine / `Warping: ACTIVE|idle`（输出窗口活性，对齐原版右上角 Desktop warping ENABLED/DISABLED 语义）/ `Blackout: ON`（仅黑场时显示，对齐原版右上角 Blackout 项）/ `Color balancing: R() G() B()` / 当前融合边 / 捕获源 / `Engine: 59.9 fps  frame 2.31 ms (cap 1.42 + draw 0.87)  uptime hh:mm:ss`（渲染健康与逐段帧耗时，与 `GET perf` 同源）。
+状态栏（控制台底部）实时显示（1 秒刷新）：`Projector: N [i]` / 模式 / Snapshot / Preview / In-place / Engine / `Warping: ACTIVE|idle`（输出窗口活性，对齐原版右上角 Desktop warping ENABLED/DISABLED 语义）/ `Blackout: ON`（仅黑场时显示，对齐原版右上角 Blackout 项）/ `Color balancing: R() G() B()` / 当前融合边 / 捕获源 / `Engine: 59.9 fps  frame 2.31 ms (cap 1.42 + draw 0.87)  lat 8.3 ms  uptime hh:mm:ss`（渲染健康、逐段帧耗时与捕获→上屏端到端延迟，与 `GET perf` 同源；lat 仅 DXGI 引擎测量，MAG 模式不显示）。
 
 ## 单屏模式（无投影仪也能用）
 
@@ -94,8 +94,8 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
 | `SET left.gain=0.8;` / `SET left.slope=0.3;` | `OK left.gain=0.8` | 融合曲线增益/陡度（gain 0–2、slope 0–1；0/0 = 线性斜坡，slope=1 为硬切换） |
 | `SET left.chanr=1.5;` / `SET left.chang=0.8;` / `SET left.chanb=1.2;` | `OK left.chanr=1.5` | **R/G/B 分通道融合伽马**：该边权重变为逐通道 `pow(curve(t), gamma×chanC)`（chan 0.1–5，默认 1/1/1 与旧版逐像素一致），用于修平铺重叠区的色彩平衡。仅 DXGI 引擎在 shader 中生效；MAG 引擎 overlay 单 alpha 无法逐通道衰减桌面内容，保持标量权重（平台限制）。随配置持久化（`left.chan=R,G,B`），`GET config` 的 `outN.*.chan=` 可读 |
-| `GET perf;` | `OK perf=uptime=123;frames=4567;fps=59.9;cap=1.42;draw=0.87;frame=2.31;outputs=1;running=1` | 运行健康诊断：运行秒数、累计帧数、滚动 1 秒平均帧率（空闲 0.0）、**逐段帧耗时 EMA（毫秒）**：cap=桌面捕获段（桌面完全静止时≈0，AcquireNextFrame(0) 立即超时零拷贝）、draw=网格+常量+Draw+Present 段、frame=整帧 renderAll（≥ cap+draw，差值为配置快照/自愈开销）、启用输出数、是否运行中 |
-| `PERFLOG ON;` / `PERFLOG OFF;` / `PERFLOG;` / `GET perflog;` / `SET perflog=1;` | `OK perflog=on` | **perf 历史采样**：开启后主窗口 1s 定时器每 10 s 向 debug.log 写一行 `perf: fps=… cap=… draw=… frame=… frames=…`（真机排查帧耗时随时间变化）；持久化到 config 键 `perflog=`，默认 off |
+| `GET perf;` | `OK perf=uptime=123;frames=4567;fps=59.9;cap=1.42;draw=0.87;frame=2.31;lat=8.32;outputs=1;running=1` | 运行健康诊断：运行秒数、累计帧数、滚动 1 秒平均帧率（空闲 0.0）、**逐段帧耗时 EMA（毫秒）**：cap=桌面捕获段（桌面完全静止时≈0，AcquireNextFrame(0) 立即超时零拷贝）、draw=网格+常量+Draw+Present 段、frame=整帧 renderAll（≥ cap+draw，差值为配置快照/自愈开销）、**lat=端到端延迟**（桌面帧时间戳 DXGI LastPresentTime(QPC)→Present 的 EMA，渲染管线半程；MAG 引擎恒 0 未测量；扫描输出与投影仪输入延迟叠加在其上）、启用输出数、是否运行中 |
+| `PERFLOG ON;` / `PERFLOG OFF;` / `PERFLOG;` / `GET perflog;` / `SET perflog=1;` | `OK perflog=on` | **perf 历史采样**：开启后主窗口 1s 定时器每 10 s 向 debug.log 写一行 `perf: fps=… cap=… draw=… frame=… lat=… frames=…`（真机排查帧耗时随时间变化）；持久化到 config 键 `perflog=`，默认 off |
 | `PROBE ON;` / `PROBE OFF;` / `PROBE;` / `GET probe;` / `SET probe=on;` | `OK probe=on` | **相机对位探针**：在每个 warp 目标点画白色十字标记（含中心块，约 24px），校准相机检测十字实际落点后经 `SET warp.load=` 回灌修正。独立于校准模式（calib 关着也显示）；无参数 PROBE 为切换。MAG 引擎下为均匀 rows×cols 点阵分层 overlay（无 warp 网格，网格密度跟随 `SET rows/cols`） |
 | `INPLACE ON;` / `INPLACE OFF;` / `INPLACE;` / `GET inplace;` / `SET inplace=on;` | `OK inplace=on` | **原位覆盖（主屏异型校正输出）**：输出窗口无边框覆盖整台显示器 + `WS_EX_TRANSPARENT` 鼠标穿透 + `WDA_EXCLUDEFROMCAPTURE` 捕获排除——扭曲后的桌面看起来就是桌面本身（用户态复刻原版 DWM 桌面扭曲的视觉效果）。切换会重建输出窗口；校准时先关掉（穿透模式下无法拖控制点），控制台窗口置顶可随时操作；随配置持久化 |
 | `BLACKOUT ON;` / `BLACKOUT OFF;` / `BLACKOUT;` / `GET blackout;` / `SET blackout=on;` | `OK blackout=on` | **演出黑场（一键全黑）**：所有启用输出立即渲染纯黑——DXGI 引擎跳过网格/overlay 只 Clear+Present（下一帧生效，无需重建）；MAG 引擎由常驻 mask overlay 画全屏黑（toggle 时立即唤醒 250ms 轮询）且 probe 标记同步隐去。View 菜单 "Blackout" 同一开关（勾选标记同步）。**刻意不持久化**：控制台重启后永远亮着，不会黑场吓到现场；GET config 不含该键、STATUS 含 |

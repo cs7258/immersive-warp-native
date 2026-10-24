@@ -1599,12 +1599,18 @@ void refreshStatusBar() {
         wsprintfW(l5, L"Capture source: %s (pinned)", srcDev.c_str());
 
     // live render health (same numbers the CMDNET GET perf reports)
-    wchar_t l6[128];
+    wchar_t l6[160];
     {
         unsigned long long up = engineUptimeMs() / 1000;
-        _snwprintf_s(l6, 128, _TRUNCATE,
-                     L"Engine: %.1f fps   frame %.2f ms (cap %.2f + draw %.2f)   uptime %02u:%02u:%02u",
-                     engineFps(), engineFrameMs(), engineCapMs(), engineDrawMs(),
+        double lat = engineLatMs();
+        wchar_t latPart[48] = L"";
+        // lat shown only once measured (DXGI engine with frames flowing; MAG
+        // has no duplication timestamps -> stays 0 and the segment is omitted)
+        if (lat > 0.0)
+            _snwprintf_s(latPart, 48, _TRUNCATE, L"   lat %.1f ms", lat);
+        _snwprintf_s(l6, 160, _TRUNCATE,
+                     L"Engine: %.1f fps   frame %.2f ms (cap %.2f + draw %.2f)%s   uptime %02u:%02u:%02u",
+                     engineFps(), engineFrameMs(), engineCapMs(), engineDrawMs(), latPart,
                      (unsigned)(up / 3600), (unsigned)((up / 60) % 60), (unsigned)(up % 60));
     }
 
@@ -4578,11 +4584,11 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             static unsigned perfTick = 0;
             if (g_perfLog.load() && ++perfTick >= 10) {
                 perfTick = 0;
-                char b[160];
+                char b[180];
                 _snprintf_s(b, _TRUNCATE,
-                            "perf: fps=%.1f cap=%.2fms draw=%.2fms frame=%.2fms frames=%llu",
+                            "perf: fps=%.1f cap=%.2fms draw=%.2fms frame=%.2fms lat=%.2fms frames=%llu",
                             engineFps(), engineCapMs(), engineDrawMs(),
-                            engineFrameMs(), engineFrames());
+                            engineFrameMs(), engineLatMs(), engineFrames());
                 dbgLogLine(b);
             }
         }

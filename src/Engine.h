@@ -35,6 +35,10 @@ public:
     double capMs() const { return m_capMs100.load() / 100.0; }    // desktop duplication
     double drawMs() const { return m_drawMs100.load() / 100.0; }  // mesh+CB+draw+present
     double frameMs() const { return m_frameMs100.load() / 100.0; }// whole renderAll
+    // end-to-end latency: QPC of the newest duplicated desktop frame
+    // (DXGI_OUTDUPL_FRAME_INFO.LastPresentTime) -> Present. 0 until the first
+    // real frame; not measured on the MAG engine (no duplication timestamps).
+    double latMs() const { return m_latMs100.load() / 100.0; }
 
 private:
     Engine() = default;
@@ -48,6 +52,8 @@ private:
         ID3D11Texture2D* frameTex = nullptr;      // cached copy of last duplicated frame
         ID3D11ShaderResourceView* srv = nullptr;
         bool frameValid = false;
+        LONGLONG lastPresentQpc = 0;  // QPC of newest acquired desktop frame
+                                      // (frame info LastPresentTime; 0 = none)
         IDXGISwapChain* swap = nullptr;
         ID3D11Texture2D* backBuf = nullptr;
         ID3D11RenderTargetView* rtv = nullptr;
@@ -126,4 +132,5 @@ private:
     std::atomic<unsigned> m_capMs100{ 0 };     // capture stage (desktop duplication)
     std::atomic<unsigned> m_drawMs100{ 0 };    // mesh + CB + draw + present
     std::atomic<unsigned> m_frameMs100{ 0 };   // whole renderAll pass
+    std::atomic<unsigned> m_latMs100{ 0 };     // capture->present latency, EMA
 };

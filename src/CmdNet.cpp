@@ -161,10 +161,10 @@ static std::string dispatch(std::string line) {
             char buf[224];
             // fps/ms are fractional -> CRT snprintf (wsprintf has no %f)
             _snprintf_s(buf, _TRUNCATE,
-                        "OK perf=uptime=%llu;frames=%llu;fps=%.1f;cap=%.2f;draw=%.2f;frame=%.2f;outputs=%d;running=%d\n",
+                        "OK perf=uptime=%llu;frames=%llu;fps=%.1f;cap=%.2f;draw=%.2f;frame=%.2f;lat=%.2f;outputs=%d;running=%d\n",
                         (unsigned long long)(engineUptimeMs() / 1000),
                         engineFrames(), engineFps(),
-                        engineCapMs(), engineDrawMs(), engineFrameMs(),
+                        engineCapMs(), engineDrawMs(), engineFrameMs(), engineLatMs(),
                         nOut, running ? 1 : 0);
             return buf;
         }

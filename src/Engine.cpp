@@ -468,6 +468,7 @@ unsigned long long engineUptimeMs() { return GetTickCount64() - g_perfStartTick;
 double engineCapMs()   { return Engine::inst().capMs(); }
 double engineDrawMs()  { return Engine::inst().drawMs(); }
 double engineFrameMs() { return Engine::inst().frameMs(); }
+double engineLatMs()   { return Engine::inst().latMs(); }
 
 // QPC helpers for the per-stage frame timings below
 static double qpcMs(LARGE_INTEGER a, LARGE_INTEGER freq) {
@@ -788,6 +789,11 @@ void Engine::captureFrame(OutputCtx& oc) {
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) return;
     if (FAILED(hr)) { oc.frameValid = false; return; }
     if (info.AccumulatedFrames > 0 || info.LastPresentTime.QuadPart != 0 || !oc.frameValid) {
+        // LastPresentTime is a QPC value: remember it as the birth timestamp of
+        // the desktop frame we are about to draw, so drawOutput can report the
+        // capture->present latency (0 = mouse-only update, keep previous).
+        if (info.LastPresentTime.QuadPart != 0)
+            oc.lastPresentQpc = info.LastPresentTime.QuadPart;
         ID3D11Texture2D* tex = nullptr;
         if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
             if (oc.frameTex) {
@@ -1222,6 +1228,17 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
                   oc.w, oc.h, oc.indexCount, (void*)oc.rtv, (void*)oc.meshVB,
                   (unsigned long)phr, (int)(g_cfg.useImage ? 1 : 0), (void*)m_imgSRV);
         dbgLog(b);
+    }
+    // end-to-end latency: the duplicated desktop frame's QPC birth timestamp
+    // (captureFrame) -> after Present. This is the render-pipeline half of the
+    // real latency chain (scanout + projector input lag sit on top of it).
+    if (oc.lastPresentQpc) {
+        LARGE_INTEGER lf{}, lnow{};
+        QueryPerformanceFrequency(&lf);
+        QueryPerformanceCounter(&lnow);
+        double lat = double(lnow.QuadPart - oc.lastPresentQpc) * 1000.0 / double(lf.QuadPart);
+        if (lat >= 0.0 && lat < 500.0)   // ignore clock nonsense after suspend
+            emaPublish(m_latMs100, lat);
     }
 }
 
