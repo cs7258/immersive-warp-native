@@ -337,11 +337,17 @@ static HRESULT WINAPI HookCreateSwapChain(IUnknown* fac, IUnknown* dev,
                                           DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
     HRESULT hr = g_origCreate(fac, dev, desc, out);
     if (SUCCEEDED(hr) && out && *out) {
-        patchSwapchainVt(*out);
+        PFN_Present pv = patchSwapchainVt(*out);
         LONG c = InterlockedIncrement(&g_swapCount);
         char buf[96];
-        wsprintfA(buf, "swapchain hooked via CreateSwapChain (#%d)", (int)c);
+        wsprintfA(buf, "swapchain hooked via CreateSwapChain (#%d), vt=%p", (int)c,
+                  (void*)*(void***)*out);
         hookLog(buf);
+        if (pv) {
+            // self-test: call the (now hooked) slot with PRESENT_TEST -
+            // proves the detour is live at this exact moment
+            pv(*out, 0, DXGI_PRESENT_TEST);
+        }
     }
     return hr;
 }
@@ -430,6 +436,25 @@ static DWORD WINAPI initThread(LPVOID) {
         Sleep(50);
     }
     installFactoryHooks();
+    // watchdog: if something restores the vtable pages (AV, integrity
+    // protection), re-apply the Present detours and say so
+    while (true) {
+        Sleep(2000);
+        std::lock_guard<std::mutex> lk(g_vtMutex);
+        for (int i = 0; i < g_vtCount; i++) {
+            void** vt = g_vts[i].vt;
+            if (vt[13] != (void*)&HookPresent) {
+                DWORD old{};
+                if (VirtualProtect(&vt[13], sizeof(void*), PAGE_READWRITE, &old)) {
+                    vt[13] = (void*)&HookPresent;
+                    VirtualProtect(&vt[13], sizeof(void*), old, &old);
+                    char buf[96];
+                    wsprintfA(buf, "vtable reverted (vt=%p) - repatched", (void*)vt);
+                    hookLog(buf);
+                }
+            }
+        }
+    }
     return 0;
 }
 
