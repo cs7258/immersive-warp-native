@@ -1327,6 +1327,10 @@ static void syncMagBlendOverlays() {
 // Control window
 // ------------------------------------------------------------------
 static const wchar_t* CTL_CLASS = L"IWN_ControlWnd";
+// one shared 9pt Segoe UI for every console control (children get it via
+// WM_SETFONT in applyDarkThemeRecursive; owner-draw selects it directly).
+// Never freed - process lifetime.
+static HFONT g_uiFont = nullptr;
 static HWND g_ctl = nullptr;
 
 void requestMagBlendSync() {
@@ -1893,6 +1897,8 @@ void notifyOutputRaised() {
 #define IDC_ROISYNCLR 1047   // ROI Sync Left/Right button
 #define IDC_ROISYNCTB 1048   // ROI Sync Top/Bottom button
 #define IDC_ROIRESET  1049   // ROI Reset button
+#define IDC_STATUSLINE 1050  // transient status strip in the bottom band
+#define IDC_STATUSSEP  1051  // toolbar separator (reflowed on resize)
 // (menu bar IDM_* ids live above showTab, see the note there)
 
 static void refreshList() {
@@ -3480,11 +3486,18 @@ static HMENU buildMenuBar() {
 // full dark mode for the common controls (DarkMode_Explorer, Win10 1809+;
 // a plain no-op on older systems or unsupported controls)
 static void applyDarkThemeRecursive(HWND root) {
+    if (!g_uiFont)
+        g_uiFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                               0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     EnumChildWindows(root, [](HWND h, LPARAM) -> BOOL {
         SetWindowTheme(h, L"DarkMode_Explorer", nullptr);
+        SendMessageW(h, WM_SETFONT, (WPARAM)g_uiFont, MAKELPARAM(TRUE, 0));
         return TRUE;
     }, 0);
-    if (g_tab) SetWindowTheme(g_tab, L"DarkMode_Explorer", nullptr);
+    if (g_tab) {
+        SetWindowTheme(g_tab, L"DarkMode_Explorer", nullptr);
+        SendMessageW(g_tab, WM_SETFONT, (WPARAM)g_uiFont, MAKELPARAM(TRUE, 0));
+    }
 }
 
 // ---------------- Displays page schematic (owner-drawn static) ----------------
@@ -3669,12 +3682,14 @@ static void drawToolbarButton(DRAWITEMSTRUCT* dis) {
     }
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(220, 220, 225));
+    HGDIOBJ ofnt = g_uiFont ? SelectObject(dc, g_uiFont) : nullptr;
     wchar_t lbl[64];
     GetWindowTextW(dis->hwndItem, lbl, 64);
     int s = 14;
     drawToolbarGlyph(dc, dis->CtlID, rc.left + 8, rc.top + (rc.bottom - rc.top - s) / 2, s);
     RECT tr{ rc.left + 8 + s + 6, rc.top, rc.right - 4, rc.bottom };
     DrawTextW(dc, lbl, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (ofnt) SelectObject(dc, ofnt);
     if (dis->itemState & ODS_FOCUS) DrawFocusRect(dc, &rc);
 }
 
@@ -3708,17 +3723,18 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 tbx, 8, b.w, 26, hwnd, (HMENU)(INT_PTR)b.id, nullptr, nullptr);
             tbx += b.w + 6;
         }
-        // Exit pinned to the right end, like the original's icon strip
+        // Exit pinned to the right end, like the original's icon strip.
+        // Layout target: client 1120x630 (16:9); WM_SIZE reflows on resize.
         CreateWindowW(L"BUTTON", L"Exit",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            632 - 58 - 10, 8, 58, 26, hwnd, (HMENU)(INT_PTR)IDC_EXIT, nullptr, nullptr);
+            1052, 8, 58, 26, hwnd, (HMENU)(INT_PTR)IDC_EXIT, nullptr, nullptr);
         CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 8, 38, 622, 2,
-            hwnd, nullptr, nullptr, nullptr);
+            WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 8, 38, 1104, 2,
+            hwnd, (HMENU)IDC_STATUSSEP, nullptr, nullptr);
 
         g_tab = CreateWindowW(WC_TABCONTROLW, L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS,
-            6, 44, 622, 396, hwnd, (HMENU)IDC_TABS, nullptr, nullptr);
+            6, 44, 1108, 420, hwnd, (HMENU)IDC_TABS, nullptr, nullptr);
         static const wchar_t* tabTitles[PAGE_COUNT] =
             { L"Displays", L"Warp & Blend", L"Image & Test", L"Settings" };
         for (int i = 0; i < PAGE_COUNT; i++) {
@@ -3730,69 +3746,70 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         auto add = [](int pg, HWND h) { if (h) g_pages[pg].push_back(h); return h; };
 
         // --- Displays page: output list + projector controls + capture source
+        // two-column: list left (660 wide), actions + schematic right (412)
         add(PAGE_DISPLAYS, g_list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
             WS_CHILD | LBS_NOTIFY | WS_VSCROLL,
-            16, 44, 410, 180, hwnd, (HMENU)IDC_LIST, nullptr, nullptr));
+            16, 82, 660, 232, hwnd, (HMENU)IDC_LIST, nullptr, nullptr));
         add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Toggle selected as projector",
-            WS_CHILD | BS_PUSHBUTTON, 436, 44, 178, 28,
+            WS_CHILD | BS_PUSHBUTTON, 692, 82, 412, 28,
             hwnd, (HMENU)IDC_TOGGLE, nullptr, nullptr));
         add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Start Output",
-            WS_CHILD | BS_PUSHBUTTON, 436, 80, 178, 28,
+            WS_CHILD | BS_PUSHBUTTON, 692, 118, 412, 28,
             hwnd, (HMENU)IDC_START, nullptr, nullptr));
         add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Stop Output",
-            WS_CHILD | BS_PUSHBUTTON, 436, 116, 178, 28,
+            WS_CHILD | BS_PUSHBUTTON, 692, 154, 412, 28,
             hwnd, (HMENU)IDC_STOP, nullptr, nullptr));
         add(PAGE_DISPLAYS, CreateWindowW(L"STATIC", L"Override source:",
-            WS_CHILD | SS_LEFT, 436, 152, 178, 16,
+            WS_CHILD | SS_LEFT, 692, 192, 180, 16,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_DISPLAYS, g_cbOvrSrc = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            436, 170, 178, 220,
+            692, 210, 412, 240,
             hwnd, (HMENU)IDC_CBOVRSRC, nullptr, nullptr));
         add(PAGE_DISPLAYS, CreateWindowW(L"STATIC", L"Source:",
-            WS_CHILD | SS_LEFT, 16, 240, 54, 18,
+            WS_CHILD | SS_LEFT, 16, 330, 54, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_DISPLAYS, g_cbSrc = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            72, 236, 290, 220,
+            72, 326, 340, 220,
             hwnd, (HMENU)IDC_CBSRC, nullptr, nullptr));
         add(PAGE_DISPLAYS, CreateWindowW(L"STATIC", L"(auto = first display that is not an output)",
-            WS_CHILD | SS_LEFT, 16, 266, 440, 18,
+            WS_CHILD | SS_LEFT, 16, 356, 460, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_DISPLAYS, g_ckPreview = CreateWindowW(L"BUTTON", L"Windowed preview (single screen)",
-            WS_CHILD | BS_AUTOCHECKBOX, 380, 236, 232, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 430, 326, 246, 24,
             hwnd, (HMENU)IDC_CKPREVIEW, nullptr, nullptr));
         add(PAGE_DISPLAYS, g_ckInplace = CreateWindowW(L"BUTTON",
             L"In-place overlay (fullscreen, click-through)",
-            WS_CHILD | BS_AUTOCHECKBOX, 16, 296, 320, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 16, 386, 340, 24,
             hwnd, (HMENU)IDC_CKINPLACE, nullptr, nullptr));
         // output schematic: one dashed box per display at its real relative
         // position, orange for enabled projectors (owner-draw via WM_DRAWITEM)
         add(PAGE_DISPLAYS, g_schematic = CreateWindowW(L"STATIC", L"outputs",
-            WS_CHILD | SS_OWNERDRAW, 16, 322, 612, 78,
+            WS_CHILD | SS_OWNERDRAW, 692, 246, 412, 180,
             hwnd, (HMENU)IDC_SCHEMATIC, nullptr, nullptr));
 
         // --- Warp & Blend page
         add(PAGE_WARP, CreateWindowW(L"BUTTON", L"Cycle blend edges (Ctrl+F12)",
-            WS_CHILD | BS_PUSHBUTTON, 16, 44, 200, 28,
+            WS_CHILD | BS_PUSHBUTTON, 16, 82, 210, 28,
             hwnd, (HMENU)IDC_EDGES, nullptr, nullptr));
         add(PAGE_WARP, CreateWindowW(L"STATIC", L"Sampling:",
-            WS_CHILD | SS_LEFT, 16, 92, 62, 18,
+            WS_CHILD | SS_LEFT, 244, 88, 62, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_WARP, g_cbSamp = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            82, 88, 150, 200,
+            308, 84, 160, 220,
             hwnd, (HMENU)IDC_CBSAMP, nullptr, nullptr));
         ComboBox_AddString(g_cbSamp, L"Trilinear");
         ComboBox_AddString(g_cbSamp, L"Anisotropic 4x");
         ComboBox_AddString(g_cbSamp, L"Anisotropic 8x");
         ComboBox_AddString(g_cbSamp, L"Bi-cubic (Catmull-Rom)");
         add(PAGE_WARP, CreateWindowW(L"STATIC", L"Layout:",
-            WS_CHILD | SS_LEFT, 260, 92, 50, 18,
+            WS_CHILD | SS_LEFT, 486, 88, 50, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_WARP, g_cbLayout = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            312, 88, 74, 220,
+            538, 84, 80, 220,
             hwnd, (HMENU)IDC_CBLAYOUT, nullptr, nullptr));
         for (int R = 1; R <= 4; R++)
             for (int C = 1; C <= 4; C++) {
@@ -3803,11 +3820,11 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 ComboBox_AddString(g_cbLayout, t);
             }
         add(PAGE_WARP, CreateWindowW(L"STATIC", L"Overlap:",
-            WS_CHILD | SS_LEFT, 400, 92, 56, 18,
+            WS_CHILD | SS_LEFT, 636, 88, 56, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_WARP, g_cbOvl = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            458, 88, 66, 220,
+            694, 84, 80, 220,
             hwnd, (HMENU)IDC_CBOVL, nullptr, nullptr));
         for (int p = 0; p <= 40; p += 5) {
             wchar_t t[8];
@@ -3815,40 +3832,40 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             ComboBox_AddString(g_cbOvl, t);
         }
         add(PAGE_WARP, CreateWindowW(L"BUTTON", L"Configure display...",
-            WS_CHILD | BS_PUSHBUTTON, 16, 132, 180, 28,
+            WS_CHILD | BS_PUSHBUTTON, 16, 126, 190, 28,
             hwnd, (HMENU)IDC_CFGDLG, nullptr, nullptr));
         add(PAGE_WARP, CreateWindowW(L"BUTTON", L"Color adjustment...",
-            WS_CHILD | BS_PUSHBUTTON, 206, 132, 170, 28,
+            WS_CHILD | BS_PUSHBUTTON, 216, 126, 180, 28,
             hwnd, (HMENU)IDC_COLOR, nullptr, nullptr));
         add(PAGE_WARP, CreateWindowW(L"STATIC", L"1x1 = single output: in-place warp / blend correction on the main screen.",
-            WS_CHILD | SS_LEFT, 16, 176, 560, 18,
+            WS_CHILD | SS_LEFT, 16, 170, 720, 18,
             hwnd, nullptr, nullptr, nullptr));
 
         // --- Image & Test page
         add(PAGE_IMAGE, g_ckTest = CreateWindowW(L"BUTTON", L"Test pattern",
-            WS_CHILD | BS_AUTOCHECKBOX, 16, 44, 140, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 16, 82, 140, 24,
             hwnd, (HMENU)IDC_CKTEST, nullptr, nullptr));
         add(PAGE_IMAGE, g_ckAdv = CreateWindowW(L"BUTTON", L"Advanced blending",
-            WS_CHILD | BS_AUTOCHECKBOX, 166, 44, 160, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 166, 82, 160, 24,
             hwnd, (HMENU)IDC_CKADV, nullptr, nullptr));
         add(PAGE_IMAGE, g_ckImage = CreateWindowW(L"BUTTON", L"Image source",
-            WS_CHILD | BS_AUTOCHECKBOX, 336, 44, 120, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 336, 82, 120, 24,
             hwnd, (HMENU)IDC_CKIMAGE, nullptr, nullptr));
         add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Load image...",
-            WS_CHILD | BS_PUSHBUTTON, 462, 42, 96, 26,
+            WS_CHILD | BS_PUSHBUTTON, 466, 80, 100, 26,
             hwnd, (HMENU)IDC_LOADIMG, nullptr, nullptr));
         add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Clear",
-            WS_CHILD | BS_PUSHBUTTON, 564, 42, 56, 26,
+            WS_CHILD | BS_PUSHBUTTON, 572, 80, 60, 26,
             hwnd, (HMENU)IDC_CLEARIMG, nullptr, nullptr));
         add(PAGE_IMAGE, g_imgLabel = CreateWindowW(L"STATIC", L"Image: (none)",
-            WS_CHILD | SS_LEFT, 16, 82, 320, 18,
+            WS_CHILD | SS_LEFT, 16, 124, 330, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_IMAGE, CreateWindowW(L"STATIC", L"Patterns:",
-            WS_CHILD | SS_LEFT, 346, 82, 62, 18,
+            WS_CHILD | SS_LEFT, 360, 124, 62, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_IMAGE, g_cbImg = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            410, 78, 200, 200,
+            424, 120, 180, 200,
             hwnd, (HMENU)IDC_CBIMG, nullptr, nullptr));
         ComboBox_AddString(g_cbImg, L"Color bars");
         ComboBox_AddString(g_cbImg, L"Checkerboard");
@@ -3859,131 +3876,125 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         // replica stays static (single-alpha layered windows can't scroll it
         // per-channel - same engine difference as the per-channel gamma).
         add(PAGE_IMAGE, CreateWindowW(L"STATIC", L"Animation:",
-            WS_CHILD | SS_LEFT, 16, 118, 70, 18,
+            WS_CHILD | SS_LEFT, 16, 160, 70, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_IMAGE, g_cbAnim = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            88, 114, 130, 200,
+            88, 156, 140, 200,
             hwnd, (HMENU)IDC_CBANIM, nullptr, nullptr));
         ComboBox_AddString(g_cbAnim, L"Off");
         ComboBox_AddString(g_cbAnim, L"Horizontal");
         ComboBox_AddString(g_cbAnim, L"Vertical");
         ComboBox_AddString(g_cbAnim, L"Diagonal");
         add(PAGE_IMAGE, g_ckPause = CreateWindowW(L"BUTTON", L"Pause",
-            WS_CHILD | BS_AUTOCHECKBOX, 232, 114, 90, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 240, 156, 80, 24,
             hwnd, (HMENU)IDC_CKPAUSE, nullptr, nullptr));
         add(PAGE_IMAGE, g_ckCheck = CreateWindowW(L"BUTTON", L"Checker 20x10",
-            WS_CHILD | BS_AUTOCHECKBOX, 330, 114, 140, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 330, 156, 150, 24,
             hwnd, (HMENU)IDC_CKCHECK, nullptr, nullptr));
         // image-area ROI row (the original's Top/Left/Right/Bottom px +
         // Full circle + Border px + Sync buttons). Insets in output px,
         // applied on Apply (or the sync/reset helpers).
         add(PAGE_IMAGE, CreateWindowW(L"STATIC", L"ROI px L/T/R/B:",
-            WS_CHILD | SS_LEFT, 16, 152, 100, 18,
+            WS_CHILD | SS_LEFT, 16, 194, 100, 18,
             hwnd, nullptr, nullptr, nullptr));
         for (int i = 0; i < 4; i++)
             add(PAGE_IMAGE, g_edRoi[i] = CreateWindowW(L"EDIT", L"0",
                 WS_CHILD | WS_BORDER | ES_NUMBER,
-                118 + i * 52, 148, 46, 24,
+                118 + i * 52, 190, 46, 24,
                 hwnd, (HMENU)(IDC_EDROIL + i), nullptr, nullptr));
         add(PAGE_IMAGE, g_ckRoiCir = CreateWindowW(L"BUTTON", L"Circle",
-            WS_CHILD | BS_AUTOCHECKBOX, 330, 148, 70, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 344, 190, 70, 24,
             hwnd, (HMENU)IDC_CKROICIR, nullptr, nullptr));
         add(PAGE_IMAGE, CreateWindowW(L"STATIC", L"Border:",
-            WS_CHILD | SS_LEFT, 404, 152, 46, 18,
+            WS_CHILD | SS_LEFT, 420, 194, 46, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_IMAGE, g_edRoiBrd = CreateWindowW(L"EDIT", L"0",
-            WS_CHILD | WS_BORDER | ES_NUMBER, 452, 148, 40, 24,
+            WS_CHILD | WS_BORDER | ES_NUMBER, 468, 190, 44, 24,
             hwnd, (HMENU)IDC_EDROIBRD, nullptr, nullptr));
         add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Apply",
-            WS_CHILD | BS_PUSHBUTTON, 498, 146, 62, 26,
+            WS_CHILD | BS_PUSHBUTTON, 520, 188, 62, 26,
             hwnd, (HMENU)IDC_ROIAPPLY, nullptr, nullptr));
         add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Sync L/R",
-            WS_CHILD | BS_PUSHBUTTON, 16, 180, 76, 26,
+            WS_CHILD | BS_PUSHBUTTON, 596, 188, 80, 26,
             hwnd, (HMENU)IDC_ROISYNCLR, nullptr, nullptr));
         add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Sync T/B",
-            WS_CHILD | BS_PUSHBUTTON, 98, 180, 76, 26,
+            WS_CHILD | BS_PUSHBUTTON, 682, 188, 80, 26,
             hwnd, (HMENU)IDC_ROISYNCTB, nullptr, nullptr));
         add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Reset",
-            WS_CHILD | BS_PUSHBUTTON, 180, 180, 60, 26,
+            WS_CHILD | BS_PUSHBUTTON, 768, 188, 70, 26,
             hwnd, (HMENU)IDC_ROIRESET, nullptr, nullptr));
 
         // --- Settings page
         add(PAGE_SETTINGS, g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
-            WS_CHILD | BS_AUTOCHECKBOX, 16, 44, 190, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 16, 82, 200, 24,
             hwnd, (HMENU)IDC_CKNET, nullptr, nullptr));
         add(PAGE_SETTINGS, g_ckAuto = CreateWindowW(L"BUTTON", L"Start with Windows",
-            WS_CHILD | BS_AUTOCHECKBOX, 216, 44, 170, 24,
+            WS_CHILD | BS_AUTOCHECKBOX, 240, 82, 180, 24,
             hwnd, (HMENU)IDC_CKAUTO, nullptr, nullptr));
         add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Save Config",
-            WS_CHILD | BS_PUSHBUTTON, 400, 40, 100, 30,
+            WS_CHILD | BS_PUSHBUTTON, 880, 78, 110, 30,
             hwnd, (HMENU)IDC_SAVE, nullptr, nullptr));
         add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Load Config",
-            WS_CHILD | BS_PUSHBUTTON, 506, 40, 100, 30,
+            WS_CHILD | BS_PUSHBUTTON, 994, 78, 110, 30,
             hwnd, (HMENU)IDC_LOAD, nullptr, nullptr));
         add(PAGE_SETTINGS, CreateWindowW(L"STATIC", L"Preset:",
-            WS_CHILD | SS_LEFT, 16, 92, 52, 18,
+            WS_CHILD | SS_LEFT, 16, 130, 52, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_SETTINGS, g_cbPreset = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWN | WS_VSCROLL,   // editable: type a new name then Save
-            70, 88, 200, 220,
+            70, 126, 260, 220,
             hwnd, (HMENU)IDC_CBPRESET, nullptr, nullptr));
         add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Save",
-            WS_CHILD | BS_PUSHBUTTON, 278, 86, 74, 26,
+            WS_CHILD | BS_PUSHBUTTON, 340, 124, 74, 26,
             hwnd, (HMENU)IDC_PRESETSAVE, nullptr, nullptr));
         add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Load",
-            WS_CHILD | BS_PUSHBUTTON, 356, 86, 74, 26,
+            WS_CHILD | BS_PUSHBUTTON, 420, 124, 74, 26,
             hwnd, (HMENU)IDC_PRESETLOAD, nullptr, nullptr));
         add(PAGE_SETTINGS, CreateWindowW(L"BUTTON", L"Delete",
-            WS_CHILD | BS_PUSHBUTTON, 434, 86, 90, 26,
+            WS_CHILD | BS_PUSHBUTTON, 500, 124, 90, 26,
             hwnd, (HMENU)IDC_PRESETDEL, nullptr, nullptr));
         add(PAGE_SETTINGS, CreateWindowW(L"STATIC", L"(CMDNET shared)",
-            WS_CHILD | SS_LEFT, 530, 92, 90, 18,
+            WS_CHILD | SS_LEFT, 600, 130, 120, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_SETTINGS, CreateWindowW(L"STATIC", L"Target:",
-            WS_CHILD | SS_LEFT, 16, 128, 52, 18,
+            WS_CHILD | SS_LEFT, 16, 170, 52, 18,
             hwnd, nullptr, nullptr, nullptr));
         add(PAGE_SETTINGS, g_cbTarget = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            70, 124, 200, 220,
+            70, 166, 260, 220,
             hwnd, (HMENU)IDC_CBTARGET, nullptr, nullptr));
 
-        // --- bottom strip, always visible (mirrors the original's bottom bar)
+        // --- bottom strip, always visible (mirrors the original's bottom bar).
+        // The transient status line ("Ready." + one-shot messages) lives at the
+        // right end of this band; the 6-line structured status block gets the
+        // full width below (114px: 6 lines of 9pt Segoe UI + padding - the old
+        // 74px block clipped its last line).
         CreateWindowW(L"BUTTON", L"Configure alignment (F3)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 16, 416, 190, 30,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 16, 470, 200, 30,
             hwnd, (HMENU)IDC_CALIB, nullptr, nullptr);
         g_ckEnable = CreateWindowW(L"BUTTON", L"Enable Desktop warping",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 216, 420, 190, 24,
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 230, 474, 200, 24,
             hwnd, (HMENU)IDC_CKENABLE, nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Engine:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 420, 424, 44, 18,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 450, 478, 44, 18,
             hwnd, nullptr, nullptr, nullptr);
         g_cbEng = CreateWindowW(L"COMBOBOX", nullptr,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            466, 420, 152, 220,
+            496, 474, 180, 220,
             hwnd, (HMENU)IDC_CBENG, nullptr, nullptr);
         ComboBox_AddString(g_cbEng, L"Desktop Duplication (DXGI)");
         ComboBox_AddString(g_cbEng, L"DWM Magnification (mirror)");
         ComboBox_AddString(g_cbEng, L"NVAPI clone (n/a)");
         ComboBox_AddString(g_cbEng, L"DOPP (n/a)");
+        g_status = CreateWindowW(L"STATIC", L"Ready.",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 696, 474, 408, 22,
+            hwnd, (HMENU)IDC_STATUSLINE, nullptr, nullptr);
         // structured status block (Projector / Mode / Color balancing / edges
         // / capture source / Engine fps+uptime), refreshed live by a 1s timer
         g_statusInfo = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 452, 612, 74,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 506, 1088, 114,
             hwnd, (HMENU)IDC_STATUSINFO, nullptr, nullptr);
-        g_status = CreateWindowW(L"STATIC", L"Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 530, 612, 22,
-            hwnd, nullptr, nullptr, nullptr);
-        // shift every page control below the toolbar band (their creation
-        // coordinates predate the toolbar; one loop beats thirty edits)
-        for (int pg = 0; pg < PAGE_COUNT; pg++)
-            for (HWND h : g_pages[pg]) {
-                RECT rc{};
-                GetWindowRect(h, &rc);
-                MapWindowPoints(nullptr, hwnd, (POINT*)&rc, 2);
-                SetWindowPos(h, nullptr, rc.left, rc.top + 38,
-                             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            }
 
         applyDarkThemeRecursive(hwnd);   // DarkMode_Explorer on every child
         syncInplaceUI(hwnd);             // initial View-menu check state
@@ -4576,6 +4587,32 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         refreshStatusBar();
         return 0;
     }
+    case WM_GETMINMAXINFO: {
+        // the console layout targets a 1120x630 (16:9) client; refuse to
+        // shrink below it (page columns are left-anchored, clipping instead
+        // of overlapping is the fallback if the user overrides via WM_SIZE)
+        MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+        RECT w{}, c{};
+        GetWindowRect(hwnd, &w);
+        GetClientRect(hwnd, &c);
+        mmi->ptMinTrackSize.x = 1120 + ((w.right - w.left) - (c.right - c.left));
+        mmi->ptMinTrackSize.y = 630 + ((w.bottom - w.top) - (c.bottom - c.top));
+        return 0;
+    }
+    case WM_SIZE: {
+        // reflow only the full-width furniture; page content is left-anchored
+        int cw = LOWORD(lp);
+        if (g_tab) MoveWindow(g_tab, 6, 44, cw - 12, 420, TRUE);
+        if (HWND h = GetDlgItem(hwnd, IDC_STATUSSEP))
+            MoveWindow(h, 8, 38, cw - 16, 2, TRUE);
+        if (HWND h = GetDlgItem(hwnd, IDC_EXIT))
+            MoveWindow(h, cw - 68, 8, 58, 26, TRUE);
+        if (HWND h = GetDlgItem(hwnd, IDC_STATUSINFO))
+            MoveWindow(h, 16, 506, cw - 32, 114, TRUE);
+        if (HWND h = GetDlgItem(hwnd, IDC_STATUSLINE))
+            MoveWindow(h, 696, 474, cw - 712, 22, TRUE);
+        return 0;
+    }
     case WM_TIMER: {                   // 1s status refresh (fps/uptime live)
         if (wp == 1 && g_statusInfo) {
             refreshStatusBar();
@@ -4666,6 +4703,19 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
         nullptr, nullptr, hInst, nullptr);
     ShowWindow(g_ctl, SW_SHOW);
     UpdateWindow(g_ctl);
+    // enforce the 16:9 console: client exactly 1120x630 (WM_CREATE laid the
+    // children out for that coordinate system). Delta math on the real client
+    // rect covers title bar, menu and frame without AdjustWindowRect guesses.
+    {
+        RECT c{};
+        GetClientRect(g_ctl, &c);
+        RECT w{};
+        GetWindowRect(g_ctl, &w);
+        SetWindowPos(g_ctl, nullptr, w.left, w.top,
+                     (w.right - w.left) + 1120 - (c.right - c.left),
+                     (w.bottom - w.top) + 630 - (c.bottom - c.top),
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     showTab(PAGE_DISPLAYS);   // now that g_ctl is set: mark the View menu item
     refreshList();
     populateOvrSrcCombo();
