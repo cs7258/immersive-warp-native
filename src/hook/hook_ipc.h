@@ -19,7 +19,9 @@ struct IWNHookCfg {
     LONG   gridN;            // mesh resolution per axis (>=2)
     float  corner[4][2];     // NDC offsets: TL, TR, BL, BR (x, y)
     LONG   frameSkip;        // log pacing
-    DWORD  reserved[3];
+    DWORD  reserved[3];      // [0]=Present detour hit count, [1]=first-chance
+                             // exception code seen by the hook VEH, [2]=tid of
+                             // the thread that raised it (crash telemetry)
 };
 #pragma pack(pop)
 

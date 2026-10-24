@@ -182,8 +182,14 @@ static std::string dispatch(std::string line) {
         }
         if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
         if (k == "maxfps") return "OK maxfps=" + std::to_string(g_cfg.maxfps) + "\n";
-        if (k == "hook") return "OK hook=" + std::string(hookIpcEnabled() ? "on" : "off") +
-                                 ";pass=" + std::to_string(hookIpcPassCount()) + "\n";
+        if (k == "hook") {
+            char hex[16];
+            snprintf(hex, sizeof(hex), "%X", hookIpcExcCode());
+            return "OK hook=" + std::string(hookIpcEnabled() ? "on" : "off") +
+                   ";pass=" + std::to_string(hookIpcPassCount()) +
+                   ";exc=0x" + hex +
+                   ";etid=" + std::to_string(hookIpcExcTid()) + "\n";
+        }
         if (k == "srcs") {   // per-output source overrides (empty "-" = global pin)
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             std::string s;

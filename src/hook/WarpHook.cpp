@@ -432,12 +432,47 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
     return orig(sw, sync, flags);
 }
 
+// ---------------------------------------------------------------- crash telemetry
+// The app's render thread silently drops hookLog writes, so a crash inside
+// Present would be invisible. The VEH publishes first-chance exception info
+// through the shared mapping (reserved[1]=code, reserved[2]=tid) which the
+// host can read via `GET hook` even if the process dies right after.
+static LONG WINAPI excFilter(PEXCEPTION_POINTERS ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != 0xE06D7363 && code != 0xC0000005) return EXCEPTION_CONTINUE_SEARCH;
+    IWNHookCfg* c = ensureCfg();
+    if (c) {
+        // InterlockedCompareExchange keeps the FIRST occurrence - later
+        // first-chance repeats (same throw unwinding) must not overwrite it
+        InterlockedCompareExchange((volatile LONG*)&c->reserved[1], (LONG)code, 0);
+        InterlockedCompareExchange((volatile LONG*)&c->reserved[2],
+                                   (LONG)GetCurrentThreadId(), 0);
+    }
+    static volatile LONG reported = 0;
+    if (InterlockedCompareExchange(&reported, 1, 0) == 0) {
+        PVOID pc = ep->ExceptionRecord->ExceptionAddress;
+        void* base = nullptr;
+        void* modBase = RtlPcToFileHeader(pc, &base);
+        DWORD off = modBase ? (DWORD)((uintptr_t)pc - (uintptr_t)modBase) : 0;
+        char buf[192];
+        wsprintfA(buf, "EXC code=0x%08X addr=%p mod=%p off=0x%X tid=%u",
+                  code, pc, modBase, off, (unsigned)GetCurrentThreadId());
+        hookLog(buf);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // ---------------------------------------------------------------- init thread
 static DWORD WINAPI initThread(LPVOID) {
     // wait for dxgi to be loaded by the host process (poll 50 ms)
     for (int i = 0; i < 600; i++) {
         if (GetModuleHandleW(L"dxgi.dll")) break;
         Sleep(50);
+    }
+    {
+        char buf[48];
+        wsprintfA(buf, "init thread tid=%u", (unsigned)GetCurrentThreadId());
+        hookLog(buf);
     }
     installFactoryHooks();
     // open the host mapping eagerly - not lazily inside Present - so a
@@ -463,9 +498,14 @@ static DWORD WINAPI initThread(LPVOID) {
     // watchdog: re-apply the detour if something restored the original entry.
     // NOTE: no repeated live probe - calling Present from this thread races
     // the app's own Present on the same swapchain and crashes DXGI.
+    static bool wdLogged = false;
     while (true) {
         Sleep(2000);
         std::lock_guard<std::mutex> lk(g_vtMutex);
+        if (!wdLogged) {
+            wdLogged = true;
+            hookLog("watchdog cycle 1 enter");
+        }
         for (int i = 0; i < g_vtCount; i++) {
             void** vt = g_vts[i].vt;
             // re-read the OBJECT's vptr: if dxgi swapped the vtable after
@@ -504,6 +544,7 @@ static DWORD g_initTid = 0;
 BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(mod);
+        AddVectoredExceptionHandler(1, &excFilter);
         char buf[300];
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);

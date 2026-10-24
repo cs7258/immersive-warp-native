@@ -47,3 +47,13 @@ unsigned hookIpcPassCount() {
     std::lock_guard<std::mutex> lk(g_hookMutex);
     return g_hookView ? g_hookView->reserved[0] : 0;
 }
+
+unsigned hookIpcExcCode() {
+    std::lock_guard<std::mutex> lk(g_hookMutex);
+    return g_hookView ? g_hookView->reserved[1] : 0;
+}
+
+unsigned hookIpcExcTid() {
+    std::lock_guard<std::mutex> lk(g_hookMutex);
+    return g_hookView ? g_hookView->reserved[2] : 0;
+}
