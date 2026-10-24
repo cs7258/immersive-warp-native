@@ -153,10 +153,23 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | src/Engine.h/.cpp | D3D11 设备、桌面复制（IDXGIOutputDuplication）、扭曲网格（Catmull-Rom 细分）、融合/色彩/遮罩像素着色器、校准覆盖层 |
 | src/Windows.cpp | 输出窗口 + 校准交互（拖点/滚轮/F10/Esc）+ 控制台 UI |
 | src/main.cpp | 启动、渲染线程、消息循环 |
+| src/HookIPC.cpp | scanout 管线宿主侧：发布 WarpHook.dll 参数映射 |
+| src/hook/WarpHook.cpp | 注入 DLL：Present hook + 就地扭曲（scanout 前） |
+| src/hook/Injector.cpp | IWNInject.exe：挂起启动注入器 |
 
 ## P0 边界与后续路线
 
 - 本版：单 GPU（adapter 0）、无色彩均衡 UI（数据模型已含）、无 Sets 热切换、无状态栏文字（引擎覆盖层后续补）
-- P1: 色彩均衡 UI、Sets、MQTT/触控面板
-- P2: swapchain hook 低延迟管线（届时需 EV 代码签名 + 杀软白名单，对应原版 WSupportLdr.exe 的合规路径）、NVIDIA NVAPI Warp and Blend（Quadro/RTX 专业卡免费 SDK，无需商务授权）
+- **P1（当前最高优先级）：scanout 级交付 = swapchain/Present hook 注入管线**（WarpHook.dll + IWNInject.exe + 宿主参数通道）。NVAPI Warp and Blend / 内核驱动暂缓——无对应硬件，待硬件到位再排
+- P1 其余：Sets 热切换补全、MQTT 对接（CMDNET/OSC 已覆盖自有远控）
+- P2（暂缓）: 内核驱动 DXGK 级（届时需 EV 代码签名 + 杀软白名单，对应原版 WSupportLdr.exe 的合规路径）
 - P3: 相机自动对准、AI 帧插值
+
+### scanout 管线（Phase 1 已落地：端到端 hook 通道）
+
+- **IWNInject.exe --launch <exe> <dll>**：挂起启动目标 → 注入 WarpHook.dll → 恢复运行（早注入，能拦到目标的全部 swapchain）；`--pid <pid> <dll>` 模式只对注入后新建的 swapchain 生效
+- **WarpHook.dll**：进程内 patch DXGI 工厂 vtable（CreateSwapChain / CreateSwapChainForHwnd），对每个新 swapchain patch Present（槽 13，按实现类建表——位块/翻转模型 vtable 不同）；Present 前把后台缓冲 CopyResource→SRV，经四角 NDC 偏移的双线性网格自绘回 RTV（就地扭曲，原版同级的"帧在 scanout 前被改造"）
+- **参数通道**：宿主发布命名映射 `IWN_WarpHook_v1`（`hook/hook_ipc.h` 契约），CMDNET 实时翻转
+- **命令**：`GET hook` / `SET hook=on|off`（使能位）、`SET hooktest=on|off`（固定梯形四角偏移，肉眼可见验证）；STATUS / GET config 双导出 `hook=`
+- **日志**：注入 DLL 写 `%APPDATA%\ImmersiveWarpNative\hook.log`（attach / vtable patch / swapchain hooked / warp pass frames）
+- Phase 1 限制：扭曲模型为 4 角 NDC 偏移的 Phase-1 PoC（宿主全控制点网格导出、融合带着色器、per-swapchain 输出选择在后续 Phase）；目标应用需在 hook 安装后创建 swapchain（用 --launch）

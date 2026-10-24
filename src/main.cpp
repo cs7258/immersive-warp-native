@@ -102,6 +102,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }
     loadConfig(L""); // override from saved file if present
+    hookIpcInit();   // publish the WarpHook.dll parameter block (enabled=0)
     if (g_cfg.cmdnet) cmdnetStart(g_cfg.cmdnetPort);
     if (g_cfg.osc) oscStart(g_cfg.oscPort);
 

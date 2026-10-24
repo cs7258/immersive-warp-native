@@ -182,6 +182,7 @@ static std::string dispatch(std::string line) {
         }
         if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
         if (k == "maxfps") return "OK maxfps=" + std::to_string(g_cfg.maxfps) + "\n";
+        if (k == "hook") return std::string("OK hook=") + (hookIpcEnabled() ? "on" : "off") + "\n";
         if (k == "srcs") {   // per-output source overrides (empty "-" = global pin)
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             std::string s;
@@ -266,6 +267,7 @@ static std::string dispatch(std::string line) {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 s += "sampling=" + std::to_string(g_cfg.sampling) + ";";
                 s += "maxfps=" + std::to_string(g_cfg.maxfps) + ";";
+                s += std::string("hook=") + (hookIpcEnabled() ? "on" : "off") + ";";
                 s += std::string("testpattern=") + (g_cfg.testPattern ? "on" : "off") + ";";
                 s += "layout=" + std::to_string(g_cfg.layoutC) + "x" + std::to_string(g_cfg.layoutR) + ";";
                 s += "overlap=" + std::to_string(g_cfg.overlap) + ";";
@@ -468,6 +470,7 @@ static std::string dispatch(std::string line) {
             eng = g_cfg.engine; testAnim = g_cfg.testAnim; checker = g_cfg.checker;
             subd = g_cfg.subdivide;
             maxFps = g_cfg.maxfps;
+            bool hookOn = hookIpcEnabled();
             roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1]; roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
             roiCir = g_cfg.roiCircle; roiBrd = g_cfg.roiBorder;
             oscCfg = g_cfg.osc; oscPortV = g_cfg.oscPort;
@@ -499,6 +502,7 @@ static std::string dispatch(std::string line) {
                ";checker=" + std::string(checker ? "on" : "off") +
                ";subdivide=" + std::to_string(subd) +
                ";maxfps=" + std::to_string(maxFps) +
+               std::string(";hook=") + (hookOn ? "on" : "off") +
                ";move=" + std::string(g_moveMode.load() == 1 ? "xy" : g_moveMode.load() == 2 ? "all" : "single") +
                ";roi=" + std::to_string(roiL) + "," + std::to_string(roiT) + "," +
                           std::to_string(roiR) + "," + std::to_string(roiB) +
@@ -792,6 +796,31 @@ static std::string dispatch(std::string line) {
             }
             refreshMaxFpsUI();   // keep the Settings combo in sync
             return "OK maxfps=" + std::to_string(v) + "\n";
+        }
+        // scanout pipeline: warp params for the injected WarpHook.dll.
+        // hook=on flips the enable flag; hooktest also installs a fixed
+        // corner displacement so the in-place warp is visible on screen.
+        if (key == "hook") {
+            bool on;
+            if (val == "1" || val == "ON" || val == "TRUE") on = true;
+            else if (val == "0" || val == "OFF" || val == "FALSE") on = false;
+            else return "ERR SET hook (on|off)\n";
+            hookIpcSet(on, nullptr, 0);
+            return std::string("OK hook=") + (on ? "on" : "off") + "\n";
+        }
+        if (key == "hooktest") {
+            bool on;
+            if (val == "1" || val == "ON" || val == "TRUE") on = true;
+            else if (val == "0" || val == "OFF" || val == "FALSE") on = false;
+            else return "ERR SET hooktest (on|off)\n";
+            // fixed trapezoid: right edge pushed +0.25 NDC right, left edge
+            // pulled -0.25 - clearly visible on any content, still on-screen
+            static const float testCorners[4][2] = {
+                { -0.25f, 0.0f }, { 0.25f, 0.0f },   // TL, TR
+                {  0.0f,  0.0f }, { 0.0f,  0.0f },   // BL, BR
+            };
+            hookIpcSet(on, on ? testCorners : nullptr, 0);
+            return std::string("OK hooktest=") + (on ? "on" : "off") + "\n";
         }
         if (key == "engine") {
             // MAG mode is a different kind of output window: the shared

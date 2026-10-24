@@ -232,6 +232,11 @@ std::wstring snapshotDefaultPath();               // %APPDATA%\...\snapshots\<ts
 bool snapEncodePng(const std::wstring& path, UINT w, UINT h,
                    const uint8_t* px, UINT stride);
 
+// hook IPC (scanout pipeline): publish warp params for the injected WarpHook.dll
+bool hookIpcInit();
+void hookIpcSet(bool enabled, const float corner[4][2], int gridN);
+bool hookIpcEnabled();
+
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);
 // image source (WIC decode); empty path clears back to pattern/capture

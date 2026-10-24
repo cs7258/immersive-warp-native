@@ -21,8 +21,21 @@ cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE ^
   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib ole32.lib comdlg32.lib windowscodecs.lib ws2_32.lib advapi32.lib
 if errorlevel 1 goto FAIL
 
+REM ---- scanout pipeline Phase 1: hook DLL + injector ----
+cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE /LD ^
+  src\hook\WarpHook.cpp ^
+  /Fe:build\WarpHook.dll /Fo:build\ ^
+  /link /SUBSYSTEM:WINDOWS d3d11.lib dxgi.lib d3dcompiler.lib kernel32.lib user32.lib
+if errorlevel 1 goto FAIL
+
+cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE ^
+  src\hook\Injector.cpp ^
+  /Fe:build\IWNInject.exe /Fo:build\ ^
+  /link /SUBSYSTEM:CONSOLE /ENTRY:wmainCRTStartup kernel32.lib user32.lib
+if errorlevel 1 goto FAIL
+
 echo.
-echo BUILD OK: build\ImmersiveWarpNative.exe
+echo BUILD OK: build\ImmersiveWarpNative.exe build\WarpHook.dll build\IWNInject.exe
 exit /b 0
 
 :NOTOOLS
