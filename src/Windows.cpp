@@ -718,6 +718,11 @@ bool paintMagMask(HWND ov, HWND host) {
     // blackout participates in the change hash so toggling always repaints
     bool bo = g_blackout.load();
     hash = (hash ^ (bo ? 0x9E3779B9u : 0u)) * 16777619u;
+    {   // checker overlay likewise (layer lives in this same overlay)
+        bool ck;
+        { std::lock_guard<std::mutex> lk(g_cfgMutex); ck = g_cfg.checker != 0; }
+        hash = (hash ^ (ck ? 0x51ED270Bu : 0u)) * 16777619u;
+    }
     for (auto& m : masks) {
         auto mix = [&hash](float f) {
             unsigned v;
@@ -743,21 +748,36 @@ bool paintMagMask(HWND ov, HWND host) {
     HBITMAP bmp = CreateDIBSection(sdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (bmp && bits) {
         auto* px = (unsigned*)bits;
+        bool checker = false;
+        { std::lock_guard<std::mutex> lk(g_cfgMutex); checker = g_cfg.checker != 0; }
         if (bo) {
             // show blackout: the whole overlay is opaque black (covers test
             // pattern; the blend bars above just multiply more black onto it)
             unsigned black = 0xFF000000;
             for (int i = 0; i < w * h; i++) px[i] = black;
-        } else for (auto& m : masks) {
-            // premultiplied opaque black = alpha 255, color 0
-            unsigned black = 0xFF000000;
-            int x0 = (int)(m.x * w), y0 = (int)(m.y * h);
-            int x1 = (int)((m.x + m.w) * w), y1 = (int)((m.y + m.h) * h);
-            if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
-            if (x1 > w) x1 = w; if (y1 > h) y1 = h;
-            for (int y = y0; y < y1; y++) {
-                unsigned* row = px + (size_t)y * w;
-                for (int x = x0; x < x1; x++) row[x] = black;
+        } else {
+            // checker 20x10 under the black masks: screen-space white cells at
+            // 35% (premultiplied alpha 89) - same look as the DXGI shader pass
+            if (checker) {
+                unsigned cell = 0x59595959;   // premultiplied white @ 0.35
+                for (int y = 0; y < h; y++) {
+                    unsigned* row = px + (size_t)y * w;
+                    bool cy = (y * 10 / h) & 1;
+                    for (int x = 0; x < w; x++)
+                        if ((((x * 20 / w) & 1) ^ cy) == 0) row[x] = cell;
+                }
+            }
+            for (auto& m : masks) {
+                // premultiplied opaque black = alpha 255, color 0
+                unsigned black = 0xFF000000;
+                int x0 = (int)(m.x * w), y0 = (int)(m.y * h);
+                int x1 = (int)((m.x + m.w) * w), y1 = (int)((m.y + m.h) * h);
+                if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+                if (x1 > w) x1 = w; if (y1 > h) y1 = h;
+                for (int y = y0; y < y1; y++) {
+                    unsigned* row = px + (size_t)y * w;
+                    for (int x = x0; x < x1; x++) row[x] = black;
+                }
             }
         }
         SelectObject(mdc, bmp);
@@ -1367,6 +1387,7 @@ bool queryAutostart() {
 static HWND g_cbImg = nullptr;
 static HWND g_cbAnim = nullptr;    // test-pattern animation direction
 static HWND g_ckPause = nullptr;   // test-pattern pause (session-only)
+static HWND g_ckCheck = nullptr;   // checker overlay 20x10
 
 static void setStatus(const wchar_t* s) {
     if (g_status) SetWindowTextW(g_status, s);
@@ -1710,6 +1731,7 @@ void notifyOutputRaised() {
 #define IDC_CBOVRSRC  1036   // per-output source override dropdown
 #define IDC_CBANIM    1037   // test-pattern animation direction dropdown
 #define IDC_CKPAUSE   1038   // test-pattern pause checkbox (session-only)
+#define IDC_CKCHECK   1039   // checker overlay 20x10 checkbox
 // (menu bar IDM_* ids live above showTab, see the note there)
 
 static void refreshList() {
@@ -1892,6 +1914,11 @@ void refreshAnimUI(int anim, bool paused) {
                  anim < 0 ? 0 : (anim > 3 ? 3 : anim), 0);
     PostMessageW(g_ckPause, BM_SETCHECK,
                  paused ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+void refreshCheckerUI(bool on) {
+    // same family as refreshAnimUI: no internal locking, plain PostMessage
+    PostMessageW(g_ckCheck, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 void requestOutputRebuild() {
@@ -3141,6 +3168,7 @@ static void applyLoadedConfig() {
     Engine::inst().setSampling(g_cfg.sampling);
     ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
     ComboBox_SetCurSel(g_cbAnim, g_cfg.testAnim);   // animation direction follows the load
+    Button_SetCheck(g_ckCheck, g_cfg.checker ? BST_CHECKED : BST_UNCHECKED);
     // g_testPause is session-only: keep the checkbox as-is on Load Config
     ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
     syncLayoutCombos();
@@ -3629,6 +3657,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         add(PAGE_IMAGE, g_ckPause = CreateWindowW(L"BUTTON", L"Pause",
             WS_CHILD | BS_AUTOCHECKBOX, 232, 114, 90, 24,
             hwnd, (HMENU)IDC_CKPAUSE, nullptr, nullptr));
+        add(PAGE_IMAGE, g_ckCheck = CreateWindowW(L"BUTTON", L"Checker 20x10",
+            WS_CHILD | BS_AUTOCHECKBOX, 330, 114, 140, 24,
+            hwnd, (HMENU)IDC_CKCHECK, nullptr, nullptr));
 
         // --- Settings page
         add(PAGE_SETTINGS, g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
@@ -3727,6 +3758,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
             ComboBox_SetCurSel(g_cbAnim, g_cfg.testAnim);
             Button_SetCheck(g_ckPause, g_testPause.load() ? BST_CHECKED : BST_UNCHECKED);
+            Button_SetCheck(g_ckCheck, g_cfg.checker ? BST_CHECKED : BST_UNCHECKED);
         }
         populateSourceCombo();   // locks g_cfgMutex itself
         populateOvrSrcCombo();   // per-output override combo (list has no selection yet)
@@ -4097,6 +4129,19 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             // session-only: not persisted, mirrors BLACKOUT semantics
             setStatus(on ? L"Test pattern animation paused."
                          : L"Test pattern animation resumed.");
+        } else if (id == IDC_CKCHECK && HIWORD(wp) == BN_CLICKED) {
+            // screen-space 20x10 checkerboard over the output content (blend
+            // alignment aid). Render reads g_cfg.checker live - no rebuild.
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.checker = Button_GetCheck(g_ckCheck) == BST_CHECKED;
+                g_rev++;
+            }
+            // MAG engine: the checker layer lives in the mask overlay (250ms
+            // hash-polled) - wake its timer so the change is immediate
+            for (HWND m : g_magMasks) PostMessageW(m, WM_TIMER, 1, 0);
+            setStatus(g_cfg.checker ? L"Checker overlay 20x10: ON."
+                                    : L"Checker overlay 20x10: OFF.");
         } else if (id == IDC_CBSAMP && HIWORD(wp) == CBN_SELCHANGE) {
             int sel = ComboBox_GetCurSel(g_cbSamp);
             if (sel >= 0) {

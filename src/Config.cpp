@@ -111,6 +111,7 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "image=" << toUtf8(g_cfg.imagePath) << "\n";
     os << "testImg=" << g_cfg.testImg << "\n";
     os << "testAnim=" << g_cfg.testAnim << "\n";
+    os << "checker=" << g_cfg.checker << "\n";
     os << "cmdnet=" << g_cfg.cmdnet << "\n";
     os << "cmdnetPort=" << g_cfg.cmdnetPort << "\n";
     os << "sampling=" << g_cfg.sampling << "\n";
@@ -190,6 +191,7 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "image") c.imagePath = fromUtf8(val);
         else if (key == "testImg") c.testImg = atoi(val.c_str());
         else if (key == "testAnim") { c.testAnim = atoi(val.c_str()); if (c.testAnim < 0 || c.testAnim > 3) c.testAnim = 0; }
+        else if (key == "checker") { c.checker = atoi(val.c_str()) != 0; }
         else if (key == "cmdnet") c.cmdnet = atoi(val.c_str());
         else if (key == "cmdnetPort") c.cmdnetPort = atoi(val.c_str());
         else if (key == "sampling") c.sampling = atoi(val.c_str());

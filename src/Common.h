@@ -93,6 +93,7 @@ struct AppConfig {
     std::wstring imagePath;
     int testImg = -1;                 // built-in test image library (0..3), -1 = none
     int testAnim = 0;                 // dynamic pattern scroll: 0 off, 1 H, 2 V, 3 diagonal
+    int checker = 0;                  // 20x10 checkerboard overlay (screen space, blend-alignment aid)
     int subdivide = 8;                // mesh subdivision per control cell
     int curved = 0;                   // 1 = Catmull-Rom curved grid interp (needs rows>=4 && cols>=4), 0 = bilinear
     int cmdnet = 0;                   // CMDNET ASCII TCP show-control service on/off
@@ -144,6 +145,7 @@ void refreshSampComboUI();     // socket thread safe: sampling dropdown follows 
 // locking, the caller passes the captured values (SET testanim runs inside
 // the CMDNET locked region - an internal lock would self-deadlock)
 void refreshAnimUI(int anim, bool paused);
+void refreshCheckerUI(bool on);   // same family: checker overlay checkbox follows
 
 // ---- DWM Magnification engine (src/MagEngine.cpp) --------------------
 // engine=1: output windows are magnifier hosts mirroring the source

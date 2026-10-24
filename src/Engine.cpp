@@ -53,6 +53,7 @@ cbuffer FrameCB : register(b0) {
     float4 chanB;           // per-side B blend gamma
     float4 sampInfo;        // x=bicubic on, y=srcW, z=srcH (for catmull-rom)
     float4 animT;           // dynamic test pattern: x=on, y=phase 0..1, zw=scroll dir
+    float4 overlay;         // x=checker 20x10 on, yz=output resolution px
 }
 // parametric blend curve: f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1).
 // gain=0, slope=0 -> f(x)=x (the plain linear ramp); slope=1 -> hard step;
@@ -117,7 +118,7 @@ float3 sampleBicubic(float2 uv, float2 ts) {
         }
     return sum;
 }
-float4 main(VOut i) : SV_Target {
+float4 main(VOut i, float4 px : SV_Position) : SV_Target {
     // per-channel weight: pow(curve, edgeGamma * chanC); all chan = 1 gives
     // the legacy scalar weight a. Each participating side multiplies in.
     float aR = 1, aG = 1, aB = 1;
@@ -158,6 +159,14 @@ float4 main(VOut i) : SV_Target {
         if (k >= flags.z) break;
         float2 d = i.nom - masks[k].xy;
         if (d.x >= 0 && d.y >= 0 && d.x <= masks[k].z && d.y <= masks[k].w) c = 0;
+    }
+    // checker overlay 20x10 (original Images-area alignment aid): screen-space
+    // white cells at 35% - adjacent projectors' cells should coincide across
+    // the seam, and the fade curve stays visible inside the blend bands
+    if (overlay.x > 0.5 && overlay.y > 0 && overlay.z > 0) {
+        float cw = overlay.y / 20.0, ch = overlay.z / 10.0;
+        float chk = fmod(floor(px.x / cw) + floor(px.y / ch), 2.0);
+        if (chk < 0.5) c = lerp(c, float3(1, 1, 1), 0.35);
     }
     return float4(saturate(c) * float3(aR, aG, aB), 1);
 }
@@ -1016,6 +1025,7 @@ struct FrameCBData {
     float chanR[4]; float chanG[4]; float chanB[4];
     float sampInfo[4];   // x=bicubic on, y=srcW, z=srcH
     float animT[4];      // dynamic pattern: x=on, y=phase, zw=scroll dir
+    float overlay[4];    // x=checker 20x10 on, yz=output resolution px
 };
 static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
@@ -1096,6 +1106,9 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
         else if (g_cfg.testAnim == 2) { d.animT[2] = 0.0f;   d.animT[3] = 1.0f;   } // vertical
         else                          { d.animT[2] = 0.707f; d.animT[3] = 0.707f; } // diagonal
     }
+    // checker overlay: screen-space, so the PS needs the output pixel size
+    d.overlay[0] = g_cfg.checker ? 1.0f : 0.0f;
+    d.overlay[1] = (float)oc.w; d.overlay[2] = (float)oc.h;
 
     D3D11_MAPPED_SUBRESOURCE mp{};
     m_ctx->Map(oc.frameCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp);

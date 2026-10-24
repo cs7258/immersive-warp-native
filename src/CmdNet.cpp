@@ -186,6 +186,10 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return "OK testanim=" + std::to_string(g_cfg.testAnim) + "\n";
         }
+        if (k == "checker") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return std::string("OK checker=") + (g_cfg.checker ? "on" : "off") + "\n";
+        }
         if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
         if (k == "layout") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -265,6 +269,7 @@ static std::string dispatch(std::string line) {
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 s += "testanim=" + std::to_string(g_cfg.testAnim) + ";";
+                s += std::string("checker=") + (g_cfg.checker ? "on" : "off") + ";";
             }
             s += std::string("testpause=") + (g_testPause.load() ? "on" : "off") + ";";
             s += std::string("autostart=") + (queryAutostart() ? "on" : "off") + ";";
@@ -398,13 +403,13 @@ static std::string dispatch(std::string line) {
         // layout/overlap/curved/masks/testpattern/source. Keys are appended at
         // the end, so older parsers reading "key=value;" pairs keep working.
         int edges = 15, outs = 0, masks = 0;
-        int layoutC = 1, layoutR = 1, overlap = 0, eng = 0, testAnim = 0;
+        int layoutC = 1, layoutR = 1, overlap = 0, eng = 0, testAnim = 0, checker = 0;
         bool curved = false, tp = false;
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             layoutC = g_cfg.layoutC; layoutR = g_cfg.layoutR; overlap = g_cfg.overlap;
             curved = g_cfg.curved != 0; tp = g_cfg.testPattern;
-            eng = g_cfg.engine; testAnim = g_cfg.testAnim;
+            eng = g_cfg.engine; testAnim = g_cfg.testAnim; checker = g_cfg.checker;
             for (auto& o : g_cfg.outputs) if (o.enabled) {
                 outs++;
                 if (outs == 1) { edges = o.edges; masks = (int)o.masks.size(); }
@@ -430,6 +435,7 @@ static std::string dispatch(std::string line) {
                ";blackout=" + std::string(g_blackout.load() ? "on" : "off") +
                ";testanim=" + std::to_string(testAnim) +
                ";testpause=" + std::string(g_testPause.load() ? "on" : "off") +
+               ";checker=" + std::string(checker ? "on" : "off") +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
@@ -537,6 +543,7 @@ static std::string dispatch(std::string line) {
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             refreshAnimUI(g_cfg.testAnim, g_testPause.load());   // animation combo follows
+            refreshCheckerUI(g_cfg.checker != 0);                // checker checkbox follows
         }
         int outs = 0;
         refreshStatusBar();
@@ -1024,6 +1031,12 @@ static std::string dispatch(std::string line) {
                 g_testPause.store(want);
                 applied = true;
                 refreshAnimUI(g_cfg.testAnim, want);   // Image-page checkbox follows
+            }
+            if (!applied && key == "checker") {
+                bool want = (val == "ON" || val == "1" || val == "true");
+                g_cfg.checker = want;
+                applied = true;
+                refreshCheckerUI(want);   // Image-page checkbox follows
             }
             if (!applied && key == "probe") {
                 g_probe.store(val == "ON" || val == "1" || val == "true");
