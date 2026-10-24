@@ -3967,7 +3967,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                             "perf: fps=%.1f cap=%.2fms draw=%.2fms frame=%.2fms frames=%llu",
                             engineFps(), engineCapMs(), engineDrawMs(),
                             engineFrameMs(), engineFrames());
-                dbgLog(b);
+                dbgLogLine(b);
             }
         }
         return 0;
