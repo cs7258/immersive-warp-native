@@ -3954,9 +3954,24 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         refreshStatusBar();
         return 0;
     }
-    case WM_TIMER:                     // 1s status refresh (fps/uptime live)
-        if (wp == 1 && g_statusInfo) refreshStatusBar();
+    case WM_TIMER: {                   // 1s status refresh (fps/uptime live)
+        if (wp == 1 && g_statusInfo) {
+            refreshStatusBar();
+            // optional perf history: one snapshot line every 10 s so a real
+            // machine run leaves a timing trail in debug.log
+            static unsigned perfTick = 0;
+            if (g_perfLog.load() && ++perfTick >= 10) {
+                perfTick = 0;
+                char b[160];
+                _snprintf_s(b, _TRUNCATE,
+                            "perf: fps=%.1f cap=%.2fms draw=%.2fms frame=%.2fms frames=%llu",
+                            engineFps(), engineCapMs(), engineDrawMs(),
+                            engineFrameMs(), engineFrames());
+                dbgLog(b);
+            }
+        }
         return 0;
+    }
     case WM_DRAWITEM: {                // owner-draw: schematic + toolbar glyphs
         DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
         if (dis && dis->CtlID == IDC_SCHEMATIC) { drawDisplaySchematic(dis); return TRUE; }

@@ -197,6 +197,9 @@ unsigned long long engineUptimeMs();     // ms since process start
 double engineCapMs();                    // capture stage, EMA ms (x100 fixed inside)
 double engineDrawMs();                   // compose+draw+present stage, EMA ms
 double engineFrameMs();                  // whole renderAll pass, EMA ms
+
+// periodic perf snapshots into debug.log (config key perflog=, 1 line / 10 s)
+extern std::atomic<bool> g_perfLog;
 bool engineSetTestImage(int id);   // built-in test image library (0..3)
 void createOutputWindows();
 // render-thread bridge: the in-progress right-drag mask rectangle (true when

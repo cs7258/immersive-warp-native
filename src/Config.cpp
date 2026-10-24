@@ -14,6 +14,8 @@ std::atomic<bool> g_previewNoCapture{ false };
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_snapshot{ false };
 std::atomic<bool> g_probe{ false };
+// periodic perf snapshot into debug.log (SET perflog=on; 1 line / 10 s)
+std::atomic<bool> g_perfLog{ false };
 std::atomic<int>  g_dispChange{ 0 };
 
 std::vector<DisplayInfo> enumerateDisplays() {
@@ -105,6 +107,7 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "cmdnetPort=" << g_cfg.cmdnetPort << "\n";
     os << "sampling=" << g_cfg.sampling << "\n";
     os << "autostart=" << g_cfg.autostart << "\n";
+    os << "perflog=" << (g_perfLog.load() ? 1 : 0) << "\n";
     os << "source=" << toUtf8(g_cfg.sourceDev) << "\n";
     os << "layoutR=" << g_cfg.layoutR << "\n";
     os << "layoutC=" << g_cfg.layoutC << "\n";
@@ -181,6 +184,7 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "cmdnetPort") c.cmdnetPort = atoi(val.c_str());
         else if (key == "sampling") c.sampling = atoi(val.c_str());
         else if (key == "autostart") c.autostart = atoi(val.c_str());
+        else if (key == "perflog") g_perfLog.store(val == "1");
         else if (key == "source") c.sourceDev = fromUtf8(val);
         else if (key == "layoutR") c.layoutR = atoi(val.c_str());
         else if (key == "layoutC") c.layoutC = atoi(val.c_str());

@@ -147,6 +147,7 @@ static std::string dispatch(std::string line) {
         if (k == "mode")     return std::string("OK mode=")     + (g_calibMode.load() == 1 ? "blend" : "warp") + "\n";
         if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
         if (k == "probe")    return std::string("OK probe=")    + (g_probe.load() ? "on" : "off") + "\n";
+        if (k == "perflog")  return std::string("OK perflog=")  + (g_perfLog.load() ? "on" : "off") + "\n";
         if (k == "inplace")  return std::string("OK inplace=")  + (g_inplace.load() ? "on" : "off") + "\n";
         // remote health monitoring: one line, key=value; pairs (STATUS style)
         if (k == "perf") {
@@ -242,6 +243,7 @@ static std::string dispatch(std::string line) {
             s += "mode=" + std::string(g_calibMode.load() == 1 ? "blend" : "warp") + ";";
             s += std::string("snapshot=") + (g_snapshot.load() ? "on" : "off") + ";";
             s += std::string("probe=") + (g_probe.load() ? "on" : "off") + ";";
+            s += std::string("perflog=") + (g_perfLog.load() ? "on" : "off") + ";";
             s += std::string("inplace=") + (g_inplace.load() ? "on" : "off") + ";";
             s += std::string("autostart=") + (queryAutostart() ? "on" : "off") + ";";
             std::wstring src = currentSourceDevice();   // locks g_cfgMutex itself
@@ -401,6 +403,7 @@ static std::string dispatch(std::string line) {
                ";source=" + (src.empty() ? std::string("auto") : shortDev(src)) +
                ";out=" + (tgt.empty() ? std::string("auto") : tgt) +
                ";probe=" + std::string(g_probe.load() ? "on" : "off") +
+               ";perflog=" + std::string(g_perfLog.load() ? "on" : "off") +
                ";inplace=" + std::string(g_inplace.load() ? "on" : "off") +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
@@ -464,6 +467,13 @@ static std::string dispatch(std::string line) {
     }
 
     if (cmd == "SAVE") return saveConfig(L"") ? "OK saved\n" : "ERR SAVE\n";
+
+    // periodic perf snapshots into debug.log (PERFLOG ON/OFF/toggle)
+    if (cmd == "PERFLOG") {
+        bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_perfLog.load();
+        g_perfLog.store(want);
+        return std::string("OK perflog=") + (g_perfLog.load() ? "on" : "off") + "\n";
+    }
 
     // shared tail of LOAD / LOADAS: resync the state the UI's Load button also
     // refreshes. loadConfig has already released g_cfgMutex by the time this
@@ -904,6 +914,10 @@ static std::string dispatch(std::string line) {
                 g_probe.store(val == "ON" || val == "1" || val == "true");
                 applied = true;
                 requestMagProbeSync();   // engine=1: overlays follow
+            }
+            if (!applied && key == "perflog") {
+                g_perfLog.store(val == "ON" || val == "1" || val == "true");
+                applied = true;
             }
             if (!applied && key == "inplace") {
                 g_inplace.store(val == "ON" || val == "1" || val == "true");
