@@ -781,7 +781,10 @@ static std::string dispatch(std::string line) {
         // no render loop - the cap is a DXGI-engine setting.
         if (key == "maxfps") {
             int v = atoi(val.c_str());
-            if (val.empty() || v < 0 || v > 240)
+            // reject non-numeric values: atoi("ABC") is 0, which would
+            // silently lift the cap instead of failing the command
+            if (val.empty() || val.find_first_not_of("0123456789") != std::string::npos
+                || v > 240)
                 return "ERR SET maxfps (0..240)\n";
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
