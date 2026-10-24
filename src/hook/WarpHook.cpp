@@ -476,7 +476,11 @@ static DWORD g_initTid = 0;
 BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(mod);
-        hookLog("WarpHook.dll attached");
+        char buf[300];
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        wsprintfA(buf, "WarpHook.dll attached pid=%u exe=%ls", (unsigned)GetCurrentProcessId(), exe);
+        hookLog(buf);
         HANDLE t = CreateThread(nullptr, 0, initThread, nullptr, 0, &g_initTid);
         if (t) CloseHandle(t);
     } else if (reason == DLL_PROCESS_DETACH) {
