@@ -4100,6 +4100,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
     uiThreadId = GetCurrentThreadId();
+    dbgLogLine("uiThread tid=" + std::to_string((long)uiThreadId));   // hotkey test hook
     g_ctl = CreateWindowExW(WS_EX_TOPMOST, CTL_CLASS, L"Immersive Warp Native",
         WS_OVERLAPPEDWINDOW, 100, 100, 650, 646,
         nullptr, nullptr, hInst, nullptr);
