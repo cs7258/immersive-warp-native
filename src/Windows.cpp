@@ -1618,7 +1618,7 @@ static void invalidateToolbarToggles() {
 // wake the mask overlays (their 250 ms poll would also catch up, but a show
 // blackout must land immediately) and repaint the probe markers (they sit
 // ABOVE the mask overlay and must not shine through a blackout).
-static void syncBlackoutUI(HWND hwnd) {
+static void syncBlackoutUI(HWND hwnd = nullptr) {
     if (!hwnd && g_ctl) hwnd = g_ctl;
     if (hwnd)
         if (HMENU m = GetMenu(hwnd))
