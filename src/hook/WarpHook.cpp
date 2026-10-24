@@ -248,7 +248,6 @@ typedef HRESULT(WINAPI* PFN_CreateSwapChainForHwnd)(IUnknown*, IUnknown*, HWND, 
 
 static PFN_CreateSwapChain         g_origCreate = nullptr;
 static PFN_CreateSwapChainForHwnd  g_origCreateHwnd = nullptr;
-static void** g_factoryVt = nullptr;      // patched vtable (process-wide)
 static volatile LONG g_swapCount = 0;
 
 // Bitblt and flip-model swapchains are distinct implementation classes with
@@ -276,26 +275,44 @@ static PFN_Present patchSwapchainVt(IDXGISwapChain* sw) {
     return orig;
 }
 
+static void patchSlot(void** vt, int idx, void* detour, void** origSave, const char* tag) {
+    DWORD old{};
+    if (!VirtualProtect(&vt[idx], sizeof(void*), PAGE_READWRITE, &old)) {
+        hookLog("VirtualProtect on factory vtable failed");
+        return;
+    }
+    if (origSave && !*origSave) *origSave = vt[idx];
+    vt[idx] = detour;
+    VirtualProtect(&vt[idx], sizeof(void*), old, &old);
+    hookLog(tag);
+}
+
 static void installFactoryHooks() {
-    IDXGIFactory2* fac = nullptr;
-    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory2), (void**)&fac))) {
+    // The app may QI any factory revision. MSVC multiple inheritance gives
+    // every interface revision its own subobject vtable, so patch both
+    // IDXGIFactory1 and IDXGIFactory2 (same implementation, prefix layout).
+    IDXGIFactory1* f1 = nullptr;
+    IDXGIFactory2* f2 = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&f1))) {
         hookLog("FATAL: CreateDXGIFactory1 failed");
         return;
     }
-    g_factoryVt = *(void***)fac;
-    DWORD old{};
-    // idx 10 = IDXGIFactory::CreateSwapChain, idx 15 = IDXGIFactory2::CreateSwapChainForHwnd
-    if (VirtualProtect(&g_factoryVt[10], sizeof(void*) * 6, PAGE_READWRITE, &old)) {
-        g_origCreate = (PFN_CreateSwapChain)g_factoryVt[10];
-        g_factoryVt[10] = (void*)&HookCreateSwapChain;
-        g_origCreateHwnd = (PFN_CreateSwapChainForHwnd)g_factoryVt[15];
-        g_factoryVt[15] = (void*)&HookCreateSwapChainForHwnd;
-        VirtualProtect(&g_factoryVt[10], sizeof(void*) * 6, old, &old);
-        hookLog("factory hooks installed (CreateSwapChain + CreateSwapChainForHwnd)");
-    } else {
-        hookLog("FATAL: VirtualProtect on factory vtable failed");
+    f1->QueryInterface(__uuidof(IDXGIFactory2), (void**)&f2);
+    void** vt1 = *(void***)f1;
+    patchSlot(vt1, 10, (void*)&HookCreateSwapChain, (void**)&g_origCreate,
+              "factory1 vtable patched (CreateSwapChain)");
+    if (f2) {
+        void** vt2 = *(void***)f2;
+        if (vt2 != vt1) {
+            patchSlot(vt2, 10, (void*)&HookCreateSwapChain, (void**)&g_origCreate,
+                      "factory2 vtable patched (CreateSwapChain)");
+        }
+        // idx 15 = IDXGIFactory2::CreateSwapChainForHwnd
+        patchSlot(vt2, 15, (void*)&HookCreateSwapChainForHwnd, (void**)&g_origCreateHwnd,
+                  "factory2 vtable patched (CreateSwapChainForHwnd)");
+        f2->Release();
     }
-    fac->Release();
+    f1->Release();
 }
 
 static HRESULT WINAPI HookCreateSwapChain(IUnknown* fac, IUnknown* dev,
