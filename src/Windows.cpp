@@ -1997,6 +1997,212 @@ void openColorDialogEx() {   // hotkey D (registered only while calibrating)
     openColorDialog(GetModuleHandleW(nullptr), g_ctl);
 }
 
+// ------------------------------------------------------------------
+// Blend curve editor (the original's "Advanced blend control", Luma
+// channel): shows the selected edge's response curve
+// w(t) = pow(blendCurve(t, gain, slope), gamma), lets the user tweak the
+// three parameters and keep a per-side history. Fade (the band width) is
+// edited on the Blending page - this dialog shapes the ramp response only.
+// R/G/B per-channel curves need a data-model upgrade first (P2).
+static OutputCfg* cfgOutput();   // fwd: defined in the Configure-dialog section
+static HWND g_curveDlg = nullptr;
+static HWND g_cuvSide = nullptr, g_cuvGain = nullptr,
+            g_cuvSlope = nullptr, g_cuvGamma = nullptr;
+struct CurveSnap { float gain, slope, gamma; };
+static CurveSnap g_cuvSnap{ 0, 0, 1 };       // painted snapshot: no lock in paint
+static std::vector<CurveSnap> g_cuvHist[4];  // per-side history, newest last
+
+#define CUV_SIDE     2050
+#define CUV_GAIN     2051
+#define CUV_SLOPE    2052
+#define CUV_GAMMA    2053
+#define CUV_APPLY    2054
+#define CUV_HADD     2055
+#define CUV_HRESTORE 2056
+#define CUV_AREA     2057   // owner-draw static: the curve plot
+
+static int cuvSide() {
+    int s = g_cuvSide ? ComboBox_GetCurSel(g_cuvSide) : -1;
+    return (s < 0 || s > 3) ? 0 : s;
+}
+
+static float cuvEditF(HWND edit) {
+    wchar_t t[32] = L"";
+    GetWindowTextW(edit, t, 32);
+    return (float)_wtof(t);
+}
+
+// load the selected side's parameters from the config into the edits + snapshot
+static void cuvReload() {
+    CurveSnap c{ 0, 0, 1 };
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        OutputCfg* o = cfgOutput();
+        if (o) {
+            const BlendSide& b = o->blend[cuvSide()];
+            c = { b.gain, b.slope, b.gamma };
+        }
+    }
+    wchar_t t[16];
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", c.gain);
+    SetWindowTextW(g_cuvGain, t);
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", c.slope);
+    SetWindowTextW(g_cuvSlope, t);
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", c.gamma);
+    SetWindowTextW(g_cuvGamma, t);
+    g_cuvSnap = c;
+    if (g_curveDlg) InvalidateRect(g_curveDlg, nullptr, TRUE);
+}
+
+// write the edits back into the selected side's blend params
+static void cuvApply() {
+    int side = cuvSide();
+    CurveSnap c{ clampf(cuvEditF(g_cuvGain), 0.0f, 2.0f),
+                 clampf(cuvEditF(g_cuvSlope), 0.0f, 1.0f),
+                 clampf(cuvEditF(g_cuvGamma), 0.1f, 5.0f) };
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        OutputCfg* o = cfgOutput();
+        if (o) {
+            o->blend[side].gain = c.gain;
+            o->blend[side].slope = c.slope;
+            o->blend[side].gamma = c.gamma;
+            g_rev++;
+        }
+    }
+    requestMagBlendSync();   // MAG overlay follows (same as the CMDNET path)
+    g_cuvSnap = c;
+    if (g_curveDlg) InvalidateRect(g_curveDlg, nullptr, TRUE);
+    refreshStatusBar();
+}
+
+static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        CreateWindowW(L"STATIC", L"Side:", WS_CHILD | WS_VISIBLE,
+            246, 13, 34, 18, hwnd, nullptr, nullptr, nullptr);
+        g_cuvSide = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+            284, 8, 120, 200, hwnd, (HMENU)CUV_SIDE, nullptr, nullptr);
+        for (const wchar_t* n : { L"Left", L"Right", L"Top", L"Bottom" })
+            ComboBox_AddString(g_cuvSide, n);
+        ComboBox_SetCurSel(g_cuvSide, 0);
+        static const struct { const wchar_t* name; int id; } prm[3] = {
+            { L"Gain", CUV_GAIN }, { L"Slope", CUV_SLOPE }, { L"Gamma", CUV_GAMMA } };
+        for (int i = 0; i < 3; i++) {
+            CreateWindowW(L"STATIC", prm[i].name, WS_CHILD | WS_VISIBLE,
+                246, 55 + i * 32, 44, 18, hwnd, nullptr, nullptr, nullptr);
+            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.000",
+                WS_CHILD | WS_VISIBLE, 294, 51 + i * 32, 64, 22,
+                hwnd, (HMENU)(INT_PTR)prm[i].id, nullptr, nullptr);
+        }
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        auto* di = (DRAWITEMSTRUCT*)lp;
+        if (!di || di->CtlID != CUV_AREA) break;
+        HDC dc = di->hDC;
+        RECT rc = di->rcItem;
+        FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        // 8x8 grid
+        HPEN grid = CreatePen(PS_SOLID, 1, RGB(48, 48, 48));
+        HPEN oldPen = (HPEN)SelectObject(dc, grid);
+        for (int i = 1; i < 8; i++) {
+            int x = rc.left + (rc.right - rc.left) * i / 8;
+            int y = rc.top + (rc.bottom - rc.top) * i / 8;
+            MoveToEx(dc, x, rc.top, nullptr);
+            LineTo(dc, x, rc.bottom);
+            MoveToEx(dc, rc.left, y, nullptr);
+            LineTo(dc, rc.right, y);
+        }
+        // the response curve, sampled at 128 points
+        HPEN curve = CreatePen(PS_SOLID, 2, RGB(255, 140, 0));
+        SelectObject(dc, curve);
+        int W = rc.right - rc.left, H = rc.bottom - rc.top;
+        for (int i = 0; i <= 128; i++) {
+            float t = i / 128.0f;
+            float w = powf(magBlendCurve(t, g_cuvSnap.gain, g_cuvSnap.slope),
+                           g_cuvSnap.gamma);
+            int x = rc.left + (int)(t * (W - 2)) + 1;
+            int y = rc.bottom - 1 - (int)(clampf(w, 0.0f, 1.0f) * (H - 2));
+            if (i == 0) MoveToEx(dc, x, y, nullptr);
+            else LineTo(dc, x, y);
+        }
+        SelectObject(dc, oldPen);
+        DeleteObject(grid);
+        DeleteObject(curve);
+        return TRUE;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == CUV_SIDE && HIWORD(wp) == CBN_SELCHANGE) cuvReload();
+        else if (id == CUV_APPLY) cuvApply();
+        else if (id == CUV_HADD) {
+            auto& h = g_cuvHist[cuvSide()];
+            h.push_back(g_cuvSnap);
+            if (h.size() > 8) h.erase(h.begin());
+        } else if (id == CUV_HRESTORE) {
+            auto& h = g_cuvHist[cuvSide()];
+            if (!h.empty()) {
+                CurveSnap c = h.back();
+                h.pop_back();
+                wchar_t t[16];
+                _snwprintf_s(t, _TRUNCATE, L"%.3f", c.gain);   SetWindowTextW(g_cuvGain, t);
+                _snwprintf_s(t, _TRUNCATE, L"%.3f", c.slope);  SetWindowTextW(g_cuvSlope, t);
+                _snwprintf_s(t, _TRUNCATE, L"%.3f", c.gamma);  SetWindowTextW(g_cuvGamma, t);
+                cuvApply();
+            }
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        g_curveDlg = nullptr;
+        g_cuvSide = g_cuvGain = g_cuvSlope = g_cuvGamma = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void openCurveDialog(HINSTANCE hInst, HWND owner) {
+    (void)owner;
+    if (g_curveDlg) {
+        SetWindowPos(g_curveDlg, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        return;
+    }
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = CurveDlgProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"IWN_CurveDlg";
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(1 + COLOR_BTNFACE);
+    RegisterClassW(&wc);
+    g_curveDlg = CreateWindowExW(WS_EX_TOPMOST, L"IWN_CurveDlg",
+        L"Blend curve editor (selected projector)",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        180, 180, 430, 300, nullptr, nullptr, hInst, nullptr);
+    if (g_curveDlg) {
+        // the plot + remaining buttons (created here so the dialog frame
+        // exists before we ask for client-relative positions)
+        CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", nullptr,
+            WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+            10, 10, 220, 220, g_curveDlg, (HMENU)CUV_AREA, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Apply",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 148, 100, 26,
+            g_curveDlg, (HMENU)CUV_APPLY, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Add to history",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 186, 120, 24,
+            g_curveDlg, (HMENU)CUV_HADD, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Restore history(0)",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 216, 120, 24,
+            g_curveDlg, (HMENU)CUV_HRESTORE, nullptr, nullptr);
+        cuvReload();
+    }
+}
+
 // ---- Configure display dialog (per-projector, mirrors the original's
 // Bezels / Align / Geometry / Blending / Color / Masking / Help tabs) ----
 static HWND g_cfgDlg = nullptr;
@@ -2025,6 +2231,7 @@ static int g_cfgSel = 0;          // index into g_cfg.outputs shown in the combo
 #define CFG_SLOPE    2124
 #define CFG_BAPPLY   2125
 #define CFG_BALL     2126
+#define CFG_BCURVE   2127   // button: open the blend curve editor
 // color page
 #define CFG_CTB(i)   (2130 + (i))      // 5 trackbars
 #define CFG_CRESET   2136
@@ -2278,6 +2485,8 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 190, 43, 96, 24, p, (HMENU)CFG_BAPPLY, nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"Apply to all 4 edges", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                 190, 78, 150, 22, p, (HMENU)CFG_BALL, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Curve editor...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                190, 112, 150, 24, p, (HMENU)CFG_BCURVE, nullptr, nullptr);
             CreateWindowW(L"STATIC",
                 L"Fade = soft ramp width, Gamma = ramp response.\n"
                 L"Gain/Slope shape the curve: f(x)=(g+1)x / (slope(x-1)+gx+1).\n"
@@ -2448,8 +2657,14 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_rev++;
                 }
             }
+            requestMagBlendSync();   // MAG overlay follows (was missing: the
+                                     // dialog path never reached the overlays)
             cfgReloadBlend();
             refreshStatusBar();
+            return 0;
+        }
+        if (id == CFG_BCURVE) {
+            openCurveDialog(GetModuleHandleW(nullptr), g_cfgDlg);
             return 0;
         }
         if (id == CFG_CRESET) {
