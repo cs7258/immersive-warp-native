@@ -95,6 +95,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             else if (msg.wParam == 5) toggleSnapshot();     // Ctrl+F3
             else if (msg.wParam == 6) openColorDialogEx();  // D (registered while calibrating)
             else if (msg.wParam == 7) toggleInplaceOverlay(); // Ctrl+F9: overlay safety switch
+            else if (msg.wParam == 8) toggleWindowWarping();  // F4: start/stop outputs
+            else if (msg.wParam == 9) toggleInplaceOverlay(); // Ctrl+F4: desktop warping (same switch)
+            else if (msg.wParam >= 10 && msg.wParam <= 17)
+                loadPresetByIndex((int)msg.wParam - 10);      // Ctrl+Shift+1..8: presets
             continue;
         }
         TranslateMessage(&msg);

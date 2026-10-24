@@ -48,6 +48,9 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | Ctrl+F12 | 切换参与融合的边：ALL → 左 → 右 → 上 → 下 → NONE → ALL（随配置保存）；控制台窗口有焦点时直接按 F12 也可（F12 被 Windows 保留给调试器，无法注册为全局热键，所以全局绑定是 Ctrl+F12，另有同名按钮） |
 | Ctrl+F3 | 截图校准：冻结当前捕获帧，在静止画面上对齐；再按恢复实时 |
 | Ctrl+F9 | 原位覆盖（in-place overlay）急停开关：穿透状态下输出窗口点不到，随时 Ctrl+F9 一键开/关（View 菜单与托盘菜单有同步勾选项） |
+| F4 | 窗口扭曲开/关：启动或停止全部输出窗口（Enabled 复选框同步翻转） |
+| Ctrl+F4 | 桌面扭曲开/关：同 Ctrl+F9 的原位覆盖切换（原版语义对齐） |
+| Ctrl+Shift+1..8 | 加载第 N 个命名预设（按预设名 ASCII 序，与 Preset 下拉 / `SAVEAS`/`LOADAS` 同一套文件；无第 N 个预设时状态栏提示） |
 | D | 打开 RGB 高级对话框（亮度/对比度/Gamma R G B），仅在校准状态注册 |
 | Esc | 退出校准 |
 | 方向键 / Shift+方向键 | 微调选中的控制点（1px / 10px） |

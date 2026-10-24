@@ -9,6 +9,7 @@
 #include <cwchar>
 #include <map>
 #include <vector>
+#include <algorithm>
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -1559,6 +1560,25 @@ void toggleInplaceOverlay() {
     refreshStatusBar();
 }
 
+// F4, the original's window-warping switch: start/stop the outputs and flip
+// the Enabled checkbox to match. UI thread only (dispatched from WM_HOTKEY).
+void toggleWindowWarping() {
+    bool on;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        on = !g_cfg.enabled;
+        g_cfg.enabled = on;
+        g_rev++;
+    }
+    if (on) createOutputWindows();
+    else destroyOutputWindows();
+    if (g_ckEnable)
+        Button_SetCheck(g_ckEnable, on ? BST_CHECKED : BST_UNCHECKED);
+    setStatus(on ? L"Output running (F4). Press F3 / Configure alignment to warp."
+                 : L"Output stopped (F4).");
+    refreshStatusBar();
+}
+
 // keep every in-place affordance in step: checkbox, View menu check mark
 // (the tray menu is rebuilt on every right-click, so it reads g_inplace live)
 static void invalidateToolbarToggles();     // fwd: syncInplaceUI calls it
@@ -2993,6 +3013,47 @@ static void applyLoadedConfig() {
     refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
 }
 
+// preset enumeration in name order (Ctrl+Shift+1..8 pick deterministically)
+static std::vector<std::wstring> presetNamesSorted() {
+    std::vector<std::wstring> names;
+    std::wstring file = presetPath("x");
+    std::wstring dir = file.substr(0, file.find_last_of(L'\\') + 1);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*.cfg").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring n = fd.cFileName;
+            if (n.size() > 4 && n.rfind(L".cfg") == n.size() - 4) n = n.substr(0, n.size() - 4);
+            names.push_back(n);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+// Ctrl+Shift+1..8, the original's config-set hotkeys: load the Nth preset in
+// name order. UI thread only (dispatched from WM_HOTKEY in main.cpp).
+void loadPresetByIndex(int idx) {   // 0-based
+    auto names = presetNamesSorted();
+    if (idx < 0 || idx >= (int)names.size()) {
+        wchar_t m[128];
+        wsprintfW(m, L"No preset #%d (%d found). Ctrl+Shift+1..8 load presets in name order.",
+                  idx + 1, (int)names.size());
+        setStatus(m);
+        return;
+    }
+    if (loadConfig(presetPath(toNarrowStr(names[idx].c_str())))) {
+        applyLoadedConfig();
+        wchar_t m[96];
+        wsprintfW(m, L"Preset '%s' loaded (Ctrl+Shift+%d).", names[idx].c_str(), idx + 1);
+        setStatus(m);
+    } else {
+        setStatus(L"Preset load failed.");
+    }
+}
+
 // ---------------- menu bar (File/View/Warping/Help, 1:1 with the original) ----------------
 static HMENU buildMenuBar() {
     HMENU mb = CreateMenu();
@@ -3619,7 +3680,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                     L"Desktop Duplication capture, mesh warp, edge blending,\n"
                     L"masks, CMDNET show control on 127.0.0.1:5252.\n\n"
                     L"Hotkeys: F3 alignment, F10 warp/blend, Ctrl+F12 edges,\n"
-                    L"Ctrl+F3 snapshot, Ctrl+F9 in-place overlay, Esc exit calibration.",
+                    L"Ctrl+F3 snapshot, F4 outputs on/off, Ctrl+F4 desktop warping,\n"
+                    L"Ctrl+Shift+1..8 presets, Ctrl+F9 in-place overlay, Esc exit calibration.",
                     L"About Immersive Warp Native", MB_OK);
             }
             return 0;
@@ -4054,6 +4116,10 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterHotKey(nullptr, 4, MOD_CONTROL, VK_F12);  // cycle blended edges
     RegisterHotKey(nullptr, 5, MOD_CONTROL, VK_F3);   // snapshot (freeze capture)
     RegisterHotKey(nullptr, 7, MOD_CONTROL, VK_F9);   // in-place overlay switch
+    RegisterHotKey(nullptr, 8, 0, VK_F4);             // window warping on/off
+    RegisterHotKey(nullptr, 9, MOD_CONTROL, VK_F4);   // desktop warping (in-place overlay)
+    for (int i = 0; i < 8; i++)                       // Ctrl+Shift+1..8: presets by name order
+        RegisterHotKey(nullptr, 10 + i, MOD_CONTROL | MOD_SHIFT, L'1' + i);
 }
 
 // GET_X_LPARAM / GET_Y_LPARAM come from windowsx.h (included above)
