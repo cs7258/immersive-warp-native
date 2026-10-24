@@ -112,6 +112,10 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "testImg=" << g_cfg.testImg << "\n";
     os << "testAnim=" << g_cfg.testAnim << "\n";
     os << "checker=" << g_cfg.checker << "\n";
+    os << "roi=" << g_cfg.roi[0] << "," << g_cfg.roi[1] << ","
+       << g_cfg.roi[2] << "," << g_cfg.roi[3] << "\n";
+    os << "roiCircle=" << g_cfg.roiCircle << "\n";
+    os << "roiBorder=" << g_cfg.roiBorder << "\n";
     os << "cmdnet=" << g_cfg.cmdnet << "\n";
     os << "cmdnetPort=" << g_cfg.cmdnetPort << "\n";
     os << "sampling=" << g_cfg.sampling << "\n";
@@ -192,6 +196,14 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "testImg") c.testImg = atoi(val.c_str());
         else if (key == "testAnim") { c.testAnim = atoi(val.c_str()); if (c.testAnim < 0 || c.testAnim > 3) c.testAnim = 0; }
         else if (key == "checker") { c.checker = atoi(val.c_str()) != 0; }
+        else if (key == "roi") {
+            // L,T,R,B inset pixels, comma separated (missing fields = 0)
+            int v[4] = { 0, 0, 0, 0 };
+            if (sscanf_s(val.c_str(), "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]) >= 1)
+                for (int i = 0; i < 4; i++) c.roi[i] = (std::max)(0, (std::min)(v[i], 2048));
+        }
+        else if (key == "roiCircle") { c.roiCircle = atoi(val.c_str()) != 0; }
+        else if (key == "roiBorder") { c.roiBorder = (std::max)(0, (std::min)(atoi(val.c_str()), 64)); }
         else if (key == "cmdnet") c.cmdnet = atoi(val.c_str());
         else if (key == "cmdnetPort") c.cmdnetPort = atoi(val.c_str());
         else if (key == "sampling") c.sampling = atoi(val.c_str());

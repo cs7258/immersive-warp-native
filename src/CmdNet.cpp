@@ -190,6 +190,21 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return std::string("OK checker=") + (g_cfg.checker ? "on" : "off") + "\n";
         }
+        if (k == "roi") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            char b[64];
+            sprintf_s(b, "OK roi=%d,%d,%d,%d\n",
+                      g_cfg.roi[0], g_cfg.roi[1], g_cfg.roi[2], g_cfg.roi[3]);
+            return b;
+        }
+        if (k == "roicircle") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return std::string("OK roicircle=") + (g_cfg.roiCircle ? "on" : "off") + "\n";
+        }
+        if (k == "roiborder") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK roiborder=" + std::to_string(g_cfg.roiBorder) + "\n";
+        }
         if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
         if (k == "layout") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -270,6 +285,11 @@ static std::string dispatch(std::string line) {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 s += "testanim=" + std::to_string(g_cfg.testAnim) + ";";
                 s += std::string("checker=") + (g_cfg.checker ? "on" : "off") + ";";
+                char rb[64];
+                sprintf_s(rb, "roi=%d,%d,%d,%d;", g_cfg.roi[0], g_cfg.roi[1], g_cfg.roi[2], g_cfg.roi[3]);
+                s += rb;
+                s += std::string("roicircle=") + (g_cfg.roiCircle ? "on" : "off") + ";";
+                s += "roiborder=" + std::to_string(g_cfg.roiBorder) + ";";
             }
             s += std::string("testpause=") + (g_testPause.load() ? "on" : "off") + ";";
             s += std::string("autostart=") + (queryAutostart() ? "on" : "off") + ";";
@@ -404,12 +424,15 @@ static std::string dispatch(std::string line) {
         // the end, so older parsers reading "key=value;" pairs keep working.
         int edges = 15, outs = 0, masks = 0;
         int layoutC = 1, layoutR = 1, overlap = 0, eng = 0, testAnim = 0, checker = 0;
+        int roiL = 0, roiT = 0, roiR = 0, roiB = 0, roiCir = 0, roiBrd = 0;
         bool curved = false, tp = false;
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             layoutC = g_cfg.layoutC; layoutR = g_cfg.layoutR; overlap = g_cfg.overlap;
             curved = g_cfg.curved != 0; tp = g_cfg.testPattern;
             eng = g_cfg.engine; testAnim = g_cfg.testAnim; checker = g_cfg.checker;
+            roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1]; roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
+            roiCir = g_cfg.roiCircle; roiBrd = g_cfg.roiBorder;
             for (auto& o : g_cfg.outputs) if (o.enabled) {
                 outs++;
                 if (outs == 1) { edges = o.edges; masks = (int)o.masks.size(); }
@@ -436,6 +459,10 @@ static std::string dispatch(std::string line) {
                ";testanim=" + std::to_string(testAnim) +
                ";testpause=" + std::string(g_testPause.load() ? "on" : "off") +
                ";checker=" + std::string(checker ? "on" : "off") +
+               ";roi=" + std::to_string(roiL) + "," + std::to_string(roiT) + "," +
+                          std::to_string(roiR) + "," + std::to_string(roiB) +
+               ";roicircle=" + std::string(roiCir ? "on" : "off") +
+               ";roiborder=" + std::to_string(roiBrd) +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
@@ -545,6 +572,7 @@ static std::string dispatch(std::string line) {
             refreshAnimUI(g_cfg.testAnim, g_testPause.load());   // animation combo follows
             refreshCheckerUI(g_cfg.checker != 0);                // checker checkbox follows
         }
+        refreshRoiUI();   // ROI edits follow the loaded config
         int outs = 0;
         refreshStatusBar();
         {
@@ -1037,6 +1065,26 @@ static std::string dispatch(std::string line) {
                 g_cfg.checker = want;
                 applied = true;
                 refreshCheckerUI(want);   // Image-page checkbox follows
+            }
+            if (!applied && key == "roi") {
+                // L,T,R,B inset px, comma separated (missing fields = 0)
+                int v[4] = { 0, 0, 0, 0 };
+                if (sscanf_s(val.c_str(), "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]) < 1)
+                    return "ERR SET roi=l,t,r,b\n";
+                for (int i = 0; i < 4; i++)
+                    g_cfg.roi[i] = (std::max)(0, (std::min)(v[i], 2048));
+                applied = true;
+                refreshRoiUI();   // Image-page edits follow (marshalled)
+            }
+            if (!applied && key == "roicircle") {
+                g_cfg.roiCircle = (val == "ON" || val == "1" || val == "true");
+                applied = true;
+                refreshRoiUI();
+            }
+            if (!applied && key == "roiborder") {
+                g_cfg.roiBorder = (std::max)(0, (std::min)(atoi(val.c_str()), 64));
+                applied = true;
+                refreshRoiUI();
             }
             if (!applied && key == "probe") {
                 g_probe.store(val == "ON" || val == "1" || val == "true");

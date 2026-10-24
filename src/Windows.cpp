@@ -42,6 +42,59 @@ static void populateOvrSrcCombo();          // fwd: refreshList tail + WM_OVRSYN
 // 24x16 checker, 12x8 grid lines, red border, green center cross. Drawn in
 // an overlay on top of the magnifier host because the MAG engine has no
 // render pipeline of its own.
+// The test-pattern artwork itself, drawn into (ox,oy)-(ox+w,oy+h). Kept as a
+// helper so the ROI path can draw it clipped inside the region of interest.
+static void paintTestPatternDC(HDC dc, int ox, int oy, int W, int H) {
+    // 24x16 checker (same greys as the shader)
+    for (int row = 0; row < 16; row++)
+        for (int col = 0; col < 24; col++) {
+            if ((col + row) % 2 == 0) continue;
+            RECT cell{ ox + col * W / 24, oy + row * H / 16,
+                       ox + (col + 1) * W / 24, oy + (row + 1) * H / 16 };
+            HBRUSH b = CreateSolidBrush(RGB(97, 97, 97));   // 0.38
+            FillRect(dc, &cell, b);
+            DeleteObject(b);
+        }
+    // base 0.06 grey where the checker is dark
+    HBRUSH dark = CreateSolidBrush(RGB(15, 15, 15));
+    for (int row = 0; row < 16; row++)
+        for (int col = 0; col < 24; col++) {
+            if ((col + row) % 2 != 0) continue;
+            RECT cell{ ox + col * W / 24, oy + row * H / 16,
+                       ox + (col + 1) * W / 24, oy + (row + 1) * H / 16 };
+            FillRect(dc, &cell, dark);
+        }
+    DeleteObject(dark);
+    // 12x8 grid lines
+    HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(217, 217, 217));   // 0.85
+    HGDIOBJ oldPen = SelectObject(dc, gridPen);
+    for (int c = 1; c < 12; c++) {
+        MoveToEx(dc, ox + c * W / 12, oy, nullptr);
+        LineTo(dc, ox + c * W / 12, oy + H);
+    }
+    for (int r = 1; r < 8; r++) {
+        MoveToEx(dc, ox, oy + r * H / 8, nullptr);
+        LineTo(dc, ox + W, oy + r * H / 8);
+    }
+    SelectObject(dc, oldPen);
+    DeleteObject(gridPen);
+    // red border
+    HPEN redPen = CreatePen(PS_SOLID, 3, RGB(255, 64, 64));
+    oldPen = SelectObject(dc, redPen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, ox + 1, oy + 1, ox + W - 1, oy + H - 1);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(redPen);
+    // green center cross
+    HPEN greenPen = CreatePen(PS_SOLID, 1, RGB(38, 255, 38));
+    oldPen = SelectObject(dc, greenPen);
+    MoveToEx(dc, ox + W / 2, oy, nullptr); LineTo(dc, ox + W / 2, oy + H);
+    MoveToEx(dc, ox, oy + H / 2, nullptr); LineTo(dc, ox + W, oy + H / 2);
+    SelectObject(dc, oldPen);
+    DeleteObject(greenPen);
+}
+
 static LRESULT CALLBACK MagTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
     if (msg == WM_ERASEBKGND) return 1;
@@ -50,54 +103,42 @@ static LRESULT CALLBACK MagTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         HDC dc = BeginPaint(hwnd, &ps);
         RECT rc; GetClientRect(hwnd, &rc);
         int W = rc.right, H = rc.bottom;
-        // 24x16 checker (same greys as the shader)
-        for (int row = 0; row < 16; row++)
-            for (int col = 0; col < 24; col++) {
-                if ((col + row) % 2 == 0) continue;
-                RECT cell{ col * W / 24, row * H / 16,
-                           (col + 1) * W / 24, (row + 1) * H / 16 };
-                HBRUSH b = CreateSolidBrush(RGB(97, 97, 97));   // 0.38
-                FillRect(dc, &cell, b);
-                DeleteObject(b);
-            }
-        // base 0.06 grey where the checker is dark
-        HBRUSH dark = CreateSolidBrush(RGB(15, 15, 15));
-        for (int row = 0; row < 16; row++)
-            for (int col = 0; col < 24; col++) {
-                if ((col + row) % 2 != 0) continue;
-                RECT cell{ col * W / 24, row * H / 16,
-                           (col + 1) * W / 24, (row + 1) * H / 16 };
-                FillRect(dc, &cell, dark);
-            }
-        DeleteObject(dark);
-        // 12x8 grid lines
-        HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(217, 217, 217));   // 0.85
-        HGDIOBJ oldPen = SelectObject(dc, gridPen);
-        for (int c = 1; c < 12; c++) {
-            MoveToEx(dc, c * W / 12, 0, nullptr);
-            LineTo(dc, c * W / 12, H);
+        // image-area ROI (mirrors the shader pass): insets in output px,
+        // optional inscribed circle, optional green border line
+        int roiL, roiT, roiR, roiB, cir, brd;
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1];
+            roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
+            cir = g_cfg.roiCircle; brd = g_cfg.roiBorder;
         }
-        for (int r = 1; r < 8; r++) {
-            MoveToEx(dc, 0, r * H / 8, nullptr);
-            LineTo(dc, W, r * H / 8);
+        bool hasRoi = (roiL + roiR) > 0 || (roiT + roiB) > 0 || cir || brd;
+        int rx0 = roiL, ry0 = roiT, rx1 = W - roiR, ry1 = H - roiB;
+        if (!hasRoi) {
+            paintTestPatternDC(dc, 0, 0, W, H);
+        } else if (rx1 <= rx0 || ry1 <= ry0) {
+            HBRUSH b = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(dc, &rc, b);
+            DeleteObject(b);
+        } else {
+            // black backdrop, pattern clipped to the ROI (rectangle or circle)
+            HBRUSH b = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(dc, &rc, b);
+            DeleteObject(b);
+            HRGN rgn = cir ? CreateEllipticRgn(rx0, ry0, rx1, ry1)
+                           : CreateRectRgn(rx0, ry0, rx1, ry1);
+            SaveDC(dc);
+            SelectClipRgn(dc, rgn);
+            paintTestPatternDC(dc, rx0, ry0, rx1 - rx0, ry1 - ry0);
+            SelectClipRgn(dc, nullptr);
+            RestoreDC(dc, -1);
+            if (brd > 0) {   // green border inside the ROI edge
+                HBRUSH gb = CreateSolidBrush(RGB(38, 255, 38));
+                FrameRgn(dc, rgn, gb, brd, brd);
+                DeleteObject(gb);
+            }
+            DeleteObject(rgn);
         }
-        SelectObject(dc, oldPen);
-        DeleteObject(gridPen);
-        // red border
-        HPEN redPen = CreatePen(PS_SOLID, 3, RGB(255, 64, 64));
-        oldPen = SelectObject(dc, redPen);
-        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, 1, 1, W - 1, H - 1);
-        SelectObject(dc, oldPen);
-        SelectObject(dc, oldBrush);
-        DeleteObject(redPen);
-        // green center cross
-        HPEN greenPen = CreatePen(PS_SOLID, 1, RGB(38, 255, 38));
-        oldPen = SelectObject(dc, greenPen);
-        MoveToEx(dc, W / 2, 0, nullptr); LineTo(dc, W / 2, H);
-        MoveToEx(dc, 0, H / 2, nullptr); LineTo(dc, W, H / 2);
-        SelectObject(dc, oldPen);
-        DeleteObject(greenPen);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1271,6 +1312,7 @@ constexpr UINT WM_MAGPROBE = WM_APP + 17;     // probe markers toggled off-threa
 constexpr UINT WM_BLACKOUT = WM_APP + 18;     // blackout toggled off-thread
 constexpr UINT WM_OVRSYNC = WM_APP + 20;      // per-output source override UI sync
 constexpr UINT WM_SBFRESH = WM_APP + 21;      // status bar refresh from off-thread
+constexpr UINT WM_ROISYNC = WM_APP + 22;      // ROI edits resync from off-thread
                                               // WM_DISPLAYCHANGE (the handler
                                               // must not do heavy work inline)
 static DWORD uiThreadId = 0;
@@ -1388,6 +1430,9 @@ static HWND g_cbImg = nullptr;
 static HWND g_cbAnim = nullptr;    // test-pattern animation direction
 static HWND g_ckPause = nullptr;   // test-pattern pause (session-only)
 static HWND g_ckCheck = nullptr;   // checker overlay 20x10
+static HWND g_edRoi[4] = { nullptr, nullptr, nullptr, nullptr };   // L,T,R,B inset px
+static HWND g_ckRoiCir = nullptr;  // ROI inscribed circle
+static HWND g_edRoiBrd = nullptr;  // ROI border width px
 
 static void setStatus(const wchar_t* s) {
     if (g_status) SetWindowTextW(g_status, s);
@@ -1732,6 +1777,16 @@ void notifyOutputRaised() {
 #define IDC_CBANIM    1037   // test-pattern animation direction dropdown
 #define IDC_CKPAUSE   1038   // test-pattern pause checkbox (session-only)
 #define IDC_CKCHECK   1039   // checker overlay 20x10 checkbox
+#define IDC_EDROIL    1040   // ROI inset edit: left px
+#define IDC_EDROIT    1041   // ROI inset edit: top px
+#define IDC_EDROIR    1042   // ROI inset edit: right px
+#define IDC_EDROIB    1043   // ROI inset edit: bottom px
+#define IDC_CKROICIR  1044   // ROI full-circle checkbox
+#define IDC_EDROIBRD  1045   // ROI border width edit (px)
+#define IDC_ROIAPPLY  1046   // ROI Apply button
+#define IDC_ROISYNCLR 1047   // ROI Sync Left/Right button
+#define IDC_ROISYNCTB 1048   // ROI Sync Top/Bottom button
+#define IDC_ROIRESET  1049   // ROI Reset button
 // (menu bar IDM_* ids live above showTab, see the note there)
 
 static void refreshList() {
@@ -1919,6 +1974,53 @@ void refreshAnimUI(int anim, bool paused) {
 void refreshCheckerUI(bool on) {
     // same family as refreshAnimUI: no internal locking, plain PostMessage
     PostMessageW(g_ckCheck, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+// ---- image-area ROI (test image L/T/R/B px insets + circle + border) ----
+
+// cfg -> edits (UI thread). MAG test overlays repaint on the next paint;
+// nudge them so the change is immediate.
+static void roiReloadNow() {
+    int v[4] = { 0, 0, 0, 0 }, cir = 0, brd = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (int i = 0; i < 4; i++) v[i] = g_cfg.roi[i];
+        cir = g_cfg.roiCircle; brd = g_cfg.roiBorder;
+    }
+    wchar_t t[16];
+    for (int i = 0; i < 4; i++) {
+        _snwprintf_s(t, _TRUNCATE, L"%d", v[i]);
+        SetWindowTextW(g_edRoi[i], t);
+    }
+    Button_SetCheck(g_ckRoiCir, cir ? BST_CHECKED : BST_UNCHECKED);
+    _snwprintf_s(t, _TRUNCATE, L"%d", brd);
+    SetWindowTextW(g_edRoiBrd, t);
+    for (HWND w : g_magTests) InvalidateRect(w, nullptr, FALSE);
+    if (g_curveDlg) InvalidateRect(g_curveDlg, nullptr, FALSE);
+}
+
+// edits -> cfg (UI thread). Values are the raw px insets; the shader clamps
+// geometrically (empty ROI renders black).
+static void roiApplyNow() {
+    int v[4];
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (int i = 0; i < 4; i++)
+            g_cfg.roi[i] = (std::max)(0, (std::min)(GetDlgItemInt(g_ctl, IDC_EDROIL + i, nullptr, TRUE), 2048));
+        g_cfg.roiCircle = Button_GetCheck(g_ckRoiCir) == BST_CHECKED;
+        g_cfg.roiBorder = (std::max)(0, (std::min)(GetDlgItemInt(g_ctl, IDC_EDROIBRD, nullptr, TRUE), 64));
+        for (int i = 0; i < 4; i++) v[i] = g_cfg.roi[i];
+        g_rev++;
+    }
+    wchar_t msg[96];
+    wsprintfW(msg, L"ROI insets: %d/%d/%d/%d px (test image).",
+              v[0], v[1], v[2], v[3]);
+    setStatus(msg);
+}
+
+void refreshRoiUI() {
+    // socket thread safe: marshal to the UI thread (edits are UI-owned)
+    if (g_ctl) PostMessageW(g_ctl, WM_ROISYNC, 0, 0);
 }
 
 void requestOutputRebuild() {
@@ -3169,6 +3271,7 @@ static void applyLoadedConfig() {
     ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
     ComboBox_SetCurSel(g_cbAnim, g_cfg.testAnim);   // animation direction follows the load
     Button_SetCheck(g_ckCheck, g_cfg.checker ? BST_CHECKED : BST_UNCHECKED);
+    roiReloadNow();   // ROI edits follow the load
     // g_testPause is session-only: keep the checkbox as-is on Load Config
     ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
     syncLayoutCombos();
@@ -3660,6 +3763,38 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         add(PAGE_IMAGE, g_ckCheck = CreateWindowW(L"BUTTON", L"Checker 20x10",
             WS_CHILD | BS_AUTOCHECKBOX, 330, 114, 140, 24,
             hwnd, (HMENU)IDC_CKCHECK, nullptr, nullptr));
+        // image-area ROI row (the original's Top/Left/Right/Bottom px +
+        // Full circle + Border px + Sync buttons). Insets in output px,
+        // applied on Apply (or the sync/reset helpers).
+        add(PAGE_IMAGE, CreateWindowW(L"STATIC", L"ROI px L/T/R/B:",
+            WS_CHILD | SS_LEFT, 16, 152, 100, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        for (int i = 0; i < 4; i++)
+            add(PAGE_IMAGE, g_edRoi[i] = CreateWindowW(L"EDIT", L"0",
+                WS_CHILD | WS_BORDER | ES_NUMBER,
+                118 + i * 52, 148, 46, 24,
+                hwnd, (HMENU)(IDC_EDROIL + i), nullptr, nullptr));
+        add(PAGE_IMAGE, g_ckRoiCir = CreateWindowW(L"BUTTON", L"Circle",
+            WS_CHILD | BS_AUTOCHECKBOX, 330, 148, 70, 24,
+            hwnd, (HMENU)IDC_CKROICIR, nullptr, nullptr));
+        add(PAGE_IMAGE, CreateWindowW(L"STATIC", L"Border:",
+            WS_CHILD | SS_LEFT, 404, 152, 46, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_IMAGE, g_edRoiBrd = CreateWindowW(L"EDIT", L"0",
+            WS_CHILD | WS_BORDER | ES_NUMBER, 452, 148, 40, 24,
+            hwnd, (HMENU)IDC_EDROIBRD, nullptr, nullptr));
+        add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Apply",
+            WS_CHILD | BS_PUSHBUTTON, 498, 146, 62, 26,
+            hwnd, (HMENU)IDC_ROIAPPLY, nullptr, nullptr));
+        add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Sync L/R",
+            WS_CHILD | BS_PUSHBUTTON, 16, 180, 76, 26,
+            hwnd, (HMENU)IDC_ROISYNCLR, nullptr, nullptr));
+        add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Sync T/B",
+            WS_CHILD | BS_PUSHBUTTON, 98, 180, 76, 26,
+            hwnd, (HMENU)IDC_ROISYNCTB, nullptr, nullptr));
+        add(PAGE_IMAGE, CreateWindowW(L"BUTTON", L"Reset",
+            WS_CHILD | BS_PUSHBUTTON, 180, 180, 60, 26,
+            hwnd, (HMENU)IDC_ROIRESET, nullptr, nullptr));
 
         // --- Settings page
         add(PAGE_SETTINGS, g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
@@ -3760,6 +3895,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             Button_SetCheck(g_ckPause, g_testPause.load() ? BST_CHECKED : BST_UNCHECKED);
             Button_SetCheck(g_ckCheck, g_cfg.checker ? BST_CHECKED : BST_UNCHECKED);
         }
+        roiReloadNow();   // ROI edits start from the loaded config
         populateSourceCombo();   // locks g_cfgMutex itself
         populateOvrSrcCombo();   // per-output override combo (list has no selection yet)
         syncLayoutCombos();
@@ -3778,6 +3914,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     case WM_SBFRESH:    // status bar refresh requested from the socket thread
         refreshStatusBar();
+        return 0;
+    case WM_ROISYNC:    // ROI changed from the socket thread: resync the edits
+        roiReloadNow();
         return 0;
     case WM_INPLACESET: {   // in-place overlay toggled (UI or socket thread):
         // only the window style changes, but CreateWindowExW takes the full
@@ -4142,6 +4281,33 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             for (HWND m : g_magMasks) PostMessageW(m, WM_TIMER, 1, 0);
             setStatus(g_cfg.checker ? L"Checker overlay 20x10: ON."
                                     : L"Checker overlay 20x10: OFF.");
+        } else if (id == IDC_ROIAPPLY && HIWORD(wp) == BN_CLICKED) {
+            roiApplyNow();
+        } else if (id == IDC_ROISYNCLR && HIWORD(wp) == BN_CLICKED) {
+            // mirror L<->R (and T<->B for the TB variant) then commit like Apply
+            int l = GetDlgItemInt(g_ctl, IDC_EDROIL, nullptr, TRUE);
+            int r = GetDlgItemInt(g_ctl, IDC_EDROIR, nullptr, TRUE);
+            int m = (l + r) / 2;
+            wchar_t t[16];
+            _snwprintf_s(t, _TRUNCATE, L"%d", m);
+            SetWindowTextW(g_edRoi[0], t);
+            SetWindowTextW(g_edRoi[2], t);
+            roiApplyNow();
+        } else if (id == IDC_ROISYNCTB && HIWORD(wp) == BN_CLICKED) {
+            int t2 = GetDlgItemInt(g_ctl, IDC_EDROIT, nullptr, TRUE);
+            int b = GetDlgItemInt(g_ctl, IDC_EDROIB, nullptr, TRUE);
+            int m = (t2 + b) / 2;
+            wchar_t t[16];
+            _snwprintf_s(t, _TRUNCATE, L"%d", m);
+            SetWindowTextW(g_edRoi[1], t);
+            SetWindowTextW(g_edRoi[3], t);
+            roiApplyNow();
+        } else if (id == IDC_ROIRESET && HIWORD(wp) == BN_CLICKED) {
+            for (int i = 0; i < 4; i++) SetWindowTextW(g_edRoi[i], L"0");
+            SetWindowTextW(g_edRoiBrd, L"0");
+            Button_SetCheck(g_ckRoiCir, BST_UNCHECKED);
+            roiApplyNow();
+            setStatus(L"ROI reset (test image fills the output).");
         } else if (id == IDC_CBSAMP && HIWORD(wp) == CBN_SELCHANGE) {
             int sel = ComboBox_GetCurSel(g_cbSamp);
             if (sel >= 0) {

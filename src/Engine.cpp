@@ -54,6 +54,8 @@ cbuffer FrameCB : register(b0) {
     float4 sampInfo;        // x=bicubic on, y=srcW, z=srcH (for catmull-rom)
     float4 animT;           // dynamic test pattern: x=on, y=phase 0..1, zw=scroll dir
     float4 overlay;         // x=checker 20x10 on, yz=output resolution px
+    float4 roiPx;           // test-image ROI insets: L,T,R,B (output px)
+    float4 roiMode;         // x=inscribed circle, y=border width px
 }
 // parametric blend curve: f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1).
 // gain=0, slope=0 -> f(x)=x (the plain linear ramp); slope=1 -> hard step;
@@ -151,7 +153,35 @@ float4 main(VOut i, float4 px : SV_Position) : SV_Target {
         else if (sampInfo.x > 0.5 && sampInfo.y > 0 && sampInfo.z > 0)
             c = sampleBicubic(uv, sampInfo.yz);
         else c = tex.Sample(samp, uv).rgb;
-    } else c = testPattern(i.nom, animT);
+    } else {
+        c = testPattern(i.nom, animT);
+        // Image area ROI (the original's Top/Left/Right/Bottom px + Full
+        // circle + Border): confine the test image to the region of interest,
+        // rescaling the pattern to fill it. Capture/image sources unaffected.
+        if (overlay.y > 0 && overlay.z > 0) {
+            float2 res = overlay.yz;
+            float2 lo = roiPx.xy / res, hi = 1.0 - roiPx.zw / res;
+            bool hasRoi = (roiPx.x + roiPx.z) > 0 || (roiPx.y + roiPx.w) > 0
+                       || roiMode.x > 0.5 || roiMode.y > 0.5;
+            if (hasRoi) {
+                bool inside = all(i.nom >= lo) && all(i.nom <= hi);
+                if (roiMode.x > 0.5) {   // full circle: the ROI's inscribed ellipse
+                    float2 q = (i.nom - (lo + hi) * 0.5) / max((hi - lo) * 0.5, 1e-5);
+                    inside = inside && dot(q, q) <= 1.0;
+                }
+                if (!inside) c = 0;
+                else {
+                    float2 p2 = (i.nom - lo) / max(hi - lo, 1e-5);   // pattern fills the ROI
+                    c = testPattern(p2, animT);
+                    if (roiMode.y > 0.5) {   // green border line inside the ROI edge
+                        float2 bn = float2(roiMode.y, roiMode.y) / res;
+                        float2 din = min(i.nom - lo, hi - i.nom);
+                        if (min(din.x, din.y) < bn.x) c = float3(0.15, 1, 0.15);
+                    }
+                }
+            }
+        }
+    }
     c = pow(saturate(c), color.rgb);
     c = (c - 0.5) * contrast + 0.5;
     c *= color.w;
@@ -1026,6 +1056,8 @@ struct FrameCBData {
     float sampInfo[4];   // x=bicubic on, y=srcW, z=srcH
     float animT[4];      // dynamic pattern: x=on, y=phase, zw=scroll dir
     float overlay[4];    // x=checker 20x10 on, yz=output resolution px
+    float roiPx[4];      // test-image ROI insets L,T,R,B (output px)
+    float roiMode[4];    // x=inscribed circle, y=border width px
 };
 static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
@@ -1109,6 +1141,11 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
     // checker overlay: screen-space, so the PS needs the output pixel size
     d.overlay[0] = g_cfg.checker ? 1.0f : 0.0f;
     d.overlay[1] = (float)oc.w; d.overlay[2] = (float)oc.h;
+    // image-area ROI (test image only; insets in output px)
+    d.roiPx[0] = (float)g_cfg.roi[0]; d.roiPx[1] = (float)g_cfg.roi[1];
+    d.roiPx[2] = (float)g_cfg.roi[2]; d.roiPx[3] = (float)g_cfg.roi[3];
+    d.roiMode[0] = g_cfg.roiCircle ? 1.0f : 0.0f;
+    d.roiMode[1] = (float)g_cfg.roiBorder;
 
     D3D11_MAPPED_SUBRESOURCE mp{};
     m_ctx->Map(oc.frameCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp);
