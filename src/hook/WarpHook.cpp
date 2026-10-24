@@ -437,6 +437,81 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
 // Present would be invisible. The VEH publishes first-chance exception info
 // through the shared mapping (reserved[1]=code, reserved[2]=tid) which the
 // host can read via `GET hook` even if the process dies right after.
+// The bare ExceptionAddress always lands in KERNELBASE!RaiseException for
+// MSVC C++ throws, so we additionally decode the ThrowInfo (x64 EH v4 uses
+// image-relative offsets) into the exception TYPE NAME and scan the stack
+// for the throwing module - the type name alone usually fingers the cause.
+
+// MSVC x64 EH v4 lite layouts - all cross-references are 32-bit RVAs
+struct TiLite { DWORD attr; int unwind; int fwd; int ctaRva; };
+struct CtaLite { int n; int rvas[1]; };
+struct CtLite { DWORD props; int typeRva; int mdisp; int pdisp; int vdisp;
+                int sizeOff; int copyFn; };
+struct TdLite { void* vf; void* spare; char name[80]; };
+
+static void logThrowType(PEXCEPTION_POINTERS ep) {
+    __try {
+        ULONG_PTR* ei = ep->ExceptionRecord->ExceptionInformation;
+        if (ei[0] != 0x19930520u) { hookLog("throw: unknown magic"); return; }
+        // find the throwing module: walk the stack, keep distinct module
+        // bases in frame order; the first two are the RaiseException plumbing
+        // (KERNELBASE, ntdll), the third distinct base is the thrower
+        void* dum = nullptr;
+        UINT64* sp = (UINT64*)ep->ContextRecord->Rsp;
+        void* seen[4] = {}; int nSeen = 0;
+        void* ownerMb = nullptr;
+        for (int i = 0; i < 128 && !ownerMb; i++) {
+            void* mb = RtlPcToFileHeader((PVOID)sp[i], &dum);
+            if (!mb) continue;
+            ULONGLONG off = (ULONGLONG)sp[i] - (ULONGLONG)mb;
+            if (off < 0x1000 || off > 0x2000000) continue;
+            bool known = false;
+            for (int k = 0; k < nSeen; k++) if (seen[k] == mb) { known = true; break; }
+            if (!known && nSeen < 4) seen[nSeen++] = mb;
+            if (nSeen >= 3) ownerMb = seen[nSeen - 1];   // past raise plumbing
+        }
+        if (!ownerMb) { hookLog("throw: no owner module found"); return; }
+        const TiLite* ti = (const TiLite*)((const BYTE*)ownerMb + (DWORD)ei[1]);
+        if (ti->ctaRva <= 0) { hookLog("throw: no catchable types"); return; }
+        const CtaLite* cta = (const CtaLite*)((const BYTE*)ownerMb + ti->ctaRva);
+        if (cta->n <= 0) { hookLog("throw: empty cta"); return; }
+        const CtLite* ct = (const CtLite*)((const BYTE*)ownerMb + cta->rvas[0]);
+        const TdLite* td = (const TdLite*)((const BYTE*)ownerMb + ct->typeRva);
+        char buf[112];
+        wsprintfA(buf, "throw type: %.70s", td->name);
+        hookLog(buf);
+        char buf2[112];
+        wsprintfA(buf2, "throw module: %p", ownerMb);
+        hookLog(buf2);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hookLog("throw type: parse fault");
+    }
+}
+
+static void logStackScan(PEXCEPTION_POINTERS ep) {
+    __try {
+        UINT64* sp = (UINT64*)ep->ContextRecord->Rsp;
+        char buf[80];
+        int n = 0;
+        void* seen[6] = {}; int nSeen = 0;
+        for (int i = 0; i < 96 && n < 6; i++) {
+            void* mb = RtlPcToFileHeader((PVOID)sp[i], nullptr);
+            if (!mb) continue;
+            ULONGLONG off = (ULONGLONG)sp[i] - (ULONGLONG)mb;
+            if (off < 0x1000 || off > 0x2000000) continue;
+            bool known = false;
+            for (int k = 0; k < nSeen; k++) if (seen[k] == mb) { known = true; break; }
+            if (known) continue;
+            if (nSeen < 6) seen[nSeen++] = mb;
+            wsprintfA(buf, "stack mod: %p off=0x%X", mb, (DWORD)off);
+            hookLog(buf);
+            n++;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hookLog("stack scan fault");
+    }
+}
+
 static LONG WINAPI excFilter(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != 0xE06D7363 && code != 0xC0000005) return EXCEPTION_CONTINUE_SEARCH;
@@ -458,6 +533,8 @@ static LONG WINAPI excFilter(PEXCEPTION_POINTERS ep) {
         wsprintfA(buf, "EXC code=0x%08X addr=%p mod=%p off=0x%X tid=%u",
                   code, pc, modBase, off, (unsigned)GetCurrentThreadId());
         hookLog(buf);
+        logStackScan(ep);
+        if (code == 0xE06D7363) logThrowType(ep);
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
