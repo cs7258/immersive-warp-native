@@ -56,7 +56,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | 方向键 / Shift+方向键 | 微调选中的控制点（1px / 10px） |
 | 滚轮 | 融合模式下调该边 Gamma |
 
-状态栏（控制台底部）实时显示（1 秒刷新）：`Projector: N [i]` / 模式 / Snapshot / `Color balancing: R() G() B()` / 当前融合边 / 捕获源 / `Engine: 59.9 fps  frame 2.31 ms (cap 1.42 + draw 0.87)  uptime hh:mm:ss`（渲染健康与逐段帧耗时，与 `GET perf` 同源）。
+状态栏（控制台底部）实时显示（1 秒刷新）：`Projector: N [i]` / 模式 / Snapshot / Preview / In-place / Engine / `Warping: ACTIVE|idle`（输出窗口活性，对齐原版右上角 Desktop warping ENABLED/DISABLED 语义）/ `Blackout: ON`（仅黑场时显示，对齐原版右上角 Blackout 项）/ `Color balancing: R() G() B()` / 当前融合边 / 捕获源 / `Engine: 59.9 fps  frame 2.31 ms (cap 1.42 + draw 0.87)  uptime hh:mm:ss`（渲染健康与逐段帧耗时，与 `GET perf` 同源）。
 
 ## 单屏模式（无投影仪也能用）
 

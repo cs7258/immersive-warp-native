@@ -176,6 +176,10 @@ extern std::atomic<bool> g_blackout;
 // window reposts itself into a deferred rebuild of the output windows; the
 // counter is read back via GET dispchange for test/observability.
 extern std::atomic<int> g_dispChange;
+// live output-window count, maintained by the UI thread wherever g_outWins
+// gains/loses entries. The status bar (also refreshed from socket threads)
+// reads this instead of touching the g_outWins vector itself.
+extern std::atomic<int> g_outCount;
 
 struct DisplayInfo {
     std::wstring deviceName, label;

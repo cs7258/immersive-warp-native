@@ -20,6 +20,7 @@ std::atomic<bool> g_blackout{ false };
 // periodic perf snapshot into debug.log (SET perflog=on; 1 line / 10 s)
 std::atomic<bool> g_perfLog{ false };
 std::atomic<int>  g_dispChange{ 0 };
+std::atomic<int>  g_outCount{ 0 };    // live output windows, UI-thread maintained
 
 std::vector<DisplayInfo> enumerateDisplays() {
     std::vector<DisplayInfo> result;

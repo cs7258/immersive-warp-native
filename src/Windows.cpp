@@ -390,7 +390,7 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         dbgLogLine("output window destroyed");
         for (size_t i = 0; i < g_outWins.size(); i++)
-            if (g_outWins[i].first == hwnd) { delete g_outWins[i].second; g_outWins.erase(g_outWins.begin() + i); break; }
+            if (g_outWins[i].first == hwnd) { delete g_outWins[i].second; g_outWins.erase(g_outWins.begin() + i); g_outCount.store((int)g_outWins.size()); break; }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -591,6 +591,7 @@ void createOutputWindows() {
         syncMagProbeOverlays(g_probe.load());
     // MAG edge-blend overlays: marshalled so they paint after the lock
     requestMagBlendSync();
+    g_outCount.store((int)g_outWins.size());
     // console always stays on top of the output windows (like the original)
     notifyOutputRaised();
 }
@@ -613,6 +614,7 @@ void destroyOutputWindows() {
     g_magProbes.clear();
     for (auto& p : g_outWins) DestroyWindow(p.first);
     g_outWins.clear();
+    g_outCount.store(0);
     Engine::inst().detachAll();
 }
 
@@ -1374,17 +1376,19 @@ void refreshStatusBar() {
         }
         srcDev = g_cfg.sourceDev;
     }
-    wchar_t l1[128], l2[160], l3[192], l4[128], l5[160];
+    wchar_t l1[192], l2[160], l3[192], l4[128], l5[160];
     // [n] = which projector is being edited (1-based). refreshList() resets the
     // listbox selection, so fall back to 1 instead of showing [0].
     int cur = (sel >= 0 && sel < nProj) ? sel + 1 : (nProj > 0 ? 1 : 0);
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
-        wsprintfW(l1, L"Projector: %d [%d]%s%s%s", nProj, cur,
+        wsprintfW(l1, L"Projector: %d [%d]%s%s%s%s%s", nProj, cur,
                   g_previewMode.load() ? L"   Preview: ON" : L"",
                   g_inplace.load() ? (g_calib.load() ? L"   In-place: CALIB (click-through bypassed)"
                                                      : L"   In-place: ON") : L"",
-                  g_cfg.engine == 1 ? L"   Engine: MAG" : L"");
+                  g_cfg.engine == 1 ? L"   Engine: MAG" : L"",
+                  g_outCount.load() > 0 ? L"   Warping: ACTIVE" : L"   Warping: idle",
+                  g_blackout.load() ? L"   Blackout: ON" : L"");
     }
     // wsprintfW (user32) has no floating point support -> use the CRT here
     _snwprintf_s(l2, 160, _TRUNCATE, L"Mode: %s   Snapshot: %s",
