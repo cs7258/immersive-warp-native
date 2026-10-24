@@ -206,9 +206,9 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return "OK subdivide=" + std::to_string(g_cfg.subdivide) + "\n";
         }
-        if (k == "snapshot") {
+        if (k == "snap") {
             std::lock_guard<std::mutex> lk(g_snapMutex);
-            return std::string("OK snapshot=") + (g_lastSnap.empty() ? "none" : g_lastSnap) + "\n";
+            return std::string("OK snap=") + (g_lastSnap.empty() ? "none" : g_lastSnap) + "\n";
         }
         if (k == "move") {
             int m = g_moveMode.load();
@@ -983,12 +983,13 @@ static std::string dispatch(std::string line) {
         // grid density (REBUILDS each warp grid, dropping manual point edits,
         // same as the Configure dialog's Apply). Targets the selected output
         // when one is set, else every enabled output (legacy).
-        if (key == "snapshot") {
+        if (key == "snap") {
             // frame snapshot to PNG: 1/on -> %APPDATA%\...\snapshots\<ts>.png,
-            // or a custom path. Runs on the render thread (async); GET snapshot
-            // reports the last written file. dispatch uppercased the line, so a
-            // custom path arrives uppercase - Windows paths are case-insensitive
-            // but the directory must already exist.
+            // or a custom path. Runs on the render thread (async); GET snap
+            // reports the last written file. Named "snap" because "SNAPSHOT"
+            // already means the calib freeze toggle. dispatch uppercased the
+            // line, so a custom path arrives uppercase - Windows paths are
+            // case-insensitive but the directory must already exist.
             std::wstring path;
             if (val == "1" || val == "ON" || val == "TRUE" || val.empty()) {
                 path = snapshotDefaultPath();
@@ -1001,7 +1002,7 @@ static std::string dispatch(std::string line) {
                 g_snapPath = path;
             }
             g_snapReq.store(1);
-            return "OK snapshot=requested\n";
+            return "OK snap=requested\n";
         }
         if (key == "rows" || key == "cols") {
             int n = atoi(val.c_str());
