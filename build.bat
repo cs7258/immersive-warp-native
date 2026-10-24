@@ -16,7 +16,7 @@ if errorlevel 1 goto FAIL
 
 if not exist build mkdir build
 cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE ^
-  src\Config.cpp src\Engine.cpp src\Windows.cpp src\CmdNet.cpp src\MagEngine.cpp src\main.cpp ^
+  src\Config.cpp src\Engine.cpp src\Windows.cpp src\CmdNet.cpp src\MagEngine.cpp src\HookIPC.cpp src\main.cpp ^
   /Fe:build\ImmersiveWarpNative.exe /Fo:build\ ^
   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib ole32.lib comdlg32.lib windowscodecs.lib ws2_32.lib advapi32.lib
 if errorlevel 1 goto FAIL
