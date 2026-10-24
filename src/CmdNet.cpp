@@ -648,6 +648,10 @@ static std::string dispatch(std::string line) {
         std::string val = (eq == std::string::npos) ? "" : arg.substr(eq + 1);
         if (key.empty()) return "ERR SET side.field=value\n";
         for (auto& c : key) c = (char)tolower((unsigned char)c);
+        // tolerate stray whitespace around '=' (OSC joins args with spaces,
+        // and some TCP clients pad too): "SET perflog= ON" must equal ON
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.pop_back();
         // Set the capture source: rebuilds the outputs, so it must run without
         // holding g_cfgMutex (setSourceDisplay locks internally).
         if (key == "source") {
