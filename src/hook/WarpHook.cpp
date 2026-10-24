@@ -432,8 +432,9 @@ static DWORD WINAPI initThread(LPVOID) {
         Sleep(50);
     }
     installFactoryHooks();
-    // watchdog: probe the hooked slot with PRESENT_TEST every 2 s (proves the
-    // detour is live), and re-apply if something restored the original
+    // watchdog: re-apply the detour if something restored the original entry.
+    // NOTE: no live Present probe here - calling Present from this thread
+    // races the app's own Present on the same swapchain and crashes DXGI.
     while (true) {
         Sleep(2000);
         std::lock_guard<std::mutex> lk(g_vtMutex);
@@ -449,9 +450,6 @@ static DWORD WINAPI initThread(LPVOID) {
                     hookLog(buf);
                 }
             }
-            // live probe: PRESENT_TEST never displays, just validates state
-            if (g_vts[i].probe)
-                ((PFN_Present)vt[13])(g_vts[i].probe, 0, DXGI_PRESENT_TEST);
         }
     }
     return 0;
