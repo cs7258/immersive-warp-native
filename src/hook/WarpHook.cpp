@@ -55,18 +55,28 @@ static void hookLog(const char* line) {
 // ---------------------------------------------------------------- config
 static IWNHookCfg* g_cfg = nullptr;          // mapped view, may stay null
 static DWORD g_cfgLastTry = 0;               // GetTickCount pacing
+static int g_cfgTries = 0;
 
 static IWNHookCfg* ensureCfg() {
     if (g_cfg) return g_cfg;
     DWORD now = GetTickCount();
     if (now - g_cfgLastTry < 1000) return nullptr;   // retry at 1 Hz
     g_cfgLastTry = now;
+    g_cfgTries++;
     HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, IWN_HOOK_MAPPING_NAME);
-    if (!h) return nullptr;
+    if (!h) {
+        if (g_cfgTries == 10)
+            hookLog("cfg: mapping not found after 10 tries (host not running or name mismatch)");
+        return nullptr;
+    }
     g_cfg = (IWNHookCfg*)MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(IWNHookCfg));
     if (g_cfg && (g_cfg->magic != IWN_HOOK_MAGIC || g_cfg->size != sizeof(IWNHookCfg))) {
         hookLog("cfg: magic/size mismatch, ignoring host mapping");
         UnmapViewOfFile(g_cfg); g_cfg = nullptr;
+    } else if (g_cfg) {
+        char buf[80];
+        wsprintfA(buf, "cfg mapping attached (enabled=%d gridN=%d)", (int)g_cfg->enabled, (int)g_cfg->gridN);
+        hookLog(buf);
     }
     return g_cfg;
 }
@@ -355,6 +365,11 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
     PFN_Present orig = origPresentFor(sw);
     IWNHookCfg* cfg = ensureCfg();
     if (cfg && cfg->enabled && orig && sw) {
+        static bool firstPassLogged = false;
+        if (!firstPassLogged) {
+            firstPassLogged = true;
+            hookLog("first warp pass attempt (enabled=1 seen)");
+        }
         ID3D11Texture2D* bb = nullptr;
         if (SUCCEEDED(sw->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) && bb) {
             std::lock_guard<std::mutex> lk(g_ctxMutex);
