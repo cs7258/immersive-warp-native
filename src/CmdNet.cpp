@@ -37,7 +37,7 @@ static std::wstring toWide(const std::string& s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
     std::wstring w((size_t)n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n, nullptr, nullptr);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
 
@@ -710,7 +710,7 @@ static std::string dispatch(std::string line) {
         if (arg.empty() || arg.size() > 512) return "ERR LOADFILE (path required)\n";
         std::wstring wpath = toWide(arg);
         DWORD attr = GetFileAttributesW(wpath.c_str());
-        if (attr == INVALID_FILE_NAME || (attr & FILE_ATTRIBUTE_DIRECTORY))
+        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
             return "ERR LOADFILE (no such file)\n";
         if (!loadConfig(wpath)) return "ERR LOADFILE (load failed)\n";
         return finishLoad("file", sigBefore);
