@@ -36,6 +36,7 @@ static const wchar_t* MAGTEST_CLASS = L"IWN_MagTestWnd"; // engine=1 test patter
 static void syncMagTestOverlays(bool on);   // fwd: createOutputWindows calls it
 static void syncMagMaskOverlays();          // fwd: createOutputWindows calls it
 static void syncMagProbeOverlays(bool on);  // fwd: WM_MAGPROBE handler + createOutputWindows
+static void populateOvrSrcCombo();          // fwd: refreshList tail + WM_OVRSYNC
 
 // GDI replica of the DXGI test pattern (Engine.cpp testPattern shader):
 // 24x16 checker, 12x8 grid lines, red border, green center cross. Drawn in
