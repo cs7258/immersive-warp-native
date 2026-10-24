@@ -27,7 +27,8 @@ static std::vector<HWND> g_magExtras; // test-pattern overlays etc.
 
 // g_magMutex held: hosts + console + extras for every live host
 static void applyFiltersLocked() {
-    std::vector<HWND> filter = g_magHosts;
+    std::vector<HWND> filter;
+    for (HWND h : g_magHosts) if (h && IsWindow(h)) filter.push_back(h);
     if (g_magConsole) filter.push_back(g_magConsole);
     for (HWND e : g_magExtras) if (e && IsWindow(e)) filter.push_back(e);
     for (HWND h : g_magHosts)
@@ -70,11 +71,23 @@ bool magAttachOutput(HWND host, const RECT& srcDesktop) {
         return false;
     }
     // exclude every host (incl. this one) plus the console from the feed
-    g_magHosts.push_back(host);
     applyFiltersLocked();
     dbgLogLine("magAttachOutput: host attached, filter=" +
                std::to_string((long)g_magHosts.size() + (g_magConsole ? 1 : 0) + g_magExtras.size()));
     return true;
+}
+
+// register a magnifier host window the moment it is created - independent of
+// whether MagSetWindowSource succeeds (some environments, e.g. RDP sessions,
+// reject the feed entirely). Registered hosts still count for the recursion
+// filter list and for magSnapshotAll, so the GDI capture path works wherever
+// the host windows exist. Stale entries are skipped via IsWindow.
+void magRegisterHost(HWND host) {
+    std::lock_guard<std::mutex> lk(g_magMutex);
+    if (!host) return;
+    for (HWND h : g_magHosts) if (h == host) return;   // no duplicates
+    g_magHosts.push_back(host);
+    applyFiltersLocked();
 }
 
 void magSetConsoleWindow(HWND ctl) {

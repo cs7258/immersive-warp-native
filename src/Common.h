@@ -165,6 +165,7 @@ void magSetConsoleWindow(HWND ctl);            // console is excluded from the f
 void magAddFilter(HWND w);                     // extra windows hidden from the feed
 void magRemoveFilter(HWND w);
 void magDetachAll();                           // clear sources, uninit
+void magRegisterHost(HWND host);               // register host at creation (pre-attach)
 int magSnapshotAll(const std::wstring& basePath); // GDI-capture every live host to PNG
 // set when WDA_EXCLUDEFROMCAPTURE is unavailable: capturing our own display
 // would recursively film the output window, so capture is disabled instead

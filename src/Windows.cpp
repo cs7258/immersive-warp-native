@@ -667,6 +667,10 @@ void createOutputWindows() {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
             g_outWins.push_back({ hwnd, st });
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // register before attach: the host counts for the recursion
+            // filter and the GDI snapshot even where MagSetWindowSource is
+            // unavailable (e.g. RDP sessions reject the magnifier feed)
+            magRegisterHost(hwnd);
             // NxN tile: the host mirrors THIS tile's source window - same
             // geometry as the DXGI pipeline (screen x shows source
             // x + c*(1-ov)), clamped to the source desktop.
@@ -4153,13 +4157,14 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (!snapPath.empty()) {
             int n = magSnapshotAll(snapPath);
             if (n > 0) {
+                KillTimer(hwnd, 2);
                 snapRetries = 0;
             } else if (++snapRetries < 10) {
                 // hosts may still be rebuilding right after SET engine=MAG -
-                // repost to ourselves, bounded (message-loop paced)
-                PostMessageW(hwnd, WM_MAGSNAP, 0, 0);
-                return 0;
+                // pace retries with a 300 ms timer, bounded
+                SetTimer(hwnd, 2, 300, nullptr);
             } else {
+                KillTimer(hwnd, 2);
                 dbgLogLine("magSnap: gave up - no live magnifier hosts");
                 snapRetries = 0;
             }
@@ -4686,6 +4691,11 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     }
     case WM_TIMER: {                   // 1s status refresh (fps/uptime live)
+        if (wp == 2) {                 // MAG snapshot retry tick
+            KillTimer(hwnd, 2);
+            PostMessageW(hwnd, WM_MAGSNAP, 0, 0);
+            return 0;
+        }
         if (wp == 1 && g_statusInfo) {
             refreshStatusBar();
             // optional perf history: one snapshot line every 10 s so a real
