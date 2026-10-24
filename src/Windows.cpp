@@ -1724,6 +1724,7 @@ static void refreshList() {
         }
     }
     if (g_schematic) InvalidateRect(g_schematic, nullptr, TRUE);
+    populateOvrSrcCombo();   // cheap enough here; covers display set changes
     refreshStatusBar();
 }
 
@@ -3700,7 +3701,6 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_SRCSET: {   // capture source changed from the socket thread
         rebuildForSource();
-        populateOvrSrcCombo();   // override combo follows (same UI thread)
         return 0;
     }
     case WM_OVRSYNC:    // per-output override changed from the socket thread
