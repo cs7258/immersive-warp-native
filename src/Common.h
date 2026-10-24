@@ -140,6 +140,10 @@ void requestOvrSrcSync();      // any thread: override combo follows SET src=
 void requestBlackoutSync();    // any thread: blackout overlays + menu checkbox follow
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
 void refreshSampComboUI();     // socket thread safe: sampling dropdown follows shared state
+// socket thread safe AND callable while holding g_cfgMutex: no internal
+// locking, the caller passes the captured values (SET testanim runs inside
+// the CMDNET locked region - an internal lock would self-deadlock)
+void refreshAnimUI(int anim, bool paused);
 
 // ---- DWM Magnification engine (src/MagEngine.cpp) --------------------
 // engine=1: output windows are magnifier hosts mirroring the source

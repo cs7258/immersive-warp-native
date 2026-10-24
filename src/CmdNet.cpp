@@ -472,6 +472,10 @@ static std::string dispatch(std::string line) {
         // freeze the dynamic test pattern bands (original's Animation/Paused)
         bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_testPause.load();
         g_testPause.store(want);
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);   // no lock held here
+            refreshAnimUI(g_cfg.testAnim, want);   // Image-page checkbox follows
+        }
         return std::string("OK testpause=") + (g_testPause.load() ? "on" : "off") + "\n";
     }
 
@@ -530,6 +534,10 @@ static std::string dispatch(std::string line) {
         Engine::inst().setTestImage(g_cfg.testImg);   // <0 clears the overlay
         if (!g_cfg.imagePath.empty()) engineLoadImage(g_cfg.imagePath);
         refreshSampComboUI();   // engine/sampling dropdowns follow loaded config
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            refreshAnimUI(g_cfg.testAnim, g_testPause.load());   // animation combo follows
+        }
         int outs = 0;
         refreshStatusBar();
         {
@@ -1009,10 +1017,13 @@ static std::string dispatch(std::string line) {
                 if (v < 0 || v > 3) return "ERR SET testanim (want 0..3)\n";
                 g_cfg.testAnim = v;
                 applied = true;
+                refreshAnimUI(v, g_testPause.load());   // Image-page combo follows
             }
             if (!applied && key == "testpause") {
-                g_testPause.store(val == "ON" || val == "1" || val == "true");
+                bool want = (val == "ON" || val == "1" || val == "true");
+                g_testPause.store(want);
                 applied = true;
+                refreshAnimUI(g_cfg.testAnim, want);   // Image-page checkbox follows
             }
             if (!applied && key == "probe") {
                 g_probe.store(val == "ON" || val == "1" || val == "true");

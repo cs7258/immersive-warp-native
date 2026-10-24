@@ -1365,6 +1365,8 @@ bool queryAutostart() {
     return on;
 }
 static HWND g_cbImg = nullptr;
+static HWND g_cbAnim = nullptr;    // test-pattern animation direction
+static HWND g_ckPause = nullptr;   // test-pattern pause (session-only)
 
 static void setStatus(const wchar_t* s) {
     if (g_status) SetWindowTextW(g_status, s);
@@ -1706,6 +1708,8 @@ void notifyOutputRaised() {
 #define IDC_SCHEMATIC  1034   // Displays page: owner-drawn output schematic
 #define IDC_STATUSINFO 1035   // structured status block (testable by id)
 #define IDC_CBOVRSRC  1036   // per-output source override dropdown
+#define IDC_CBANIM    1037   // test-pattern animation direction dropdown
+#define IDC_CKPAUSE   1038   // test-pattern pause checkbox (session-only)
 // (menu bar IDM_* ids live above showTab, see the note there)
 
 static void refreshList() {
@@ -1877,6 +1881,17 @@ void refreshSampComboUI() {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         PostMessageW(g_cbSamp, CB_SETCURSEL, g_cfg.sampling, 0);
     }
+}
+
+void refreshAnimUI(int anim, bool paused) {
+    // socket thread safe, no internal locking: SET testanim/testpause call
+    // this from inside the CMDNET locked region (see dispatch). CB_SETCURSEL
+    // / BM_SETCHECK are plain PostMessages - they never fire CBN_SELCHANGE /
+    // BN_CLICKED, so no feedback loop.
+    PostMessageW(g_cbAnim, CB_SETCURSEL,
+                 anim < 0 ? 0 : (anim > 3 ? 3 : anim), 0);
+    PostMessageW(g_ckPause, BM_SETCHECK,
+                 paused ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 void requestOutputRebuild() {
@@ -3125,6 +3140,8 @@ static void applyLoadedConfig() {
     Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
     Engine::inst().setSampling(g_cfg.sampling);
     ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
+    ComboBox_SetCurSel(g_cbAnim, g_cfg.testAnim);   // animation direction follows the load
+    // g_testPause is session-only: keep the checkbox as-is on Load Config
     ComboBox_SetCurSel(g_cbImg, g_cfg.testImg);
     syncLayoutCombos();
     refreshTargetComboUI();   // enabled outputs may have changed with the config
@@ -3594,6 +3611,24 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ComboBox_AddString(g_cbImg, L"Checkerboard");
         ComboBox_AddString(g_cbImg, L"Gray ramp");
         ComboBox_AddString(g_cbImg, L"Identity grid");
+        // animation direction + pause: the original's Images area controls.
+        // The scroll band lives in the DXGI test-pattern shader; MAG's GDI
+        // replica stays static (single-alpha layered windows can't scroll it
+        // per-channel - same engine difference as the per-channel gamma).
+        add(PAGE_IMAGE, CreateWindowW(L"STATIC", L"Animation:",
+            WS_CHILD | SS_LEFT, 16, 118, 70, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_IMAGE, g_cbAnim = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            88, 114, 130, 200,
+            hwnd, (HMENU)IDC_CBANIM, nullptr, nullptr));
+        ComboBox_AddString(g_cbAnim, L"Off");
+        ComboBox_AddString(g_cbAnim, L"Horizontal");
+        ComboBox_AddString(g_cbAnim, L"Vertical");
+        ComboBox_AddString(g_cbAnim, L"Diagonal");
+        add(PAGE_IMAGE, g_ckPause = CreateWindowW(L"BUTTON", L"Pause",
+            WS_CHILD | BS_AUTOCHECKBOX, 232, 114, 90, 24,
+            hwnd, (HMENU)IDC_CKPAUSE, nullptr, nullptr));
 
         // --- Settings page
         add(PAGE_SETTINGS, g_ckNet = CreateWindowW(L"BUTTON", L"TCP control (CMDNET)",
@@ -3690,6 +3725,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
             Engine::inst().setSampling(g_cfg.sampling);
             ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
+            ComboBox_SetCurSel(g_cbAnim, g_cfg.testAnim);
+            Button_SetCheck(g_ckPause, g_testPause.load() ? BST_CHECKED : BST_UNCHECKED);
         }
         populateSourceCombo();   // locks g_cfgMutex itself
         populateOvrSrcCombo();   // per-output override combo (list has no selection yet)
@@ -4041,6 +4078,25 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             setAutostart(on);
             setStatus(on ? L"Autostart: registered (HKCU Run)."
                          : L"Autostart: removed.");
+        } else if (id == IDC_CBANIM && HIWORD(wp) == CBN_SELCHANGE) {
+            int sel = ComboBox_GetCurSel(g_cbAnim);
+            if (sel >= 0) {
+                { std::lock_guard<std::mutex> lk(g_cfgMutex); g_cfg.testAnim = sel; g_rev++; }
+                // renderAll reads g_cfg.testAnim live - no rebuild needed
+                static const wchar_t* dirName[4] =
+                    { L"off", L"horizontal", L"vertical", L"diagonal" };
+                wchar_t msg[96];
+                wsprintfW(msg, L"Test pattern animation: %s.", dirName[sel]);
+                setStatus(msg);
+            }
+        } else if (id == IDC_CKPAUSE && HIWORD(wp) == BN_CLICKED) {
+            // read through the global handle, not lp: synthetic WM_COMMAND
+            // (tests) sends lp=0 and Button_GetCheck(nullptr) is always 0
+            bool on = Button_GetCheck(g_ckPause) == BST_CHECKED;
+            g_testPause.store(on);
+            // session-only: not persisted, mirrors BLACKOUT semantics
+            setStatus(on ? L"Test pattern animation paused."
+                         : L"Test pattern animation resumed.");
         } else if (id == IDC_CBSAMP && HIWORD(wp) == CBN_SELCHANGE) {
             int sel = ComboBox_GetCurSel(g_cbSamp);
             if (sel >= 0) {
