@@ -1326,10 +1326,13 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
         phr = oc.swap->Present(0, 0);
     }
     if ((++m_frameCount % 180) == 1) {
-        char b[200];
-        sprintf_s(b, "draw: out=%ux%u idx=%u rtv=%p meshVB=%p hr=0x%08lX useImg=%d imgSRV=%p",
+        void** swvt = oc.swap ? *(void***)oc.swap : nullptr;
+        char b[240];
+        sprintf_s(b, "draw: out=%ux%u idx=%u rtv=%p meshVB=%p hr=0x%08lX useImg=%d imgSRV=%p "
+                     "swap=%p vt13=%p",
                   oc.w, oc.h, oc.indexCount, (void*)oc.rtv, (void*)oc.meshVB,
-                  (unsigned long)phr, (int)(g_cfg.useImage ? 1 : 0), (void*)m_imgSRV);
+                  (unsigned long)phr, (int)(g_cfg.useImage ? 1 : 0), (void*)m_imgSRV,
+                  (void*)oc.swap, swvt ? swvt[13] : nullptr);
         dbgLog(b);
     }
     // end-to-end latency: the duplicated desktop frame's QPC birth timestamp
