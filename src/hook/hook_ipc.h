@@ -61,8 +61,8 @@ struct IWNHookCfg {
 };
 #pragma pack(pop)
 
-static_assert(offsetof(IWNOutSlot, verts) == 220, "hook IPC v3 slot drift");
-static_assert(sizeof(IWNOutSlot) == 220 + IWN_MAX_MESH_VERTS * sizeof(IWNMeshVtx),
+static_assert(offsetof(IWNOutSlot, verts) == 156, "hook IPC v3 slot drift");
+static_assert(sizeof(IWNOutSlot) == 156 + IWN_MAX_MESH_VERTS * sizeof(IWNMeshVtx),
               "hook IPC v3 slot layout drift");
 static_assert(offsetof(IWNHookCfg, outs) == 92, "hook IPC v3 header drift");
 static_assert(sizeof(IWNHookCfg) == 92 + IWN_MAX_OUTPUTS * sizeof(IWNOutSlot),
