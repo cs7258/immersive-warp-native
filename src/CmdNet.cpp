@@ -463,6 +463,7 @@ static std::string dispatch(std::string line) {
         int roiL = 0, roiT = 0, roiR = 0, roiB = 0, roiCir = 0, roiBrd = 0;
         int oscCfg = 0, oscPortV = 8000;
         bool curved = false, tp = false;
+        bool hookOn = hookIpcEnabled();
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             layoutC = g_cfg.layoutC; layoutR = g_cfg.layoutR; overlap = g_cfg.overlap;
@@ -470,7 +471,6 @@ static std::string dispatch(std::string line) {
             eng = g_cfg.engine; testAnim = g_cfg.testAnim; checker = g_cfg.checker;
             subd = g_cfg.subdivide;
             maxFps = g_cfg.maxfps;
-            bool hookOn = hookIpcEnabled();
             roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1]; roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
             roiCir = g_cfg.roiCircle; roiBrd = g_cfg.roiBorder;
             oscCfg = g_cfg.osc; oscPortV = g_cfg.oscPort;
