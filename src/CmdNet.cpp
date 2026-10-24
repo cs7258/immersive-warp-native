@@ -140,6 +140,7 @@ static std::string dispatch(std::string line) {
     while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(line.begin());
     while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
     for (auto& c : line) c = (char)toupper((unsigned char)c);
+    dbgLogLine("dispatch: " + line);   // DEBUG-ROUND: bisect the SET osc crash
     size_t sp = line.find(' ');
     std::string cmd = line, arg;
     if (sp != std::string::npos) { cmd = line.substr(0, sp); arg = line.substr(sp + 1); }
@@ -648,6 +649,7 @@ static std::string dispatch(std::string line) {
         std::string val = (eq == std::string::npos) ? "" : arg.substr(eq + 1);
         if (key.empty()) return "ERR SET side.field=value\n";
         for (auto& c : key) c = (char)tolower((unsigned char)c);
+        dbgLogLine("dispatch SET: key=" + key + " val=" + val);   // DEBUG-ROUND
         // Set the capture source: rebuilds the outputs, so it must run without
         // holding g_cfgMutex (setSourceDisplay locks internally).
         if (key == "source") {
