@@ -1244,7 +1244,6 @@ constexpr UINT WM_MAGTEST = WM_APP + 14;      // test pattern changed off-thread
 constexpr UINT WM_TGTREFRESH = WM_APP + 15;   // refresh the Target combo (off-thread)
 constexpr UINT WM_DISPCHANGE = WM_APP + 16;   // deferred output rebuild after
 constexpr UINT WM_MAGPROBE = WM_APP + 17;     // probe markers toggled off-thread
-constexpr UINT WM_SRCSET = WM_APP + 19;       // per-output source override changed
 constexpr UINT WM_BLACKOUT = WM_APP + 18;     // blackout toggled off-thread
                                               // WM_DISPLAYCHANGE (the handler
                                               // must not do heavy work inline)
@@ -1837,7 +1836,8 @@ void requestMagProbeSync() {
 }
 
 // socket thread: a per-output source override changed (SET src=). The
-// duplication binds at attach time, so outputs must rebuild on the UI thread.
+// duplication binds at attach time, so outputs must rebuild on the UI thread
+// (reuses the existing WM_SRCSET rebuild message from the global source path).
 void requestSourceRebuild() {
     if (g_ctl) PostMessageW(g_ctl, WM_SRCSET, 0, 0);
 }
@@ -3675,10 +3675,6 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         syncMagBlendOverlays();
         return 0;
     }
-    case WM_SRCSET:         // per-output source override changed (socket thread)
-        rebuildForSource();
-        refreshStatusBar();
-        return 0;
     case WM_MAGPROBE: {     // probe markers toggled from the socket thread
         bool on;
         {
