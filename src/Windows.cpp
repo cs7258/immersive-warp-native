@@ -2063,8 +2063,6 @@ static void cuvApply() {
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         OutputCfg* o = cfgOutput();
-        dbgLogLine("cuvApply side=" + std::to_string(side) + " gain="
-                   + std::to_string(c.gain) + " out=" + (o ? "ok" : "null"));
         if (o) {
             o->blend[side].gain = c.gain;
             o->blend[side].slope = c.slope;
@@ -2089,12 +2087,14 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         for (const wchar_t* n : { L"Left", L"Right", L"Top", L"Bottom" })
             ComboBox_AddString(g_cuvSide, n);
         ComboBox_SetCurSel(g_cuvSide, 0);
-        static const struct { const wchar_t* name; int id; } prm[3] = {
-            { L"Gain", CUV_GAIN }, { L"Slope", CUV_SLOPE }, { L"Gamma", CUV_GAMMA } };
+        static const struct { const wchar_t* name; int id; HWND* slot; } prm[3] = {
+            { L"Gain", CUV_GAIN, &g_cuvGain },
+            { L"Slope", CUV_SLOPE, &g_cuvSlope },
+            { L"Gamma", CUV_GAMMA, &g_cuvGamma } };
         for (int i = 0; i < 3; i++) {
             CreateWindowW(L"STATIC", prm[i].name, WS_CHILD | WS_VISIBLE,
                 246, 55 + i * 32, 44, 18, hwnd, nullptr, nullptr, nullptr);
-            CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.000",
+            *prm[i].slot = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.000",
                 WS_CHILD | WS_VISIBLE, 294, 51 + i * 32, 64, 22,
                 hwnd, (HMENU)(INT_PTR)prm[i].id, nullptr, nullptr);
         }
@@ -2137,8 +2137,6 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     }
     case WM_COMMAND: {
         int id = LOWORD(wp);
-        dbgLogLine("CurveDlg WM_COMMAND id=" + std::to_string(id)
-                   + " hi=" + std::to_string(HIWORD(wp)));
         if (id == CUV_SIDE && HIWORD(wp) == CBN_SELCHANGE) cuvReload();
         else if (id == CUV_APPLY) cuvApply();
         else if (id == CUV_HADD) {
