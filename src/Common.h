@@ -103,6 +103,12 @@ struct AppConfig {
     int cmdnetPort = 5252;            // CMDNET listen port (loopback only)
     int osc = 0;                      // OSC over UDP remote control on/off (loopback)
     int oscPort = 8000;               // OSC listen port (standard OSC 8000)
+    // MQTT broker client (original v7.1.2 parity): subscribes
+    // <prefix>/command, publishes <prefix>/status (retain)
+    int mqtt = 0;
+    int mqttPort = 1883;              // standard MQTT port
+    std::string mqttHost = "127.0.0.1";   // broker address (name or IPv4)
+    std::string mqttPrefix = "display";   // topic prefix, case-sensitive on the wire
     int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x, 3 bicubic
     int maxfps = 0;                   // output frame cap (0 = uncapped); paces the DXGI render loop
     int autostart = 0;                // start with Windows (HKCU Run mirror)
@@ -174,12 +180,19 @@ int magSnapshotAll(const std::wstring& basePath); // GDI-capture every live host
 extern std::atomic<bool> g_previewNoCapture;
 extern AppConfig g_cfg;
 extern std::mutex g_cfgMutex;
+// the console (control) window handle, for off-thread PostMessage marshalling
+// (Mqtt.cpp). Constant after creation; null before/after.
+HWND consoleWindowHandle();
 extern std::atomic<int> g_rev;        // config revision, bumped on every edit
 extern std::atomic<bool> g_calib;     // calibration mode active
 // Register/UnregisterHotKey MUST run on the thread with the message loop (the
 // UI thread) - registering from the socket thread would post WM_HOTKEY into a
 // queue nobody pumps. CMDNET dispatches through this posted message.
 constexpr UINT WM_CALIBSET = WM_APP + 12;   // wp=0, lp = desired g_calib value
+// MQTT marshalling: commands land on the mqtt thread and touch the UI, so
+// they hop to the console window like every other off-thread caller
+constexpr UINT WM_MQWARP = WM_APP + 24;     // MQTT setdesktopwarping: wp = want(0/1)
+constexpr UINT WM_MQCFGSET = WM_APP + 25;   // MQTT setconfigset: wp = set 1..8
 void calibrationHotkeysSync(bool on);       // idempotent, UI thread only
 void requestCalibrationSync();              // any thread: post WM_CALIBSET
 extern std::atomic<bool> g_running;
@@ -305,6 +318,14 @@ void cmdnetStop();
 void oscStart(int port);
 void oscStop();
 bool oscRunning();
+// MQTT broker client (src/Mqtt.cpp): JSON commands on <prefix>/command,
+// retained status on <prefix>/status. Commands apply via cmdnetExecute /
+// PostMessage marshalling - same threading discipline as OSC.
+void mqttStart();
+void mqttStop();
+bool mqttRunning();
+bool mqttConnected();
+void mqttReconfigure(const std::string& host, int port, const std::string& prefix);
 std::string cmdnetExecute(const std::string& line); // run a CMDNET line programmatically (OSC)
 // start with Windows: HKCU\...\Run value "ImmersiveWarpNative" (no admin needed)
 void setAutostart(bool on);

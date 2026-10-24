@@ -33,6 +33,14 @@ static std::string toNarrow(const std::wstring& w) {
     return s;
 }
 
+static std::wstring toWide(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n, nullptr, nullptr);
+    return w;
+}
+
 // short form used on the wire: "\\.\DISPLAY2" -> "DISPLAY2"
 static std::string shortDev(const std::wstring& w) {
     std::string s = toNarrow(w);
@@ -159,6 +167,14 @@ static std::string dispatch(std::string line) {
         if (k == "oscport") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return "OK oscport=" + std::to_string(g_cfg.oscPort) + "\n";
+        }
+        if (k == "mqtt") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK mqtt=" + std::string(g_cfg.mqtt ? "on" : "off") +
+                   ";host=" + g_cfg.mqttHost +
+                   ";port=" + std::to_string(g_cfg.mqttPort) +
+                   ";prefix=" + g_cfg.mqttPrefix +
+                   ";conn=" + (mqttRunning() ? (mqttConnected() ? "connected" : "connecting") : "off") + "\n";
         }
         if (k == "inplace")  return std::string("OK inplace=")  + (g_inplace.load() ? "on" : "off") + "\n";
         // remote health monitoring: one line, key=value; pairs (STATUS style)
@@ -287,6 +303,10 @@ static std::string dispatch(std::string line) {
                 s += std::string("engine=") + (g_cfg.engine == 1 ? "mag" : "desktopduplication") + ";";
                 s += "osc=" + std::to_string(g_cfg.osc) + ";";
                 s += "oscport=" + std::to_string(g_cfg.oscPort) + ";";
+                s += "mqtt=" + std::to_string(g_cfg.mqtt) + ";";
+                s += "mqttport=" + std::to_string(g_cfg.mqttPort) + ";";
+                s += "mqtthost=" + g_cfg.mqttHost + ";";
+                s += "mqttprefix=" + g_cfg.mqttPrefix + ";";
                 int n = 0;
                 for (auto& o : g_cfg.outputs) {
                     char p[8];
@@ -474,6 +494,8 @@ static std::string dispatch(std::string line) {
         int maxFps = 0;
         int roiL = 0, roiT = 0, roiR = 0, roiB = 0, roiCir = 0, roiBrd = 0;
         int oscCfg = 0, oscPortV = 8000;
+        int mqttCfg = 0, mqttPortV = 1883;
+        std::string mqttHostV, mqttPrefixV;
         bool curved = false, tp = false;
         bool hookOn = hookIpcEnabled();
         {
@@ -486,6 +508,8 @@ static std::string dispatch(std::string line) {
             roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1]; roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
             roiCir = g_cfg.roiCircle; roiBrd = g_cfg.roiBorder;
             oscCfg = g_cfg.osc; oscPortV = g_cfg.oscPort;
+            mqttCfg = g_cfg.mqtt; mqttPortV = g_cfg.mqttPort;
+            mqttHostV = g_cfg.mqttHost; mqttPrefixV = g_cfg.mqttPrefix;
             for (auto& o : g_cfg.outputs) if (o.enabled) {
                 outs++;
                 if (outs == 1) { edges = o.edges; masks = (int)o.masks.size(); }
@@ -523,6 +547,10 @@ static std::string dispatch(std::string line) {
                ";roiborder=" + std::to_string(roiBrd) +
                ";osc=" + std::string(oscRunning() || oscCfg ? "on" : "off") +
                ";oscport=" + std::to_string(oscPortV) +
+               ";mqtt=" + std::string(mqttRunning() || mqttCfg ? "on" : "off") +
+               ";mqttport=" + std::to_string(mqttPortV) +
+               ";mqtthost=" + mqttHostV +
+               ";mqttprefix=" + mqttPrefixV +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
@@ -671,6 +699,21 @@ static std::string dispatch(std::string line) {
         std::wstring sigBefore = enabledOutputsSignature();
         if (!loadConfig(presetPath(arg))) return "ERR LOADAS (no such preset)\n";
         return finishLoad("preset=" + arg, sigBefore);
+    }
+    if (cmd == "LOADFILE") {
+        // full-path config load; the MQTT loadprocalib command maps here
+        // (its "display" key is ignored - our presets are whole-rig configs).
+        // arg holds the rest of the line, so paths may contain spaces;
+        // dispatch uppercased the line and NTFS paths are case-insensitive.
+        // Bytes arrive as UTF-8 from the MQTT JSON payload.
+        std::wstring sigBefore = enabledOutputsSignature();
+        if (arg.empty() || arg.size() > 512) return "ERR LOADFILE (path required)\n";
+        std::wstring wpath = toWide(arg);
+        DWORD attr = GetFileAttributesW(wpath.c_str());
+        if (attr == INVALID_FILE_NAME || (attr & FILE_ATTRIBUTE_DIRECTORY))
+            return "ERR LOADFILE (no such file)\n";
+        if (!loadConfig(wpath)) return "ERR LOADFILE (load failed)\n";
+        return finishLoad("file", sigBefore);
     }
 
     if (cmd == "AUTOSTART") {
@@ -1306,6 +1349,56 @@ static std::string dispatch(std::string line) {
                     dbgLogLine("osc: rebind threw (non-std)");
                     return "ERR SET oscport (unknown)\n";
                 }
+                applied = true;
+            }
+            if (!applied && key == "mqtt") {
+                // NOTE: this whole chain runs INSIDE the g_cfgMutex scope
+                // opened above - mqttStart/mqttStop/mqttReconfigure only take
+                // their own g_mqCfgMutex (a different lock, never g_cfgMutex)
+                if (val != "ON" && val != "1" && val != "OFF" && val != "0")
+                    return "ERR SET mqtt=on|off\n";
+                bool want = (val == "ON" || val == "1");
+                g_cfg.mqtt = want ? 1 : 0;
+                try {
+                    if (want && !mqttRunning()) mqttStart();
+                    else if (!want) mqttStop();
+                } catch (const std::exception& e) {
+                    dbgLogLine(std::string("mqtt: SET threw: ") + e.what());
+                    return std::string("ERR SET mqtt (") + e.what() + ")\n";
+                } catch (...) {
+                    dbgLogLine("mqtt: SET threw (non-std)");
+                    return "ERR SET mqtt (unknown)\n";
+                }
+                applied = true;
+            }
+            if (!applied && key == "mqtthost") {
+                // dispatch uppercased the line - DNS names are case-insensitive
+                if (val.empty() || val.size() > 127)
+                    return "ERR SET mqtthost (1..127 chars)\n";
+                g_cfg.mqttHost = val;
+                mqttReconfigure(g_cfg.mqttHost, g_cfg.mqttPort, g_cfg.mqttPrefix);
+                applied = true;
+            }
+            if (!applied && key == "mqttport") {
+                int p = atoi(val.c_str());
+                if (p < 1 || p > 65535) return "ERR SET mqttport (1..65535)\n";
+                g_cfg.mqttPort = p;
+                mqttReconfigure(g_cfg.mqttHost, g_cfg.mqttPort, g_cfg.mqttPrefix);
+                applied = true;
+            }
+            if (!applied && key == "mqttprefix") {
+                // topics are case-sensitive on the wire but dispatch uppercases
+                // the line, so the prefix is normalized to lowercase here
+                // (original default "display")
+                std::string v;
+                for (char c : val) v += (char)tolower((unsigned char)c);
+                bool okPfx = !v.empty() && v.size() <= 60;
+                for (char c : v)
+                    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+                        okPfx = false;
+                if (!okPfx) return "ERR SET mqttprefix (a-z 0-9 _ -, max 60)\n";
+                g_cfg.mqttPrefix = v;
+                mqttReconfigure(g_cfg.mqttHost, g_cfg.mqttPort, g_cfg.mqttPrefix);
                 applied = true;
             }
             if (!applied) return "ERR SET " + key + "\n";

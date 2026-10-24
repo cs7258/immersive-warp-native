@@ -2,6 +2,7 @@
 #include <shlobj.h>
 #include <fstream>
 #include <sstream>
+#include <cctype>
 
 AppConfig g_cfg;
 std::mutex g_cfgMutex;
@@ -145,6 +146,10 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "cmdnetPort=" << g_cfg.cmdnetPort << "\n";
     os << "osc=" << g_cfg.osc << "\n";
     os << "oscPort=" << g_cfg.oscPort << "\n";
+    os << "mqtt=" << g_cfg.mqtt << "\n";
+    os << "mqttPort=" << g_cfg.mqttPort << "\n";
+    os << "mqttHost=" << g_cfg.mqttHost << "\n";
+    os << "mqttPrefix=" << g_cfg.mqttPrefix << "\n";
     os << "sampling=" << g_cfg.sampling << "\n";
     os << "maxfps=" << g_cfg.maxfps << "\n";
     os << "autostart=" << g_cfg.autostart << "\n";
@@ -238,6 +243,25 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "oscPort") {
             int p = atoi(val.c_str());
             c.oscPort = (p >= 1024 && p <= 65535) ? p : 8000;
+        }
+        else if (key == "mqtt") c.mqtt = atoi(val.c_str()) ? 1 : 0;
+        else if (key == "mqttPort") {
+            int p = atoi(val.c_str());
+            c.mqttPort = (p >= 1 && p <= 65535) ? p : 1883;
+        }
+        else if (key == "mqttHost") { if (val.size() <= 127) c.mqttHost = val; }
+        else if (key == "mqttPrefix") {
+            // topics are case-sensitive; the config stores the lowercase form
+            // (SET mqttprefix normalizes too)
+            if (!val.empty() && val.size() <= 60) {
+                std::string v;
+                for (char ch : val) v += (char)tolower((unsigned char)ch);
+                bool ok = true;
+                for (char ch : v)
+                    if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-'))
+                        ok = false;
+                if (ok) c.mqttPrefix = v;
+            }
         }
         else if (key == "sampling") c.sampling = atoi(val.c_str());
         else if (key == "maxfps") { c.maxfps = atoi(val.c_str()); if (c.maxfps < 0) c.maxfps = 0; if (c.maxfps > 240) c.maxfps = 240; }   // render-loop pacing; garbage values clamp, 0 = uncapped

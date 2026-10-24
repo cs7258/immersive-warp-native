@@ -1337,6 +1337,10 @@ static const wchar_t* CTL_CLASS = L"IWN_ControlWnd";
 static HFONT g_uiFont = nullptr;
 static HWND g_ctl = nullptr;
 
+// cross-TU accessor for off-thread marshalling (Mqtt.cpp PostMessage hops);
+// set once on window creation, nulled on destroy
+HWND consoleWindowHandle() { return g_ctl; }
+
 void requestMagBlendSync() {
     // any thread: the sync itself touches windows, so always marshal to the
     // UI thread even when already on it (PostMessage defers past the caller's
@@ -4242,6 +4246,23 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_BLACKOUT: {     // blackout toggled from the socket thread
         syncBlackoutUI();
+        return 0;
+    }
+    case WM_MQWARP: {   // MQTT setdesktopwarping: absolute on/off. The F4
+        // toggle is a flip, so compare against the live value first and
+        // only flip when it differs (idempotent, race-safe enough for a
+        // human-paced MQTT command stream)
+        bool want = wp != 0;
+        bool cur;
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            cur = g_cfg.enabled;
+        }
+        if (cur != want) toggleWindowWarping();
+        return 0;
+    }
+    case WM_MQCFGSET: {     // MQTT setconfigset 1..8: presets by name order
+        loadPresetByIndex((int)wp - 1);   // bounds-checked inside
         return 0;
     }
     case WM_LAYSET: {   // tiled layout changed from the socket thread

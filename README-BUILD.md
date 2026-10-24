@@ -154,15 +154,15 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | src/Windows.cpp | 输出窗口 + 校准交互（拖点/滚轮/F10/Esc）+ 控制台 UI |
 | src/main.cpp | 启动、渲染线程、消息循环 |
 | src/HookIPC.cpp | scanout 管线宿主侧：发布 WarpHook.dll 参数映射 |
+| src/Mqtt.cpp | MQTT broker 客户端：`<prefix>/command` JSON 命令 + `<prefix>/status` retain 上报 |
 | src/hook/WarpHook.cpp | 注入 DLL：Present hook + 就地扭曲（scanout 前） |
 | src/hook/Injector.cpp | IWNInject.exe：挂起启动注入器 |
 
 ## P0 边界与后续路线
 
 - 本版：单 GPU（adapter 0）、无状态栏文字（引擎覆盖层后续补）。Sets 热切换已补全：预设（Settings 页 Preset 下拉 / 托盘 / Ctrl+Shift+1..8 / CMDNET SAVEAS·LOADAS）加载后若启用输出集变化，输出窗口经 WM_DISPCHANGE 实时重建，无需重启
-- **P1（当前最高优先级）：scanout 级交付 = swapchain/Present hook 注入管线**（WarpHook.dll + IWNInject.exe + 宿主参数通道 IPC v3 per-output 多槽位）。NVAPI Warp and Blend / 内核驱动暂缓——无对应硬件，待硬件到位再排
-- P1 其余：MQTT 对接（CMDNET/OSC 已覆盖自有远控）
-- P2（暂缓）: 内核驱动 DXGK 级（届时需 EV 代码签名 + 杀软白名单，对应原版 WSupportLdr.exe 的合规路径）
+- **MQTT 对接已完成**（原版 v7.1.2 parity，src/Mqtt.cpp 零依赖 MQTT 3.1.1 客户端）：订阅 `<prefix>/command`（默认 `display/command`，prefix 经 SET mqttprefix 小写归一），JSON 命令映射——setconfigset→预设按名序 1..8、setdesktopwarping→输出引擎绝对开关、blackout→SET blackout、loadprocalib→LOADFILE 全路径加载、quit→退出；`<prefix>/status` retain 状态上报（连接时+每命令后）。QoS0 无鉴权（与 CMDNET 同信任模型）；SET mqtt/mqtthost/mqttport/mqttprefix 四键管理，断线 3s 重连
+- **P1 全部清零**：色彩均衡 UI、scanout 注入管线（IPC v3 多槽位+标定覆盖层+Sets 热切换）、MQTT 对接。剩余：真机双屏验证（VERIFY-CHECKLIST.md A-H）、P2 内核驱动（暂缓——无对应硬件，届时需 EV 代码签名 + 杀软白名单，对应原版 WSupportLdr.exe 的合规路径）
 - P3: 相机自动对准、AI 帧插值
 
 ### scanout 管线（Phase 1 已落地：端到端 hook 通道）
