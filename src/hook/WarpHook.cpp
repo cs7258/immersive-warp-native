@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <vector>
 #include <cstring>
@@ -209,8 +210,8 @@ static bool ensureResources(HookCtx& c, ID3D11Texture2D* bb, const IWNHookCfg& c
     bool rebuild = (!c.dev || c.bbKey != (void*)bb || c.w != td.Width || c.h != td.Height);
     if (rebuild) {
         releaseSlot(c);
-        HRESULT hr = bb->GetDevice(__uuidof(ID3D11Device), (void**)&c.dev);
-        if (FAILED(hr)) { hookLog("GetDevice failed"); return false; }
+        bb->GetDevice(&c.dev);   // DeviceChild::GetDevice(ID3D11Device**), void return
+        if (!c.dev) { hookLog("GetDevice failed"); return false; }
         c.dev->GetImmediateContext(&c.ctx);
         c.bbKey = (void*)bb;
         c.w = td.Width; c.h = td.Height;
@@ -248,6 +249,7 @@ typedef HRESULT(WINAPI* PFN_CreateSwapChainForHwnd)(IUnknown*, IUnknown*, HWND, 
 static PFN_CreateSwapChain         g_origCreate = nullptr;
 static PFN_CreateSwapChainForHwnd  g_origCreateHwnd = nullptr;
 static void** g_factoryVt = nullptr;      // patched vtable (process-wide)
+static volatile LONG g_swapCount = 0;
 
 // Bitblt and flip-model swapchains are distinct implementation classes with
 // distinct vtables - patch each vtable once and remember its original Present.
@@ -323,8 +325,6 @@ static HRESULT WINAPI HookCreateSwapChainForHwnd(IUnknown* fac, IUnknown* dev, H
     }
     return hr;
 }
-
-static volatile LONG g_swapCount = 0;
 
 static PFN_Present origPresentFor(IDXGISwapChain* sw) {
     void** vt = *(void***)sw;
