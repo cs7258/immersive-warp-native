@@ -129,6 +129,11 @@ float4 main(PSIn i) : SV_TARGET {
     return c;
 }
 )";
+// solid-color pixel shader for the calibration mesh-line overlay
+static const char* kPSLine = R"(
+struct PSIn { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+float4 main(PSIn i) : SV_TARGET { return float4(1.0, 1.0, 0.0, 1.0); }
+)";
 
 // ---------------------------------------------------------------- per-swapchain context
 struct HookCtx {
@@ -143,6 +148,9 @@ struct HookCtx {
     ID3D11SamplerState*     ss = nullptr;
     ID3D11InputLayout*      il = nullptr;
     ID3D11Buffer*           cb = nullptr;   // blend constants (b0)
+    ID3D11PixelShader*      psLine = nullptr;   // mesh-line overlay
+    ID3D11Buffer*           lineVB = nullptr;   // line-segment topology mesh
+    UINT lineVertCount = 0;
     UINT w = 0, h = 0;          // back buffer size of cached resources
     UINT vertCount = 0;         // vertices in the cached VB
     LONG  gridN = 0;            // corner-model mesh resolution of cached VB
@@ -167,6 +175,8 @@ static void releaseSlot(HookCtx& c) {
     if (c.ss) c.ss->Release();
     if (c.il) c.il->Release();
     if (c.cb) c.cb->Release();
+    if (c.psLine) c.psLine->Release();
+    if (c.lineVB) c.lineVB->Release();
     if (c.ctx) c.ctx->Release();
     if (c.dev) c.dev->Release();
     ZeroMemory(&c, sizeof(c));
@@ -185,6 +195,14 @@ static bool compileShaders(HookCtx& c) {
     HRESULT hr1 = c.dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &c.vs);
     HRESULT hr2 = c.dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &c.ps);
     if (FAILED(hr1) || FAILED(hr2)) { hookLog("shader create failed"); return false; }
+    ID3DBlob* lsb = nullptr;
+    if (FAILED(D3DCompile(kPSLine, lstrlenA(kPSLine), nullptr, nullptr, nullptr, "main",
+                          "ps_5_0", 0, 0, &lsb, &err)) ||
+        FAILED(c.dev->CreatePixelShader(lsb->GetBufferPointer(), lsb->GetBufferSize(), nullptr, &c.psLine))) {
+        if (lsb) lsb->Release();
+        hookLog("line ps create failed"); return false;
+    }
+    if (lsb) lsb->Release();
     const D3D11_INPUT_ELEMENT_DESC il[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -208,77 +226,96 @@ static bool compileShaders(HookCtx& c) {
     return true;
 }
 
+static bool createVB(HookCtx& c, const void* data, size_t bytes, ID3D11Buffer** out, const char* tag) {
+    if (*out) { (*out)->Release(); *out = nullptr; }
+    D3D11_BUFFER_DESC bd = {};
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.ByteWidth = (UINT)bytes;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA init = { data, 0, 0 };
+    if (FAILED(c.dev->CreateBuffer(&bd, &init, out))) { hookLog(tag); return false; }
+    return true;
+}
+
 static bool buildMesh(HookCtx& c, const IWNHookCfg& cfg) {
     const LONG n = cfg.gridN >= 2 && cfg.gridN <= 64 ? cfg.gridN : 16;
     struct V { float pos[3]; float uv[2]; };
-    std::vector<V> data;
+    std::vector<V> grid;               // row-major unique grid vertices
+    int RV, CV;
     if (cfg.mode == 1 && cfg.vertCount > 0 && cfg.meshRows >= 2 && cfg.meshCols >= 2 &&
         (LONG)cfg.meshRows * cfg.meshCols == (LONG)cfg.vertCount) {
         // full control-point mesh published by the host: row-major grid of
         // IWNMeshVtx (sx,sy = src uv, dx,dy = dest in 0..1 space)
-        const int RV = cfg.meshRows, CV = cfg.meshCols;
-        data.reserve((size_t)(RV - 1) * (CV - 1) * 6);
-        for (int i = 0; i < RV - 1; i++) {
-            for (int j = 0; j < CV - 1; j++) {
-                const IWNMeshVtx* q[4] = {
-                    &cfg.verts[(size_t)i * CV + j],       &cfg.verts[(size_t)i * CV + j + 1],
-                    &cfg.verts[(size_t)(i + 1) * CV + j], &cfg.verts[(size_t)(i + 1) * CV + j + 1],
-                };
-                V quad[4];
-                for (int k = 0; k < 4; k++) {
-                    quad[k].pos[0] = 2 * q[k]->dx - 1;
-                    quad[k].pos[1] = 1 - 2 * q[k]->dy;
-                    quad[k].pos[2] = 0;
-                    quad[k].uv[0] = q[k]->sx;
-                    quad[k].uv[1] = q[k]->sy;
-                }
-                const int idl[6] = { 0, 2, 1, 1, 2, 3 };
-                for (int k = 0; k < 6; k++) data.push_back(quad[idl[k]]);
+        RV = cfg.meshRows; CV = cfg.meshCols;
+        grid.resize((size_t)RV * CV);
+        for (int i = 0; i < RV; i++)
+            for (int j = 0; j < CV; j++) {
+                const IWNMeshVtx& s = cfg.verts[(size_t)i * CV + j];
+                V& d = grid[(size_t)i * CV + j];
+                d.pos[0] = 2 * s.dx - 1;
+                d.pos[1] = 1 - 2 * s.dy;
+                d.pos[2] = 0;
+                d.uv[0] = s.sx;
+                d.uv[1] = s.sy;
             }
-        }
         c.mode = 1;
         c.meshRev = cfg.meshRev;
     } else {
         // corner fallback (Phase 1 PoC): bilinear blend of 4 NDC offsets
-        const int verts = (int)((n - 1) * (n - 1) * 6);
-        data.reserve(verts);
+        RV = CV = (int)n;
+        grid.resize((size_t)n * n);
         const float* c00 = cfg.corner[0];  // TL
         const float* c10 = cfg.corner[1];  // TR
         const float* c01 = cfg.corner[2];  // BL
         const float* c11 = cfg.corner[3];  // BR
-        for (LONG y = 0; y < n - 1; y++) {
-            for (LONG x = 0; x < n - 1; x++) {
-                float u0 = (float)x / (n - 1), u1 = (float)(x + 1) / (n - 1);
-                float v0 = (float)y / (n - 1), v1 = (float)(y + 1) / (n - 1);
-                float us[4] = { u0, u1, u0, u1 }, vs_[4] = { v0, v0, v1, v1 };
-                V quad[4];
-                for (int i = 0; i < 4; i++) {
-                    float u = us[i], v = vs_[i];
-                    float dx = (1 - u) * (1 - v) * c00[0] + u * (1 - v) * c10[0] +
-                               (1 - u) * v * c01[0] + u * v * c11[0];
-                    float dy = (1 - u) * (1 - v) * c00[1] + u * (1 - v) * c10[1] +
-                               (1 - u) * v * c01[1] + u * v * c11[1];
-                    quad[i].pos[0] = (2 * u - 1) + dx;
-                    quad[i].pos[1] = (1 - 2 * v) + dy;
-                    quad[i].pos[2] = 0;
-                    quad[i].uv[0] = u;
-                    quad[i].uv[1] = v;
-                }
-                const int idx[6] = { 0, 2, 1, 1, 2, 3 };
-                for (int i = 0; i < 6; i++) data.push_back(quad[idx[i]]);
+        for (LONG y = 0; y < n; y++) {
+            for (LONG x = 0; x < n; x++) {
+                float u = (float)x / (n - 1), v = (float)y / (n - 1);
+                float dx = (1 - u) * (1 - v) * c00[0] + u * (1 - v) * c10[0] +
+                           (1 - u) * v * c01[0] + u * v * c11[0];
+                float dy = (1 - u) * (1 - v) * c00[1] + u * (1 - v) * c10[1] +
+                           (1 - u) * v * c01[1] + u * v * c11[1];
+                V& d = grid[(size_t)y * n + x];
+                d.pos[0] = (2 * u - 1) + dx;
+                d.pos[1] = (1 - 2 * v) + dy;
+                d.pos[2] = 0;
+                d.uv[0] = u;
+                d.uv[1] = v;
             }
         }
         c.mode = 0;
         c.gridN = n;
     }
-    if (c.vb) { c.vb->Release(); c.vb = nullptr; }
-    D3D11_BUFFER_DESC bd = {};
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    bd.ByteWidth = (UINT)(data.size() * sizeof(V));
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    D3D11_SUBRESOURCE_DATA init = { data.data(), 0, 0 };
-    if (FAILED(c.dev->CreateBuffer(&bd, &init, &c.vb))) { hookLog("vb create failed"); return false; }
+    // warp pass: two triangles per cell (0,2,1)(1,2,3), TL,TR,BL,BR ordering
+    std::vector<V> data;
+    data.reserve((size_t)(RV - 1) * (CV - 1) * 6);
+    for (int i = 0; i < RV - 1; i++) {
+        for (int j = 0; j < CV - 1; j++) {
+            const V* q[4] = {
+                &grid[(size_t)i * CV + j],     &grid[(size_t)i * CV + j + 1],
+                &grid[(size_t)(i + 1) * CV + j], &grid[(size_t)(i + 1) * CV + j + 1],
+            };
+            const int idl[6] = { 0, 2, 1, 1, 2, 3 };
+            for (int k = 0; k < 6; k++) data.push_back(*q[idl[k]]);
+        }
+    }
+    // calibration overlay: horizontal + vertical line segments over the grid
+    std::vector<V> lines;
+    lines.reserve(((size_t)(RV - 1) * CV + (size_t)(CV - 1) * RV) * 2);
+    for (int i = 0; i < RV; i++)
+        for (int j = 0; j < CV - 1; j++) {
+            lines.push_back(grid[(size_t)i * CV + j]);
+            lines.push_back(grid[(size_t)i * CV + j + 1]);
+        }
+    for (int j = 0; j < CV; j++)
+        for (int i = 0; i < RV - 1; i++) {
+            lines.push_back(grid[(size_t)i * CV + j]);
+            lines.push_back(grid[(size_t)(i + 1) * CV + j]);
+        }
+    if (!createVB(c, data.data(), data.size() * sizeof(V), &c.vb, "vb create failed")) return false;
+    if (!createVB(c, lines.data(), lines.size() * sizeof(V), &c.lineVB, "line vb create failed")) return false;
     c.vertCount = (UINT)data.size();
+    c.lineVertCount = (UINT)lines.size();
     memcpy(c.corner, cfg.corner, sizeof(c.corner));
     if (c.mode == 1) {
         char buf[96];
@@ -531,6 +568,17 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
                 ID3D11ShaderResourceView* srvp = c.srv;
                 c.ctx->PSSetShaderResources(0, 1, &srvp);
                 c.ctx->Draw(c.vertCount, 0);
+                // calibration overlay: redraw the warp mesh as yellow lines
+                if (cfg->overlay && c.lineVB && c.lineVertCount) {
+                    c.ctx->PSSetShader(c.psLine, nullptr, 0);
+                    ID3D11Buffer* lvb = c.lineVB;
+                    c.ctx->IASetVertexBuffers(0, 1, &lvb, &stride, &off);
+                    c.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+                    c.ctx->Draw(c.lineVertCount, 0);
+                    // restore for the next frame's warp draw
+                    c.ctx->IASetVertexBuffers(0, 1, &vbp, &stride, &off);
+                    c.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                }
                 ID3D11ShaderResourceView* nullSrv = nullptr;
                 c.ctx->PSSetShaderResources(0, 1, &nullSrv);
                 c.frames++;

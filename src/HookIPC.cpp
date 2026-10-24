@@ -78,6 +78,11 @@ void hookIpcPublishMesh(const float* src, int srcStride, int rows, int cols,
     g_hookView->meshRev++;     // DLL rebuild trigger
 }
 
+void hookIpcSetOverlay(bool on) {
+    std::lock_guard<std::mutex> lk(g_hookMutex);
+    if (g_hookView) g_hookView->overlay = on ? 1 : 0;
+}
+
 bool hookIpcEnabled() {
     std::lock_guard<std::mutex> lk(g_hookMutex);
     return g_hookView && g_hookView->enabled;
@@ -106,4 +111,9 @@ int hookIpcMeshVerts() {
 int hookIpcMeshRev() {
     std::lock_guard<std::mutex> lk(g_hookMutex);
     return g_hookView ? (int)g_hookView->meshRev : 0;
+}
+
+bool hookIpcOverlay() {
+    std::lock_guard<std::mutex> lk(g_hookMutex);
+    return g_hookView && g_hookView->overlay;
 }

@@ -46,12 +46,14 @@ struct IWNHookCfg {
     float  chanBlend[3];     // per-channel blend gamma R,G,B (edge 0's values)
     LONG   edgesMask;        // bit0=left bit1=right bit2=top bit3=bottom
     LONG   meshRev;          // bumped on every mesh publish (DLL rebuild trigger)
+    LONG   overlay;          // 0 = none, 1 = draw the warp mesh lines on top
+    LONG   overlayPad;       // keep 8-byte alignment before the vertex array
     wchar_t monitor[32];     // target monitor DeviceName (\\.\DISPLAYn);
                              // empty = apply to every hooked swapchain
     IWNMeshVtx verts[IWN_MAX_MESH_VERTS];
 };
 #pragma pack(pop)
 
-static_assert(offsetof(IWNHookCfg, verts) == 228, "hook IPC v2 header drift");
-static_assert(sizeof(IWNHookCfg) >= 228 + IWN_MAX_MESH_VERTS * sizeof(IWNMeshVtx),
+static_assert(offsetof(IWNHookCfg, verts) == 236, "hook IPC v2 header drift");
+static_assert(sizeof(IWNHookCfg) >= 236 + IWN_MAX_MESH_VERTS * sizeof(IWNMeshVtx),
               "hook IPC v2 layout drift");

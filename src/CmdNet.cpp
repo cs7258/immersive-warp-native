@@ -190,7 +190,8 @@ static std::string dispatch(std::string line) {
                    ";exc=0x" + hex +
                    ";etid=" + std::to_string(hookIpcExcTid()) +
                    ";mesh=" + std::to_string(hookIpcMeshVerts()) +
-                   ";rev=" + std::to_string(hookIpcMeshRev()) + "\n";
+                   ";rev=" + std::to_string(hookIpcMeshRev()) +
+                   ";ovl=" + std::string(hookIpcOverlay() ? "on" : "off") + "\n";
         }
         if (k == "srcs") {   // per-output source overrides (empty "-" = global pin)
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -277,6 +278,7 @@ static std::string dispatch(std::string line) {
                 s += "sampling=" + std::to_string(g_cfg.sampling) + ";";
                 s += "maxfps=" + std::to_string(g_cfg.maxfps) + ";";
                 s += std::string("hook=") + (hookIpcEnabled() ? "on" : "off") + ";";
+                s += std::string("hookovl=") + (hookIpcOverlay() ? "on" : "off") + ";";
                 s += std::string("testpattern=") + (g_cfg.testPattern ? "on" : "off") + ";";
                 s += "layout=" + std::to_string(g_cfg.layoutC) + "x" + std::to_string(g_cfg.layoutR) + ";";
                 s += "overlap=" + std::to_string(g_cfg.overlap) + ";";
@@ -512,6 +514,7 @@ static std::string dispatch(std::string line) {
                ";subdivide=" + std::to_string(subd) +
                ";maxfps=" + std::to_string(maxFps) +
                std::string(";hook=") + (hookOn ? "on" : "off") +
+               std::string(";hookovl=") + (hookIpcOverlay() ? "on" : "off") +
                ";move=" + std::string(g_moveMode.load() == 1 ? "xy" : g_moveMode.load() == 2 ? "all" : "single") +
                ";roi=" + std::to_string(roiL) + "," + std::to_string(roiT) + "," +
                           std::to_string(roiR) + "," + std::to_string(roiB) +
@@ -816,6 +819,15 @@ static std::string dispatch(std::string line) {
             else return "ERR SET hook (on|off)\n";
             hookIpcSet(on, nullptr, 0);
             return std::string("OK hook=") + (on ? "on" : "off") + "\n";
+        }
+        if (key == "hookovl") {
+            // DLL-side calibration overlay: draw the warp mesh as lines
+            bool on;
+            if (val == "1" || val == "ON" || val == "TRUE") on = true;
+            else if (val == "0" || val == "OFF" || val == "FALSE") on = false;
+            else return "ERR SET hookovl (on|off)\n";
+            hookIpcSetOverlay(on);
+            return std::string("OK hookovl=") + (on ? "on" : "off") + "\n";
         }
         if (key == "hooktest") {
             bool on;

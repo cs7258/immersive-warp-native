@@ -248,6 +248,8 @@ void hookIpcPublishMesh(const float* src, int srcStride, int rows, int cols,
                         int edgesMask, const wchar_t* monitor);
 int hookIpcMeshVerts();        // published grid vertex count (0 = corner model)
 int hookIpcMeshRev();          // publish revision (bumps on every rebuild)
+void hookIpcSetOverlay(bool on);  // DLL-side mesh-line overlay (calibration)
+bool hookIpcOverlay();            // overlay flag as last set
 
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);
