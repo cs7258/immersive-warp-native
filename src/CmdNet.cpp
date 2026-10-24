@@ -1000,8 +1000,15 @@ static std::string dispatch(std::string line) {
             {
                 std::lock_guard<std::mutex> lk(g_snapMutex);
                 g_snapPath = path;
+                g_lastSnap.clear();   // in-flight marker: GET snap polls for none -> path
             }
-            g_snapReq.store(1);
+            if (g_cfg.engine == 1) {
+                // MAG engine: no render thread to consume g_snapReq - the
+                // snapshot is a GDI grab of the magnifier hosts on the UI thread
+                requestMagSnapshot();
+            } else {
+                g_snapReq.store(1);
+            }
             return "OK snap=requested\n";
         }
         if (key == "rows" || key == "cols") {

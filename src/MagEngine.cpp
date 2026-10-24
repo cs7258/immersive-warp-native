@@ -106,3 +106,58 @@ void magDetachAll() {
     }
     g_magHosts.clear();
 }
+
+// Frame snapshot for the MAG engine. There is no swapchain here, so the
+// capture walks every live magnifier host and BitBlts its client area off
+// the composited screen (CAPTUREBLT: layered windows are included). That
+// grabs exactly what the output shows - magnified feed + the mask / blend /
+// probe overlays stacked on top. File naming: first host writes basePath
+// verbatim, additional hosts get a -2/-3 suffix. Returns files written.
+int magSnapshotAll(const std::wstring& basePath) {
+    std::lock_guard<std::mutex> lk(g_magMutex);
+    if (!g_magReady) return 0;
+    int written = 0, idx = 0;
+    for (HWND h : g_magHosts) {
+        if (!h || !IsWindow(h)) { idx++; continue; }
+        RECT rc{};
+        if (!GetClientRect(h, &rc)) { idx++; continue; }
+        int w = rc.right - rc.left, hh = rc.bottom - rc.top;
+        if (w <= 0 || hh <= 0) { idx++; continue; }
+        POINT pt{};
+        ClientToScreen(h, &pt);
+        HDC sdc = GetDC(nullptr);
+        HDC mdc = CreateCompatibleDC(sdc);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -hh;      // top-down rows, same as D3D
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(mdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (bmp && bits) {
+            HGDIOBJ old = SelectObject(mdc, bmp);
+            if (BitBlt(mdc, 0, 0, w, hh, sdc, pt.x, pt.y, SRCCOPY | CAPTUREBLT)) {
+                std::wstring path = basePath;
+                if (idx > 0) { path += L"-"; path += std::to_wstring(idx + 1); }
+                if (snapEncodePng(path, (UINT)w, (UINT)hh,
+                                  (const uint8_t*)bits, (UINT)w * 4)) {
+                    std::lock_guard<std::mutex> sl(g_snapMutex);
+                    g_lastSnap = std::string(path.begin(), path.end());  // ASCII-safe dir
+                    dbgLogLine("magSnap: wrote host " + std::to_string(idx + 1));
+                    written++;
+                } else dbgLogLine("magSnap: encode failed");
+            } else {
+                dbgLogLine("magSnap: BitBlt failed gle=" +
+                           std::to_string((long)GetLastError()));
+            }
+            SelectObject(mdc, old);
+            DeleteObject(bmp);
+        } else dbgLogLine("magSnap: CreateDIBSection failed");
+        if (mdc) DeleteDC(mdc);
+        if (sdc) ReleaseDC(nullptr, sdc);
+        idx++;
+    }
+    return written;
+}

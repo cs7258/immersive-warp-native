@@ -141,6 +141,7 @@ void requestMagBlendSync();    // any thread: MAG edge-blend overlays resync (UI
 void requestOutputRebuild();   // any thread: destroy+recreate output windows on the UI thread
 void requestMagTestSync();     // any thread: test pattern overlays follow (engine=1)
 void requestMagProbeSync();    // any thread: probe marker overlays follow (engine=1)
+void requestMagSnapshot();     // any thread: MAG frame snapshot via GDI (UI thread)
 void requestSourceRebuild();   // any thread: per-output src override -> rebuild outputs
 void requestOvrSrcSync();      // any thread: override combo follows SET src=
 void requestBlackoutSync();    // any thread: blackout overlays + menu checkbox follow
@@ -164,6 +165,7 @@ void magSetConsoleWindow(HWND ctl);            // console is excluded from the f
 void magAddFilter(HWND w);                     // extra windows hidden from the feed
 void magRemoveFilter(HWND w);
 void magDetachAll();                           // clear sources, uninit
+int magSnapshotAll(const std::wstring& basePath); // GDI-capture every live host to PNG
 // set when WDA_EXCLUDEFROMCAPTURE is unavailable: capturing our own display
 // would recursively film the output window, so capture is disabled instead
 extern std::atomic<bool> g_previewNoCapture;
@@ -223,6 +225,9 @@ bool saveConfig(const std::wstring& path);
 bool loadConfig(const std::wstring& path);
 std::wstring presetPath(const std::string& name);  // %APPDATA%\...\presets\<NAME>.cfg
 std::wstring snapshotDefaultPath();               // %APPDATA%\...\snapshots\<ts>.png
+// shared WIC PNG encoder (DXGI back-buffer snapshot + MAG GDI capture)
+bool snapEncodePng(const std::wstring& path, UINT w, UINT h,
+                   const uint8_t* px, UINT stride);
 
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);

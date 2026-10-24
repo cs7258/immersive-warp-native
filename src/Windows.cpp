@@ -1417,6 +1417,7 @@ constexpr UINT WM_BLACKOUT = WM_APP + 18;     // blackout toggled off-thread
 constexpr UINT WM_OVRSYNC = WM_APP + 20;      // per-output source override UI sync
 constexpr UINT WM_SBFRESH = WM_APP + 21;      // status bar refresh from off-thread
 constexpr UINT WM_ROISYNC = WM_APP + 22;      // ROI edits resync from off-thread
+constexpr UINT WM_MAGSNAP = WM_APP + 23;      // MAG frame snapshot (GDI grab)
                                               // WM_DISPLAYCHANGE (the handler
                                               // must not do heavy work inline)
 static DWORD uiThreadId = 0;
@@ -2159,6 +2160,12 @@ void requestMagProbeSync() {
     // socket thread: probe markers toggled -> overlays follow on the UI
     // thread (engine=1 only; the DXGI engine draws them in its overlay pass)
     if (g_ctl) PostMessageW(g_ctl, WM_MAGPROBE, 0, 0);
+}
+
+void requestMagSnapshot() {
+    // socket thread: SET snap with engine=1 -> GDI-grab the magnifier hosts
+    // on the UI thread (there is no render thread to consume g_snapReq)
+    if (g_ctl) PostMessageW(g_ctl, WM_MAGSNAP, 0, 0);
 }
 
 // socket thread: a per-output source override changed (SET src=). The
@@ -4134,6 +4141,29 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             on = g_cfg.engine == 1;
         }
         syncMagProbeOverlays(on && g_probe.load() && !g_outWins.empty());
+        return 0;
+    }
+    case WM_MAGSNAP: {      // MAG frame snapshot: GDI grab of the magnifier hosts
+        static int snapRetries = 0;
+        std::wstring snapPath;
+        {
+            std::lock_guard<std::mutex> lk(g_snapMutex);
+            snapPath = g_snapPath;
+        }
+        if (!snapPath.empty()) {
+            int n = magSnapshotAll(snapPath);
+            if (n > 0) {
+                snapRetries = 0;
+            } else if (++snapRetries < 10) {
+                // hosts may still be rebuilding right after SET engine=MAG -
+                // repost to ourselves, bounded (message-loop paced)
+                PostMessageW(hwnd, WM_MAGSNAP, 0, 0);
+                return 0;
+            } else {
+                dbgLogLine("magSnap: gave up - no live magnifier hosts");
+                snapRetries = 0;
+            }
+        }
         return 0;
     }
     case WM_BLACKOUT: {     // blackout toggled from the socket thread

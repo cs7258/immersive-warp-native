@@ -331,6 +331,52 @@ bool Engine::uploadImage(UINT w, UINT h, const std::vector<BYTE>& bgra, const ch
     return true;
 }
 
+// Shared WIC PNG encoder. px = tightly-packed or strided 32bpp BGRA pixels.
+// Used by the DXGI back-buffer snapshot and the MAG engine's GDI capture.
+bool snapEncodePng(const std::wstring& path, UINT w, UINT h,
+                   const uint8_t* px, UINT stride) {
+    static bool comInit = false;
+    if (!comInit) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); comInit = true; }
+    IWICImagingFactory* fac = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+            CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (void**)&fac))) {
+        dbgLog("snap: no WIC factory");
+        return false;
+    }
+    bool ok = false;
+    IWICBitmap* bmp = nullptr;
+    if (SUCCEEDED(fac->CreateBitmapFromMemory(w, h,
+            GUID_WICPixelFormat32bppBGRA, stride, (UINT)stride * h, px, &bmp))) {
+        IWICStream* stream = nullptr;
+        if (SUCCEEDED(fac->CreateStream(&stream)) && stream &&
+            SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) {
+            IWICBitmapEncoder* enc = nullptr;
+            if (SUCCEEDED(fac->CreateEncoder(GUID_ContainerFormatPng,
+                    nullptr, &enc)) && enc &&
+                SUCCEEDED(enc->Initialize(stream, WICBitmapEncoderNoCache))) {
+                IWICBitmapFrameEncode* frame = nullptr;
+                if (SUCCEEDED(enc->CreateNewFrame(&frame, nullptr)) && frame &&
+                    SUCCEEDED(frame->Initialize(nullptr)) &&
+                    SUCCEEDED(frame->SetSize(w, h))) {
+                    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+                    frame->SetPixelFormat(&fmt);
+                    HRESULT hr = frame->WritePixels(h, stride, stride * h, (void*)px);
+                    if (SUCCEEDED(hr) && SUCCEEDED(frame->Commit()) &&
+                        SUCCEEDED(enc->Commit())) {
+                        ok = true;
+                    } else dbgLog("snap: encode failed");
+                }
+                if (frame) frame->Release();
+            }
+            if (enc) enc->Release();
+        }
+        if (stream) stream->Release();
+    }
+    if (bmp) bmp->Release();
+    fac->Release();
+    return ok;
+}
+
 // Frame snapshot: copies the swapchain back buffer to a staging texture and
 // encodes it as PNG via WIC. Runs on the render thread right before Present
 // (the back buffer holds the complete frame at that point). Bypasses the
@@ -367,51 +413,17 @@ void Engine::captureSnapshot(OutputCtx& oc) {
         D3D11_MAPPED_SUBRESOURCE mp{};
         hr = m_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mp);
         if (SUCCEEDED(hr)) {
-            static bool comInit = false;
-            if (!comInit) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); comInit = true; }
-            IWICImagingFactory* fac = nullptr;
-            if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                    CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (void**)&fac))) {
-                // row pitch may exceed width*4 - copy scanlines into one block
-                std::vector<uint8_t> px((size_t)td.Width * td.Height * 4);
-                const uint8_t* src = (const uint8_t*)mp.pData;
-                for (UINT y = 0; y < td.Height; y++)
-                    memcpy(px.data() + (size_t)y * td.Width * 4,
-                           src + (size_t)y * mp.RowPitch, (size_t)td.Width * 4);
-                IWICBitmap* bmp = nullptr;
-                if (SUCCEEDED(fac->CreateBitmapFromMemory(td.Width, td.Height,
-                        GUID_WICPixelFormat32bppBGRA, (UINT)mp.RowPitch > 0 ? td.Width * 4 : 4,
-                        (UINT)px.size(), px.data(), &bmp))) {
-                    IWICStream* stream = nullptr;
-                    if (SUCCEEDED(fac->CreateStream(&stream)) && stream &&
-                        SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) {
-                        IWICBitmapEncoder* enc = nullptr;
-                        if (SUCCEEDED(fac->CreateEncoder(GUID_ContainerFormatPng,
-                                nullptr, &enc)) && enc &&
-                            SUCCEEDED(enc->Initialize(stream, WICBitmapEncoderNoCache))) {
-                            IWICBitmapFrameEncode* frame = nullptr;
-                            if (SUCCEEDED(enc->CreateNewFrame(&frame, nullptr)) && frame &&
-                                SUCCEEDED(frame->Initialize(nullptr)) &&
-                                SUCCEEDED(frame->SetSize(td.Width, td.Height))) {
-                                WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-                                frame->SetPixelFormat(&fmt);
-                                hr = frame->WritePixels((UINT)td.Height, td.Width * 4,
-                                                        (UINT)px.size(), px.data());
-                                if (SUCCEEDED(hr) && SUCCEEDED(frame->Commit()) &&
-                                    SUCCEEDED(enc->Commit())) {
-                                    std::lock_guard<std::mutex> lk(g_snapMutex);
-                                    g_lastSnap = std::string(path.begin(), path.end());  // ASCII-safe: snapshot dir
-                                    dbgLog("snap: wrote " + g_lastSnap);
-                                } else dbgLog("snap: encode failed");
-                            }
-                            if (frame) frame->Release();
-                        }
-                        if (enc) enc->Release();
-                    }
-                    if (stream) stream->Release();
-                }
-                if (bmp) bmp->Release();
-            } else dbgLog("snap: no WIC factory");
+            // row pitch may exceed width*4 - copy scanlines into one block
+            std::vector<uint8_t> px((size_t)td.Width * td.Height * 4);
+            const uint8_t* src = (const uint8_t*)mp.pData;
+            for (UINT y = 0; y < td.Height; y++)
+                memcpy(px.data() + (size_t)y * td.Width * 4,
+                       src + (size_t)y * mp.RowPitch, (size_t)td.Width * 4);
+            if (snapEncodePng(path, td.Width, td.Height, px.data(), td.Width * 4)) {
+                std::lock_guard<std::mutex> lk(g_snapMutex);
+                g_lastSnap = std::string(path.begin(), path.end());  // ASCII-safe: snapshot dir
+                dbgLog("snap: wrote " + g_lastSnap);
+            }
             m_ctx->Unmap(staging, 0);
         } else dbgLog("snap: Map failed");
         staging->Release();
