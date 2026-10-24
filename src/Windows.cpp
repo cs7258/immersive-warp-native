@@ -1182,6 +1182,9 @@ static HWND g_ckNet = nullptr;
 static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
 static HWND g_cbLayout = nullptr, g_cbOvl = nullptr, g_cbEng = nullptr;
 static HWND g_cbSrc = nullptr;
+static HWND g_cbOvrSrc = nullptr;      // per-output source override dropdown
+static bool g_ovrBusy = false;         // guards ComboBox_ResetContent reentrancy
+static std::vector<std::wstring> g_ovrDevs;  // combo index -> device name (0 = follow global)
 static HWND g_cbPreset = nullptr;   // named presets (shared with CMDNET)
 static HWND g_cbTarget = nullptr;   // per-output command target (mirrors SET out=)
 // capture source combo: index 0 = auto, index i>0 = g_srcDevs[i]
@@ -1245,6 +1248,7 @@ constexpr UINT WM_TGTREFRESH = WM_APP + 15;   // refresh the Target combo (off-t
 constexpr UINT WM_DISPCHANGE = WM_APP + 16;   // deferred output rebuild after
 constexpr UINT WM_MAGPROBE = WM_APP + 17;     // probe markers toggled off-thread
 constexpr UINT WM_BLACKOUT = WM_APP + 18;     // blackout toggled off-thread
+constexpr UINT WM_OVRSYNC = WM_APP + 20;      // per-output source override UI sync
                                               // WM_DISPLAYCHANGE (the handler
                                               // must not do heavy work inline)
 static DWORD uiThreadId = 0;
@@ -1691,6 +1695,7 @@ void notifyOutputRaised() {
 #define IDC_CKINPLACE  1033   // in-place overlay (fullscreen click-through)
 #define IDC_SCHEMATIC  1034   // Displays page: owner-drawn output schematic
 #define IDC_STATUSINFO 1035   // structured status block (testable by id)
+#define IDC_CBOVRSRC  1036   // per-output source override dropdown
 // (menu bar IDM_* ids live above showTab, see the note there)
 
 static void refreshList() {
@@ -1746,6 +1751,54 @@ static void populateSourceCombo() {
 std::wstring currentSourceDevice() {
     std::lock_guard<std::mutex> lk(g_cfgMutex);
     return g_cfg.sourceDev;
+}
+
+// ---- per-output source override combo (Displays page, UI thread) ----
+// device name behind the output listbox's current selection ("" = none)
+static std::wstring listSelDeviceName() {
+    if (!g_list) return L"";
+    int sel = ListBox_GetCurSel(g_list);
+    if (sel < 0) return L"";
+    auto displays = enumerateDisplays();
+    if (sel >= (int)displays.size()) return L"";
+    return displays[sel].deviceName;
+}
+
+// fill the override combo for the currently selected output. Index 0 =
+// "follow global source" (empty override), 1..n = display devices.
+static void populateOvrSrcCombo() {
+    if (!g_cbOvrSrc) return;
+    g_ovrBusy = true;
+    ComboBox_ResetContent(g_cbOvrSrc);
+    g_ovrDevs.clear();
+    g_ovrDevs.push_back(L"");   // index 0 = follow global
+    ComboBox_AddString(g_cbOvrSrc, L"Follow global source");
+    auto displays = enumerateDisplays();
+    for (auto& d : displays) {
+        wchar_t line[160];
+        wsprintfW(line, L"%s%s", d.label.c_str(), d.primary ? L" [Primary]" : L"");
+        ComboBox_AddString(g_cbOvrSrc, line);
+        g_ovrDevs.push_back(d.deviceName);
+    }
+    int sel = 0;
+    std::wstring own = listSelDeviceName();
+    if (!own.empty()) {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs) {
+            if (!o.enabled || o.deviceName != own) continue;
+            if (!o.srcOverride.empty())
+                for (size_t i = 1; i < g_ovrDevs.size(); i++)
+                    if (sameDisplayName(g_ovrDevs[i], o.srcOverride)) { sel = (int)i; break; }
+            break;
+        }
+    }
+    ComboBox_SetCurSel(g_cbOvrSrc, sel);
+    g_ovrBusy = false;
+}
+
+// socket thread: CMDNET SET src= changed an override -> combo follows
+void requestOvrSrcSync() {
+    if (g_ctl) PostMessageW(g_ctl, WM_OVRSYNC, 0, 0);
 }
 
 // cfg-only update, any thread (returns true when the value actually changed)
@@ -3048,6 +3101,7 @@ void refreshTargetComboUI() {
 // loadConfig() swapped g_cfg. Must be called WITHOUT g_cfgMutex held.
 static void applyLoadedConfig() {
     refreshList();
+    populateOvrSrcCombo();   // overrides may differ in the loaded config
     g_previewMode.store(g_cfg.previewMode);
     g_inplace.store(g_cfg.inplace);
     Button_SetCheck(g_ckPreview, g_cfg.previewMode ? BST_CHECKED : BST_UNCHECKED);
@@ -3417,6 +3471,13 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Stop Output",
             WS_CHILD | BS_PUSHBUTTON, 436, 116, 178, 28,
             hwnd, (HMENU)IDC_STOP, nullptr, nullptr));
+        add(PAGE_DISPLAYS, CreateWindowW(L"STATIC", L"Override source:",
+            WS_CHILD | SS_LEFT, 436, 152, 178, 16,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_DISPLAYS, g_cbOvrSrc = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            436, 170, 178, 220,
+            hwnd, (HMENU)IDC_CBOVRSRC, nullptr, nullptr));
         add(PAGE_DISPLAYS, CreateWindowW(L"STATIC", L"Source:",
             WS_CHILD | SS_LEFT, 16, 240, 54, 18,
             hwnd, nullptr, nullptr, nullptr));
@@ -3620,6 +3681,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
         }
         populateSourceCombo();   // locks g_cfgMutex itself
+        populateOvrSrcCombo();   // per-output override combo (list has no selection yet)
         syncLayoutCombos();
         refreshTargetComboUI();
         trayInit(hwnd);
@@ -3629,8 +3691,12 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_SRCSET: {   // capture source changed from the socket thread
         rebuildForSource();
+        populateOvrSrcCombo();   // override combo follows (same UI thread)
         return 0;
     }
+    case WM_OVRSYNC:    // per-output override changed from the socket thread
+        populateOvrSrcCombo();
+        return 0;
     case WM_INPLACESET: {   // in-place overlay toggled (UI or socket thread):
         // only the window style changes, but CreateWindowExW takes the full
         // ex-style, so rebuild the output windows (idempotent)
@@ -3981,6 +4047,34 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             else wsprintfW(msg, L"Capture source pinned to %s (outputs rebuilt).", dev.c_str());
             setStatus(msg);
             setSourceDisplay(dev);
+        } else if (id == IDC_CBOVRSRC && HIWORD(wp) == CBN_SELCHANGE) {
+            if (g_ovrBusy) return 0;   // reentrancy guard (combo repopulation)
+            int sel = ComboBox_GetCurSel(g_cbOvrSrc);
+            std::wstring dev;   // index 0 = follow global (empty override)
+            if (sel > 0 && sel < (int)g_ovrDevs.size()) dev = g_ovrDevs[sel];
+            std::wstring own = listSelDeviceName();
+            bool applied = false;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled || o.deviceName != own) continue;
+                    if (o.srcOverride != dev) { o.srcOverride = dev; g_rev++; }
+                    applied = true;
+                    break;
+                }
+            }
+            if (applied) {
+                wchar_t msg[192];
+                if (dev.empty())
+                    lstrcpyW(msg, L"Output source override cleared (follows global).");
+                else wsprintfW(msg, L"Output %s captures %s (outputs rebuilt).",
+                               own.c_str(), dev.c_str());
+                setStatus(msg);
+                requestSourceRebuild();
+                refreshStatusBar();
+            }
+        } else if (id == IDC_LIST && HIWORD(wp) == LBN_SELCHANGE) {
+            populateOvrSrcCombo();   // combo follows the selected output
         } else if (id == IDC_CBLAYOUT && HIWORD(wp) == CBN_SELCHANGE) {
             wchar_t t[8] = L"1x1";
             ComboBox_GetLBText(g_cbLayout, ComboBox_GetCurSel(g_cbLayout), t);
@@ -4182,6 +4276,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     UpdateWindow(g_ctl);
     showTab(PAGE_DISPLAYS);   // now that g_ctl is set: mark the View menu item
     refreshList();
+    populateOvrSrcCombo();
     // global hotkeys so calibration keys work no matter which window has focus
     RegisterHotKey(nullptr, 1, 0, VK_F3);            // enter/exit calibration
     RegisterHotKey(nullptr, 2, 0, VK_F10);           // warp <-> blend mode

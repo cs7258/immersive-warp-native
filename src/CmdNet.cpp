@@ -602,6 +602,7 @@ static std::string dispatch(std::string line) {
             }
             if (!n) return "ERR no output (SET out=<name>?)\n";
             requestSourceRebuild();
+            requestOvrSrcSync();     // Displays-page override combo follows
             refreshStatusBar();
             return "OK src=" + (dev.empty() ? std::string("auto") : shortDev(dev)) +
                    " on " + std::to_string(n) + " output(s)\n";

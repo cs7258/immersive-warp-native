@@ -135,6 +135,7 @@ void requestOutputRebuild();   // any thread: destroy+recreate output windows on
 void requestMagTestSync();     // any thread: test pattern overlays follow (engine=1)
 void requestMagProbeSync();    // any thread: probe marker overlays follow (engine=1)
 void requestSourceRebuild();   // any thread: per-output src override -> rebuild outputs
+void requestOvrSrcSync();      // any thread: override combo follows SET src=
 void requestBlackoutSync();    // any thread: blackout overlays + menu checkbox follow
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
 void refreshSampComboUI();     // socket thread safe: sampling dropdown follows shared state
