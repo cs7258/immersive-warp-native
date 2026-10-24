@@ -124,6 +124,7 @@ static void handleCommand(const std::string& payload) {
         dbgLogLine("mqtt: payload without a command string (dropped)");
         return;
     }
+    dbgLogLine("mqtt: cmd=" + cmd);
     if (cmd == "setconfigset") {
         double v;
         if (!jsonFindNumber(payload, "value", v) || v < 1 || v > 8 || v != (double)(int)v) {
@@ -137,7 +138,11 @@ static void handleCommand(const std::string& payload) {
             dbgLogLine("mqtt: setdesktopwarping needs enabled true|false");
             return;
         }
-        PostMessage(consoleWindowHandle(), WM_MQWARP, on ? 1 : 0, 0);
+        HWND ctl = consoleWindowHandle();
+        BOOL posted = PostMessage(ctl, WM_MQWARP, on ? 1 : 0, 0);
+        dbgLogLine(std::string("mqtt: setdesktopwarping ") + (on ? "on" : "off") +
+                   " ctl=" + std::to_string((unsigned long long)(size_t)ctl) +
+                   " posted=" + std::to_string((int)posted));
     } else if (cmd == "blackout") {
         bool on = false;
         if (!jsonFindBool(payload, "enabled", on)) {
