@@ -1151,8 +1151,17 @@ static std::string dispatch(std::string line) {
                     std::lock_guard<std::mutex> lk(g_cfgMutex);
                     g_cfg.osc = want ? 1 : 0;
                 }
-                if (want && !oscRunning()) oscStart(g_oscPortLive.load());
-                else if (!want) oscStop();
+                dbgLogLine("osc: SET branch want=" + std::string(want ? "on" : "off"));
+                try {
+                    if (want && !oscRunning()) oscStart(g_oscPortLive.load());
+                    else if (!want) oscStop();
+                } catch (const std::exception& e) {
+                    dbgLogLine(std::string("osc: SET threw: ") + e.what());
+                    return std::string("ERR SET osc (") + e.what() + ")\n";
+                } catch (...) {
+                    dbgLogLine("osc: SET threw (non-std)");
+                    return "ERR SET osc (unknown)\n";
+                }
                 applied = true;
             }
             if (!applied && key == "oscport") {
@@ -1163,7 +1172,15 @@ static std::string dispatch(std::string line) {
                     g_cfg.oscPort = p;
                 }
                 g_oscPortLive.store(p);
-                if (oscRunning()) { oscStop(); oscStart(p); }
+                try {
+                    if (oscRunning()) { oscStop(); oscStart(p); }
+                } catch (const std::exception& e) {
+                    dbgLogLine(std::string("osc: rebind threw: ") + e.what());
+                    return std::string("ERR SET oscport (") + e.what() + ")\n";
+                } catch (...) {
+                    dbgLogLine("osc: rebind threw (non-std)");
+                    return "ERR SET oscport (unknown)\n";
+                }
                 applied = true;
             }
             if (!applied) return "ERR SET " + key + "\n";
@@ -1324,11 +1341,18 @@ static void oscHandle(const char* d, int len, sockaddr_in* from) {
     sendto(g_oscSock, rep.c_str(), (int)rep.size(), 0, (sockaddr*)from, sizeof(*from));
 }
 
-void oscStart(int port) {
+// instrumented: SET osc=on crashed with an uncaught C++ exception somewhere
+// between branch entry and the (flushed!) "osc: listening" line - step logs
+// bisect the thrower in one round
+static void oscStartInner(int port) {
     if (g_oscRun.load()) return;
+    dbgLogLine("osc: enter port=" + std::to_string(port));
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;   // ref-counted: own pair
+    int wr = WSAStartup(MAKEWORD(2, 2), &wsa);
+    dbgLogLine("osc: wsa=" + std::to_string(wr));
+    if (wr != 0) return;
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    dbgLogLine("osc: sock=" + std::to_string((long long)s));
     if (s == INVALID_SOCKET) { WSACleanup(); return; }
     BOOL reuse = TRUE;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
@@ -1337,22 +1361,39 @@ void oscStart(int port) {
     a.sin_port = htons((u_short)port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) {
+        dbgLogLine("osc: bind failed wserr=" + std::to_string(WSAGetLastError()));
         closesocket(s); WSACleanup(); return;
     }
     g_oscSock = s;
     g_oscPortLive.store(port);
     g_oscRun.store(true);
     dbgLogLine("osc: listening on udp/127.0.0.1:" + std::to_string(port));
-    g_oscThread = std::thread([s]() {
-        char buf[2048];
-        while (g_oscRun.load()) {
-            sockaddr_in from{}; int fl = sizeof(from);
-            int n = recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
-            if (n <= 0) break;
-            oscHandle(buf, n, &from);
-        }
-    });
+    try {
+        g_oscThread = std::thread([s]() {
+            char buf[2048];
+            while (g_oscRun.load()) {
+                sockaddr_in from{}; int fl = sizeof(from);
+                int n = recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+                if (n <= 0) break;
+                oscHandle(buf, n, &from);
+            }
+        });
+    } catch (const std::exception& e) {
+        dbgLogLine(std::string("osc: thread threw: ") + e.what());
+        g_oscRun.store(false);
+        closesocket(s); WSACleanup(); return;
+    }
     g_oscThread.detach();
+}
+
+void oscStart(int port) {
+    try {
+        oscStartInner(port);
+    } catch (const std::exception& e) {
+        dbgLogLine(std::string("osc: start threw: ") + e.what());
+    } catch (...) {
+        dbgLogLine("osc: start threw (non-std)");
+    }
 }
 
 void oscStop() {
