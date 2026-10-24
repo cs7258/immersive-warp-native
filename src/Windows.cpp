@@ -2369,6 +2369,12 @@ static LRESULT CALLBACK ColorDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         else if (id == 2006) DestroyWindow(hwnd);
         return 0;
     }
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORBTN:               // dark theme, same palette as console
+        return (LRESULT)dlgDarkCtl(msg, (HDC)wp);
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -2398,6 +2404,7 @@ static void openColorDialog(HINSTANCE hInst, HWND owner) {
         L"Color adjustment (applies to enabled outputs)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         140, 140, 370, 300, nullptr, nullptr, hInst, nullptr);
+    if (g_colorDlg) applyDarkThemeRecursive(g_colorDlg);   // theme + 9pt font
 }
 
 void openColorDialogEx() {   // hotkey D (registered only while calibrating)
@@ -2650,6 +2657,12 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         }
         return 0;
     }
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORBTN:               // dark theme, same palette as console
+        return (LRESULT)dlgDarkCtl(msg, (HDC)wp);
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -2702,6 +2715,7 @@ static void openCurveDialog(HINSTANCE hInst, HWND owner) {
         CreateWindowW(L"BUTTON", L"Restore history(0)",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 304, 120, 24,
             g_curveDlg, (HMENU)CUV_HRESTORE, nullptr, nullptr);
+        applyDarkThemeRecursive(g_curveDlg);   // theme + 9pt font
         cuvReload();
     }
 }
@@ -3236,6 +3250,12 @@ static LRESULT CALLBACK CfgDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (id == IDCANCEL) { DestroyWindow(hwnd); return 0; }
         return 0;
     }
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORBTN:               // dark theme, same palette as console
+        return (LRESULT)dlgDarkCtl(msg, (HDC)wp);
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -3281,6 +3301,7 @@ static void openConfigDialogInternal(HINSTANCE hInst) {
         L"Configure display",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         160, 120, 424, 474, nullptr, nullptr, hInst, nullptr);
+    if (g_cfgDlg) applyDarkThemeRecursive(g_cfgDlg);   // theme + 9pt font
 }
 
 void openConfigDialog() {
@@ -3498,6 +3519,22 @@ static void applyDarkThemeRecursive(HWND root) {
         SetWindowTheme(g_tab, L"DarkMode_Explorer", nullptr);
         SendMessageW(g_tab, WM_SETFONT, (WPARAM)g_uiFont, MAKELPARAM(TRUE, 0));
     }
+}
+
+// shared CTLCOLOR plumbing for the secondary dialogs (Color / Curve / Cfg):
+// same palette as the console - bg 30,30,34, edit/listbox fields 44,44,50,
+// light text. Dialogs add one forwarding case block and call this.
+static HBRUSH dlgDarkCtl(UINT msg, HDC dc) {
+    static HBRUSH bg = CreateSolidBrush(RGB(30, 30, 34));
+    static HBRUSH field = CreateSolidBrush(RGB(44, 44, 50));
+    if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX) {
+        SetBkColor(dc, RGB(44, 44, 50));
+        SetTextColor(dc, RGB(224, 224, 224));
+        return field;
+    }
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(224, 224, 224));
+    return bg;
 }
 
 // ---------------- Displays page schematic (owner-drawn static) ----------------
