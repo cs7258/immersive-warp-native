@@ -437,9 +437,29 @@ static DWORD WINAPI initThread(LPVOID) {
         Sleep(50);
     }
     installFactoryHooks();
+    // open the host mapping eagerly - not lazily inside Present - so a
+    // mapping failure is visible in the log with a real error code
+    if (ensureCfg()) {
+        hookLog("cfg mapping ready at init");
+    } else {
+        char buf[96];
+        wsprintfA(buf, "cfg mapping NOT available at init, gle=%u", GetLastError());
+        hookLog(buf);
+    }
+    // one-shot dispatch probe: call the (hooked) slot directly 5 s in.
+    // PRESENT_TEST never displays; proves the detour is live end-to-end.
+    Sleep(5000);
+    std::lock_guard<std::mutex> lk(g_vtMutex);
+    if (g_vtCount > 0 && g_vts[0].probe) {
+        void** vt = g_vts[0].vt;
+        if (*(void* volatile*)&vt[13] == (void*)&HookPresent) {
+            hookLog("probe: calling hooked slot with PRESENT_TEST");
+            ((PFN_Present)vt[13])(g_vts[0].probe, 0, DXGI_PRESENT_TEST);
+        }
+    }
     // watchdog: re-apply the detour if something restored the original entry.
-    // NOTE: no live Present probe here - calling Present from this thread
-    // races the app's own Present on the same swapchain and crashes DXGI.
+    // NOTE: no repeated live probe - calling Present from this thread races
+    // the app's own Present on the same swapchain and crashes DXGI.
     while (true) {
         Sleep(2000);
         std::lock_guard<std::mutex> lk(g_vtMutex);
