@@ -82,7 +82,7 @@
 
 ### H.1 注入链路（挂起启动 → DLL 附加 → vtable 补丁）
 
-- [ ] 三件齐备同目录：`ImmersiveWarpNative.exe` + `IWNInject.exe` + `WarpHook.dll`
+- [ ] 四件齐备同目录：`ImmersiveWarpNative.exe` + `IWNInject.exe` + `WarpHook.dll` + `IWND3DProbe.exe`
 - [ ] 删除旧日志：`del %APPDATA%\ImmersiveWarpNative\hook.log`
 - [ ] 挂起注入启动：
       `IWNInject.exe --launch ImmersiveWarpNative.exe WarpHook.dll`
@@ -99,6 +99,10 @@
 - [ ] `INJECT PID <运行中进程pid>;` 同样回 OK 且 attach；`INJECT PID <引擎自身pid>;` 被拒
       （ERR self-injection——引擎已自扭曲，防双重 hook）
 - [ ] 错误路径不伤主程序：坏 pid / 不存在 exe / `INJECT FROBNICATE` 均 ERR，控制台继续响应
+- [ ] **外部 D3D11 端到端（轮 18）**：`INJECT LAUNCH IWND3DProbe.exe --secs 30;` → hook.log 出现
+      `swapchain hooked`（probe 的 flip-model swapchain 被捕获）且 `GET hook;` 的 `pass=` 计数
+      以约 60/s 增长（外部应用 Present detour 活跃）；`--secs` 到时 probe 自行退出
+      （此三项 injecttest.py 已自动化，真机只需复核投影画面色彩随 probe 动画变化）
 
 ### H.2 hook 状态机（CMDNET 驱动，telnet 127.0.0.1 5252）
 
