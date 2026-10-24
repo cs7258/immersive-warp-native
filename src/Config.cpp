@@ -150,6 +150,10 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "mqttPort=" << g_cfg.mqttPort << "\n";
     os << "mqttHost=" << g_cfg.mqttHost << "\n";
     os << "mqttPrefix=" << g_cfg.mqttPrefix << "\n";
+    os << "profOn=" << g_cfg.profOn << "\n";
+    os << "profN=" << g_cfg.profExe.size() << "\n";
+    for (auto& r : g_cfg.profExe)
+        os << "prof=" << toUtf8(r) << "\n";
     os << "sampling=" << g_cfg.sampling << "\n";
     os << "maxfps=" << g_cfg.maxfps << "\n";
     os << "autostart=" << g_cfg.autostart << "\n";
@@ -263,6 +267,13 @@ bool loadConfig(const std::wstring& pathIn) {
                         ok = false;
                 if (ok) c.mqttPrefix = v;
             }
+        }
+        else if (key == "profOn") c.profOn = atoi(val.c_str()) ? 1 : 0;
+        else if (key == "profN") c.profExe.clear();      // rule lines follow
+        else if (key == "prof") {
+            // executable-name wildcard; count lines verified below (profN)
+            if (!val.empty() && val.size() <= 127)
+                c.profExe.push_back(std::wstring(val.begin(), val.end()));
         }
         else if (key == "sampling") c.sampling = atoi(val.c_str());
         else if (key == "maxfps") { c.maxfps = atoi(val.c_str()); if (c.maxfps < 0) c.maxfps = 0; if (c.maxfps > 240) c.maxfps = 240; }   // render-loop pacing; garbage values clamp, 0 = uncapped

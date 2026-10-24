@@ -197,6 +197,17 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_lockMtx);
             return std::string("OK lock=") + (g_lockPwd.empty() ? "off" : "on") + "\n";
         }
+        if (k == "profile") {
+            std::string rules;
+            int n = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                n = (int)g_cfg.profExe.size();
+                for (auto& r : g_cfg.profExe) rules += ";" + toNarrow(r);
+            }
+            return "OK profile=" + std::string(profilerRunning() ? "on" : "off") +
+                   ";rules=" + std::to_string(n) + rules + "\n";
+        }
         if (k == "osc")      return std::string("OK osc=")      + (oscRunning() ? "on" : "off") + "\n";
         if (k == "oscport") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -592,6 +603,8 @@ static std::string dispatch(std::string line) {
                ";mqtthost=" + mqttHostV +
                ";mqttprefix=" + mqttPrefixV +
                ";lock=" + std::string([&]{ std::lock_guard<std::mutex> lk(g_lockMtx); return g_lockPwd.empty() ? "off" : "on"; }()) +
+               ";prof=" + std::string(profilerRunning() ? "on" : "off") +
+               ";profrules=" + std::to_string(profileRulesCount()) +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
@@ -697,6 +710,8 @@ static std::string dispatch(std::string line) {
         requestMagProbeSync();     // engine=1 probe-marker overlays follow
         Engine::inst().setSampling(g_cfg.sampling);
         Engine::inst().setTestImage(g_cfg.testImg);   // <0 clears the overlay
+        // Profiles watcher follows the loaded config (start/stop as needed)
+        if (g_cfg.profOn) profilerStart(); else profilerStop();
         if (!g_cfg.imagePath.empty()) engineLoadImage(g_cfg.imagePath);
         refreshSampComboUI();   // engine/sampling dropdowns follow loaded config
         refreshMaxFpsUI();      // Settings max-fps combo follows loaded config
@@ -798,6 +813,72 @@ static std::string dispatch(std::string line) {
             return injectPid(pid, dllTok.empty() ? std::wstring() : toWide(dllTok));
         }
         return "ERR INJECT (mode: LAUNCH|PID)\n";
+    }
+
+    // Profiles (original Profiles-page parity): watcher auto-injects
+    // WarpHook.dll into processes matching the executable-name wildcards.
+    //   PROFILE ON|OFF            start/stop the watcher
+    //   PROFILE ADD <wild>        add a rule (* ? wildcards, case-insensitive)
+    //   PROFILE DEL <wild>        remove a rule (exact rule string match)
+    //   PROFILE LIST              list rules + state
+    // dispatch uppercased everything: exe names compare case-insensitively.
+    if (cmd == "PROFILE") {
+        std::string mode, rest;
+        {
+            size_t sp = arg.find(' ');
+            if (sp == std::string::npos) mode = arg;
+            else { mode = arg.substr(0, sp); rest = arg.substr(sp + 1); }
+        }
+        if (mode == "ON" || mode == "OFF") {
+            bool want = (mode == "ON");
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.profOn = want ? 1 : 0;
+            }
+            if (want) profilerStart(); else profilerStop();
+            return std::string("OK profile=") + (profilerRunning() ? "on" : "off") + "\n";
+        }
+        if (mode == "ADD") {
+            if (rest.empty()) return "ERR PROFILE add (wildcard required)\n";
+            std::wstring wild = toWide(rest);
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (auto& r : g_cfg.profExe)
+                    if (_wcsicmp(r.c_str(), wild.c_str()) == 0)
+                        return "OK profile (rule already present)\n";
+                g_cfg.profExe.push_back(wild);
+            }
+            profileRulesChanged();
+            return "OK profile add=" + rest + "\n";
+        }
+        if (mode == "DEL") {
+            if (rest.empty()) return "ERR PROFILE del (wildcard required)\n";
+            std::wstring wild = toWide(rest);
+            bool removed = false;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                for (size_t i = 0; i < g_cfg.profExe.size(); i++)
+                    if (_wcsicmp(g_cfg.profExe[i].c_str(), wild.c_str()) == 0) {
+                        g_cfg.profExe.erase(g_cfg.profExe.begin() + i);
+                        removed = true; break;
+                    }
+            }
+            if (!removed) return "ERR PROFILE del (no such rule)\n";
+            profileRulesChanged();
+            return "OK profile del=" + rest + "\n";
+        }
+        if (mode == "LIST" || mode.empty()) {
+            std::string rules;
+            int n = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                n = (int)g_cfg.profExe.size();
+                for (auto& r : g_cfg.profExe) rules += ";" + toNarrow(r);
+            }
+            return "OK profile=" + std::string(profilerRunning() ? "on" : "off") +
+                   ";rules=" + std::to_string(n) + rules + "\n";
+        }
+        return "ERR PROFILE (mode: ON|OFF|ADD|DEL|LIST)\n";
     }
 
     if (cmd == "AUTOSTART") {

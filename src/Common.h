@@ -110,6 +110,10 @@ struct AppConfig {
     int mqttPort = 1883;              // standard MQTT port
     std::string mqttHost = "127.0.0.1";   // broker address (name or IPv4)
     std::string mqttPrefix = "display";   // topic prefix, case-sensitive on the wire
+    // Profiles (original Profiles-page parity): auto-inject WarpHook.dll into
+    // processes whose executable name matches any rule (wildcards * ? allowed)
+    int profOn = 0;                       // watcher on/off
+    std::vector<std::wstring> profExe;    // executable-name wildcard rules
     int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x, 3 bicubic
     int maxfps = 0;                   // output frame cap (0 = uncapped); paces the DXGI render loop
     int autostart = 0;                // start with Windows (HKCU Run mirror)
@@ -336,6 +340,12 @@ std::string cmdnetExecute(const std::string& line); // run a CMDNET line program
 std::string injectLaunch(const std::wstring& exe, const std::wstring& args,
                          const std::wstring& dllIn);
 std::string injectPid(unsigned long pid, const std::wstring& dllIn);
+// Profile watcher: auto-inject into processes matching g_cfg.profExe rules
+void profilerStart();
+void profilerStop();
+bool profilerRunning();
+void profileRulesChanged();      // call after mutating profExe (rule edits)
+int profileRulesCount();         // active rule count (locked read)
 // UTF-8 <-> UTF-16 conversion shared by CmdNet.cpp / Inject.cpp
 std::string toNarrow(const std::wstring& w);
 // start with Windows: HKCU\...\Run value "ImmersiveWarpNative" (no admin needed)

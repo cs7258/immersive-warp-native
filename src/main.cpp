@@ -106,6 +106,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     if (g_cfg.cmdnet) cmdnetStart(g_cfg.cmdnetPort);
     if (g_cfg.osc) oscStart(g_cfg.oscPort);
     if (g_cfg.mqtt) mqttStart();   // broker client: <prefix>/command JSON cmds
+    if (g_cfg.profOn) profilerStart();   // Profiles: auto-inject rule watcher
 
     if (!Engine::inst().init()) {
         MessageBoxW(nullptr, L"D3D11 device creation failed.", APP_NAME, MB_ICONERROR);
@@ -148,6 +149,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     cmdnetStop();
     oscStop();
     mqttStop();
+    profilerStop();
     Engine::inst().shutdown();
     return 0;
 }
