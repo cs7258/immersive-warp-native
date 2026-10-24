@@ -20,6 +20,9 @@ std::atomic<bool> g_blackout{ false };
 // dynamic test pattern pause (Animation/Paused toggle in the original's Images
 // area). Session-only like blackout: a fresh console resumes animating.
 std::atomic<bool> g_testPause{ false };
+// warp-point move mode: 0=single, 1=row+column (Move XY), 2=all points.
+// Session-only editor state (original's Geometry "Move:" radio group).
+std::atomic<int> g_moveMode{ 0 };
 // periodic perf snapshot into debug.log (SET perflog=on; 1 line / 10 s)
 std::atomic<bool> g_perfLog{ false };
 std::atomic<int>  g_dispChange{ 0 };

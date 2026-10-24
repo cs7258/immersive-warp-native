@@ -190,6 +190,10 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return std::string("OK checker=") + (g_cfg.checker ? "on" : "off") + "\n";
         }
+        if (k == "move") {
+            int m = g_moveMode.load();
+            return std::string("OK move=") + (m == 1 ? "xy" : m == 2 ? "all" : "single") + "\n";
+        }
         if (k == "roi") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             char b[64];
@@ -285,6 +289,10 @@ static std::string dispatch(std::string line) {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 s += "testanim=" + std::to_string(g_cfg.testAnim) + ";";
                 s += std::string("checker=") + (g_cfg.checker ? "on" : "off") + ";";
+                {
+                    int m = g_moveMode.load();
+                    s += std::string("move=") + (m == 1 ? "xy" : m == 2 ? "all" : "single") + ";";
+                }
                 char rb[64];
                 sprintf_s(rb, "roi=%d,%d,%d,%d;", g_cfg.roi[0], g_cfg.roi[1], g_cfg.roi[2], g_cfg.roi[3]);
                 s += rb;
@@ -459,6 +467,7 @@ static std::string dispatch(std::string line) {
                ";testanim=" + std::to_string(testAnim) +
                ";testpause=" + std::string(g_testPause.load() ? "on" : "off") +
                ";checker=" + std::string(checker ? "on" : "off") +
+               ";move=" + std::string(g_moveMode.load() == 1 ? "xy" : g_moveMode.load() == 2 ? "all" : "single") +
                ";roi=" + std::to_string(roiL) + "," + std::to_string(roiT) + "," +
                           std::to_string(roiR) + "," + std::to_string(roiB) +
                ";roicircle=" + std::string(roiCir ? "on" : "off") +
@@ -1065,6 +1074,15 @@ static std::string dispatch(std::string line) {
                 g_cfg.checker = want;
                 applied = true;
                 refreshCheckerUI(want);   // Image-page checkbox follows
+            }
+            if (!applied && key == "move") {
+                // session-only editor mode; dispatch uppercased the line so
+                // accept both cases via explicit comparisons
+                if (val == "SINGLE" || val == "1") g_moveMode.store(0);
+                else if (val == "XY" || val == "2") g_moveMode.store(1);
+                else if (val == "ALL" || val == "3") g_moveMode.store(2);
+                else return "ERR SET move (single|xy|all)\n";
+                applied = true;
             }
             if (!applied && key == "roi") {
                 // L,T,R,B inset px, comma separated (missing fields = 0)

@@ -188,6 +188,11 @@ extern std::atomic<bool> g_probe;
 // Session-only state - never persisted to config.txt.
 extern std::atomic<bool> g_blackout;
 extern std::atomic<bool> g_testPause;   // dynamic test pattern paused (session-only)
+// warp-point move mode (Geometry "Move: Single / Move XY / All points" analog):
+// 0 = single selected point, 1 = whole row+column of the grabbed point,
+// 2 = all points together. Session-only - the original dialog does not
+// persist this editor mode either.
+extern std::atomic<int> g_moveMode;
 // WM_DISPLAYCHANGE counter (resolution change / monitor hotplug). The console
 // window reposts itself into a deferred rebuild of the output windows; the
 // counter is read back via GET dispchange for test/observability.

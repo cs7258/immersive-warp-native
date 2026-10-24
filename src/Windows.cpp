@@ -197,6 +197,35 @@ static void normFromLparam(HWND hwnd, LPARAM lp, float& nx, float& ny) {
 
 static float normPointRadius(HWND hwnd) { return 12.0f; }
 
+// Move one warp control point according to g_moveMode (the original's
+// Geometry "Move: Single / Move XY / All points" radio group):
+//   single - just the grabbed point
+//   xy     - the whole row and column through it (cross), like the original's
+//            Move XY: keeps the grid rigid along both axes
+//   all    - every point translates together (whole-image pan)
+// Caller holds g_cfgMutex. idx is the row-major point index.
+static void moveWarpPoints(OutputCfg* cfg, int idx, float dx, float dy) {
+    int n = cfg->rows * cfg->cols;
+    if ((int)cfg->points.size() < n * 2) n = (int)cfg->points.size() / 2;
+    if (idx < 0 || idx >= n) return;
+    int mode = g_moveMode.load();
+    int r = idx / cfg->cols, c = idx % cfg->cols;
+    for (int j = 0; j < n; j++) {
+        if (mode == 0 && j != idx) continue;
+        if (mode == 1) {
+            int jr = j / cfg->cols, jc = j % cfg->cols;
+            if (jr != r && jc != c) continue;
+        }
+        cfg->points[2 * j] = clampf(cfg->points[2 * j] + dx, 0, 1);
+        cfg->points[2 * j + 1] = clampf(cfg->points[2 * j + 1] + dy, 0, 1);
+    }
+    g_rev++;
+}
+
+static const wchar_t* moveModeName(int m) {
+    return m == 1 ? L"Move XY (row+column)" : m == 2 ? L"All points" : L"Move Single";
+}
+
 static bool hitTestWarp(OutWinState* st, HWND hwnd, float nx, float ny, int& idxOut) {
     RECT rc; GetClientRect(hwnd, &rc);
     float px = 1.0f / (rc.right - rc.left);
@@ -254,22 +283,22 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!g_calib.load()) break;
         if (wp == VK_F10 && st) { st->subMode = 1 - st->subMode; return 0; }
         if (wp == VK_ESCAPE) { setCalibrationMode(false); return 0; }
+        if (wp == 'M' && st) { // cycle Move mode: Single -> XY -> All points
+            int m = (g_moveMode.load() + 1) % 3;
+            g_moveMode.store(m);
+            wchar_t msg[96];
+            wsprintfW(msg, L"%s (M to cycle).", moveModeName(m));
+            setStatus(msg);
+            return 0;
+        }
         if (wp >= VK_LEFT && wp <= VK_DOWN && st) { // nudge selected point
             float step = (GetKeyState(VK_SHIFT) & 0x8000) ? 0.01f : 0.002f;
+            float ddx = (wp == VK_LEFT) ? -step : (wp == VK_RIGHT) ? step : 0;
+            float ddy = (wp == VK_UP) ? -step : (wp == VK_DOWN) ? step : 0;
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             if (auto* cfg = cfgForWindowNoLock(st)) {
-                if (st->subMode == 0 && st->dragKind == 0) {
-                    int i = st->dragIdx * 2;
-                    if (i + 1 < (int)cfg->points.size()) {
-                        if (wp == VK_LEFT) cfg->points[i] -= step;
-                        if (wp == VK_RIGHT) cfg->points[i] += step;
-                        if (wp == VK_UP) cfg->points[i + 1] -= step;
-                        if (wp == VK_DOWN) cfg->points[i + 1] += step;
-                        cfg->points[i] = clampf(cfg->points[i], 0, 1);
-                        cfg->points[i + 1] = clampf(cfg->points[i + 1], 0, 1);
-                        g_rev++;
-                    }
-                }
+                if (st->subMode == 0 && st->dragKind == 0)
+                    moveWarpPoints(cfg, st->dragIdx, ddx, ddy);
             }
             return 0;
         }
@@ -330,12 +359,7 @@ static LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         if (auto* cfg = cfgForWindowNoLock(st)) {
             if (st->dragKind == 0) {
-                int i = st->dragIdx * 2;
-                if (i + 1 < (int)cfg->points.size()) {
-                    cfg->points[i] = clampf(cfg->points[i] + dx, 0, 1);
-                    cfg->points[i + 1] = clampf(cfg->points[i + 1] + dy, 0, 1);
-                    g_rev++;
-                }
+                moveWarpPoints(cfg, st->dragIdx, dx, dy);
             } else if (st->dragKind == 1) {
                 auto& b = cfg->blend[st->dragIdx];
                 if (st->dragIdx == 0) b.fade = clampf(b.fade + dx, 0.001f, 0.5f);
