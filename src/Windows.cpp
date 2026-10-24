@@ -4265,6 +4265,12 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         loadPresetByIndex((int)wp - 1);   // bounds-checked inside
         return 0;
     }
+    case WM_MQQUIT: {       // MQTT quit: same path as the tray Exit item
+        // (WM_CLOSE hides to the tray by design, so the remote command
+        // must DestroyWindow to actually shut down)
+        DestroyWindow(hwnd);
+        return 0;
+    }
     case WM_LAYSET: {   // tiled layout changed from the socket thread
         LayMsg m;
         {

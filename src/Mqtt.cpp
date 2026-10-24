@@ -154,7 +154,9 @@ static void handleCommand(const std::string& payload) {
         // dispatch uppercases the line - NTFS paths are case-insensitive
         cmdnetExecute("LOADFILE " + file);
     } else if (cmd == "quit") {
-        { HWND ctl = consoleWindowHandle(); if (ctl) PostMessage(ctl, WM_CLOSE, 0, 0); }
+        // WM_CLOSE only hides the console to the tray (the original's
+        // behaviour) - the real exit is DestroyWindow, marshalled here
+        PostMessage(consoleWindowHandle(), WM_MQQUIT, 0, 0);
     } else {
         // setheadpose and any future commands land here until supported
         dbgLogLine("mqtt: unsupported command " + cmd);

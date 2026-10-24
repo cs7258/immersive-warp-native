@@ -193,6 +193,8 @@ constexpr UINT WM_CALIBSET = WM_APP + 12;   // wp=0, lp = desired g_calib value
 // they hop to the console window like every other off-thread caller
 constexpr UINT WM_MQWARP = WM_APP + 24;     // MQTT setdesktopwarping: wp = want(0/1)
 constexpr UINT WM_MQCFGSET = WM_APP + 25;   // MQTT setconfigset: wp = set 1..8
+constexpr UINT WM_MQQUIT = WM_APP + 26;     // MQTT quit: DestroyWindow on the UI thread
+                                            // (WM_CLOSE only hides to tray, the original's way)
 void calibrationHotkeysSync(bool on);       // idempotent, UI thread only
 void requestCalibrationSync();              // any thread: post WM_CALIBSET
 extern std::atomic<bool> g_running;
