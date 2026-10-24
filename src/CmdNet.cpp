@@ -140,7 +140,6 @@ static std::string dispatch(std::string line) {
     while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(line.begin());
     while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
     for (auto& c : line) c = (char)toupper((unsigned char)c);
-    dbgLogLine("dispatch: " + line);   // DEBUG-ROUND: bisect the SET osc crash
     size_t sp = line.find(' ');
     std::string cmd = line, arg;
     if (sp != std::string::npos) { cmd = line.substr(0, sp); arg = line.substr(sp + 1); }
@@ -649,7 +648,6 @@ static std::string dispatch(std::string line) {
         std::string val = (eq == std::string::npos) ? "" : arg.substr(eq + 1);
         if (key.empty()) return "ERR SET side.field=value\n";
         for (auto& c : key) c = (char)tolower((unsigned char)c);
-        dbgLogLine("dispatch SET: key=" + key + " val=" + val);   // DEBUG-ROUND
         // Set the capture source: rebuilds the outputs, so it must run without
         // holding g_cfgMutex (setSourceDisplay locks internally).
         if (key == "source") {
@@ -1146,14 +1144,13 @@ static std::string dispatch(std::string line) {
                 applied = true;
             }
             if (!applied && key == "osc") {
+                // NOTE: this whole chain runs INSIDE the g_cfgMutex scope
+                // opened above - touching g_cfg directly needs no lock here,
+                // and locking again throws (MSVC detects the self-relock).
                 if (val != "ON" && val != "1" && val != "OFF" && val != "0")
                     return "ERR SET osc=on|off\n";
                 bool want = (val == "ON" || val == "1");
-                {
-                    std::lock_guard<std::mutex> lk(g_cfgMutex);
-                    g_cfg.osc = want ? 1 : 0;
-                }
-                dbgLogLine("osc: SET branch want=" + std::string(want ? "on" : "off"));
+                g_cfg.osc = want ? 1 : 0;
                 try {
                     if (want && !oscRunning()) oscStart(g_oscPortLive.load());
                     else if (!want) oscStop();
@@ -1169,10 +1166,7 @@ static std::string dispatch(std::string line) {
             if (!applied && key == "oscport") {
                 int p = atoi(val.c_str());
                 if (p < 1024 || p > 65535) return "ERR SET oscport (1024..65535)\n";
-                {
-                    std::lock_guard<std::mutex> lk(g_cfgMutex);
-                    g_cfg.oscPort = p;
-                }
+                g_cfg.oscPort = p;   // under the outer mutex already
                 g_oscPortLive.store(p);
                 try {
                     if (oscRunning()) { oscStop(); oscStart(p); }
@@ -1343,18 +1337,11 @@ static void oscHandle(const char* d, int len, sockaddr_in* from) {
     sendto(g_oscSock, rep.c_str(), (int)rep.size(), 0, (sockaddr*)from, sizeof(*from));
 }
 
-// instrumented: SET osc=on crashed with an uncaught C++ exception somewhere
-// between branch entry and the (flushed!) "osc: listening" line - step logs
-// bisect the thrower in one round
 static void oscStartInner(int port) {
     if (g_oscRun.load()) return;
-    dbgLogLine("osc: enter port=" + std::to_string(port));
     WSADATA wsa;
-    int wr = WSAStartup(MAKEWORD(2, 2), &wsa);
-    dbgLogLine("osc: wsa=" + std::to_string(wr));
-    if (wr != 0) return;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;   // ref-counted: own pair
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    dbgLogLine("osc: sock=" + std::to_string((long long)s));
     if (s == INVALID_SOCKET) { WSACleanup(); return; }
     BOOL reuse = TRUE;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
@@ -1363,7 +1350,6 @@ static void oscStartInner(int port) {
     a.sin_port = htons((u_short)port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) {
-        dbgLogLine("osc: bind failed wserr=" + std::to_string(WSAGetLastError()));
         closesocket(s); WSACleanup(); return;
     }
     g_oscSock = s;
