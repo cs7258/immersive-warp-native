@@ -189,6 +189,7 @@ static std::string dispatch(std::string line) {
                    ";pass=" + std::to_string(hookIpcPassCount()) +
                    ";exc=0x" + hex +
                    ";etid=" + std::to_string(hookIpcExcTid()) +
+                   ";outs=" + std::to_string(hookIpcOutCount()) +
                    ";mesh=" + std::to_string(hookIpcMeshVerts()) +
                    ";rev=" + std::to_string(hookIpcMeshRev()) +
                    ";ovl=" + std::string(hookIpcOverlay() ? "on" : "off") + "\n";

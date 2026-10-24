@@ -239,14 +239,16 @@ bool hookIpcEnabled();
 unsigned hookIpcPassCount();   // Present detour hit counter (written by the DLL)
 unsigned hookIpcExcCode();     // first-chance exception code seen by the hook VEH
 unsigned hookIpcExcTid();      // thread that raised it
-// publish the first enabled output's full control-point grid to the hook DLL
-// (scanout Phase 2): src points row-major, srcStride in floats per vertex
+// publish one enabled output's full control-point grid to the hook DLL
+// (scanout Phase 2+): src points row-major, srcStride in floats per vertex
 // (the engine's MeshVtx has 6 floats: sx,sy,dx,dy,nx,ny - only the first 4
-// are exported). rows/cols = grid vertex counts.
-void hookIpcPublishMesh(const float* src, int srcStride, int rows, int cols,
+// are exported). rows/cols = grid vertex counts. slot = per-output index
+// among the enabled outputs, total = total enabled outputs (v3 multi-mesh).
+void hookIpcPublishMesh(int slot, int total, const float* src, int srcStride, int rows, int cols,
                         const float blend[16], const float chan[3],
                         int edgesMask, const wchar_t* monitor);
-int hookIpcMeshVerts();        // published grid vertex count (0 = corner model)
+int hookIpcOutCount();         // published per-output slot count (0 = corner model)
+int hookIpcMeshVerts();        // summed grid vertex count across active slots
 int hookIpcMeshRev();          // publish revision (bumps on every rebuild)
 void hookIpcSetOverlay(bool on);  // DLL-side mesh-line overlay (calibration)
 bool hookIpcOverlay();            // overlay flag as last set

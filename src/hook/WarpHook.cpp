@@ -155,6 +155,7 @@ struct HookCtx {
     UINT vertCount = 0;         // vertices in the cached VB
     LONG  gridN = 0;            // corner-model mesh resolution of cached VB
     int   mode = -1;            // 0 = corner, 1 = full mesh (-1 = build pending)
+    int   slotIdx = -1;         // per-output slot the cached VB was built from
     LONG  meshRev = 0;          // host publish revision of cached VB
     float corner[4][2] = {};    // corner model of cached VB
     float blendCache[24] = {};  // last blend constants uploaded to cb
@@ -237,20 +238,20 @@ static bool createVB(HookCtx& c, const void* data, size_t bytes, ID3D11Buffer** 
     return true;
 }
 
-static bool buildMesh(HookCtx& c, const IWNHookCfg& cfg) {
+static bool buildMesh(HookCtx& c, const IWNHookCfg& cfg, const IWNOutSlot* slot) {
     const LONG n = cfg.gridN >= 2 && cfg.gridN <= 64 ? cfg.gridN : 16;
     struct V { float pos[3]; float uv[2]; };
     std::vector<V> grid;               // row-major unique grid vertices
     int RV, CV;
-    if (cfg.mode == 1 && cfg.vertCount > 0 && cfg.meshRows >= 2 && cfg.meshCols >= 2 &&
-        (LONG)cfg.meshRows * cfg.meshCols == (LONG)cfg.vertCount) {
-        // full control-point mesh published by the host: row-major grid of
-        // IWNMeshVtx (sx,sy = src uv, dx,dy = dest in 0..1 space)
-        RV = cfg.meshRows; CV = cfg.meshCols;
+    if (slot && slot->active && slot->meshRows >= 2 && slot->meshCols >= 2 &&
+        (LONG)slot->meshRows * slot->meshCols <= IWN_MAX_MESH_VERTS) {
+        // per-output control-point mesh published by the host: row-major grid
+        // of IWNMeshVtx (sx,sy = src uv, dx,dy = dest in 0..1 space)
+        RV = slot->meshRows; CV = slot->meshCols;
         grid.resize((size_t)RV * CV);
         for (int i = 0; i < RV; i++)
             for (int j = 0; j < CV; j++) {
-                const IWNMeshVtx& s = cfg.verts[(size_t)i * CV + j];
+                const IWNMeshVtx& s = slot->verts[(size_t)i * CV + j];
                 V& d = grid[(size_t)i * CV + j];
                 d.pos[0] = 2 * s.dx - 1;
                 d.pos[1] = 1 - 2 * s.dy;
@@ -318,15 +319,17 @@ static bool buildMesh(HookCtx& c, const IWNHookCfg& cfg) {
     c.lineVertCount = (UINT)lines.size();
     memcpy(c.corner, cfg.corner, sizeof(c.corner));
     if (c.mode == 1) {
-        char buf[96];
-        wsprintfA(buf, "mesh v2: rows=%d cols=%d verts=%d",
-                  (int)cfg.meshRows, (int)cfg.meshCols, (int)cfg.vertCount);
+        char buf[128];
+        wsprintfA(buf, "mesh v2: rows=%d cols=%d verts=%d slot=%d mon=%ls",
+                  (int)slot->meshRows, (int)slot->meshCols, (int)(slot->meshRows * slot->meshCols),
+                  c.slotIdx, slot->monitor[0] ? slot->monitor : L"<any>");
         hookLog(buf);
     }
     return true;
 }
 
-static bool ensureResources(HookCtx& c, ID3D11Texture2D* bb, const IWNHookCfg& cfg) {
+static bool ensureResources(HookCtx& c, ID3D11Texture2D* bb, const IWNHookCfg& cfg,
+                            const IWNOutSlot* slot, int slotIdx) {
     D3D11_TEXTURE2D_DESC td;
     bb->GetDesc(&td);
     bool rebuild = (!c.dev || c.bbKey != (void*)bb || c.w != td.Width || c.h != td.Height);
@@ -356,30 +359,32 @@ static bool ensureResources(HookCtx& c, ID3D11Texture2D* bb, const IWNHookCfg& c
         hookLog(buf);
     }
     bool meshStale =
-        c.mode != cfg.mode ||
-        (cfg.mode == 1 && c.meshRev != cfg.meshRev) ||
-        (cfg.mode == 0 && (!c.gridN || memcmp(c.corner, cfg.corner, sizeof(c.corner)) != 0));
+        c.mode != (slot ? 1 : 0) ||
+        c.slotIdx != slotIdx ||
+        (slot && c.meshRev != cfg.meshRev) ||
+        (!slot && (!c.gridN || memcmp(c.corner, cfg.corner, sizeof(c.corner)) != 0));
     if (meshStale) {
-        if (!buildMesh(c, cfg)) { releaseSlot(c); return false; }
+        c.slotIdx = slotIdx;
+        if (!buildMesh(c, cfg, slot)) { releaseSlot(c); return false; }
     }
-    // blend constants: repack the host's per-side AoS block
+    // blend constants: repack the output slot's per-side AoS block
     // (blend[e*4+{fade,gamma,gain,slope}]) into the shader's SoA float4s
     // (fadeW / edgeG / gainS / slopeS = per-edge across the 4 sides), then
-    // upload when anything changed
+    // upload when anything changed. The corner fallback has no blend bands.
     {
-        float blk[24];
-        for (int e = 0; e < 4; e++) {
-            blk[e + 0]  = cfg.blend[e * 4 + 0];   // fadeW
-            blk[e + 4]  = cfg.blend[e * 4 + 1];   // edgeG
-            blk[e + 8]  = cfg.blend[e * 4 + 2];   // gainS
-            blk[e + 12] = cfg.blend[e * 4 + 3];   // slopeS
+        float blk[24] = {};
+        if (slot) {
+            for (int e = 0; e < 4; e++) {
+                blk[e + 0]  = slot->blend[e * 4 + 0];   // fadeW
+                blk[e + 4]  = slot->blend[e * 4 + 1];   // edgeG
+                blk[e + 8]  = slot->blend[e * 4 + 2];   // gainS
+                blk[e + 12] = slot->blend[e * 4 + 3];   // slopeS
+            }
+            blk[16] = slot->chanBlend[0];
+            blk[17] = slot->chanBlend[1];
+            blk[18] = slot->chanBlend[2];
+            blk[20] = (float)slot->edgesMask;
         }
-        blk[16] = cfg.chanBlend[0];
-        blk[17] = cfg.chanBlend[1];
-        blk[18] = cfg.chanBlend[2];
-        blk[19] = 0.0f;
-        blk[20] = (float)cfg.edgesMask;
-        blk[21] = blk[22] = blk[23] = 0.0f;
         if (memcmp(c.blendCache, blk, sizeof(blk)) != 0) {
             c.ctx->UpdateSubresource(c.cb, 0, nullptr, blk, 0, 0);
             memcpy(c.blendCache, blk, sizeof(blk));
@@ -526,18 +531,31 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
     if (flags & DXGI_PRESENT_TEST) return S_OK;
     PFN_Present orig = origPresentFor(sw);
     IWNHookCfg* cfg = ensureCfg();
-    // per-swapchain output selection: if the host bound a target monitor,
-    // only swapchains ON that monitor get warped (everything else passes
-    // through untouched)
+    // per-output slot selection (v3 multi-mesh): match the swapchain's
+    // containing monitor against the published slots; a slot with an empty
+    // monitor name is the catch-all for unmatched swapchains. In the global
+    // corner model (gmode=0, hooktest PoC) every swapchain is warped.
+    const IWNOutSlot* oslot = nullptr;
+    int slotIdx = -1;
     bool monitorOk = true;
-    if (cfg && cfg->monitor[0]) {
+    if (cfg && cfg->enabled && cfg->gmode == 1) {
+        wchar_t devName[32] = L"";
         IDXGIOutput* out = nullptr;
         if (SUCCEEDED(sw->GetContainingOutput(&out)) && out) {
             DXGI_OUTPUT_DESC od{};
-            monitorOk = SUCCEEDED(out->GetDesc(&od)) &&
-                        lstrcmpiW(od.DeviceName, cfg->monitor) == 0;
+            if (SUCCEEDED(out->GetDesc(&od)))
+                lstrcpynW(devName, od.DeviceName, 32);
             out->Release();
         }
+        int fallback = -1;
+        for (int i = 0; i < IWN_MAX_OUTPUTS && i < (int)cfg->outCount; i++) {
+            if (!cfg->outs[i].active) continue;
+            if (!cfg->outs[i].monitor[0]) { if (fallback < 0) fallback = i; continue; }
+            if (lstrcmpiW(devName, cfg->outs[i].monitor) == 0) { slotIdx = i; break; }
+        }
+        if (slotIdx < 0) slotIdx = fallback;
+        if (slotIdx >= 0) oslot = &cfg->outs[slotIdx];
+        monitorOk = oslot != nullptr;   // unmatched monitor = clean passthrough
     }
     if (cfg && cfg->enabled && orig && sw && monitorOk) {
         static bool firstPassLogged = false;
@@ -550,7 +568,7 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
             std::lock_guard<std::mutex> lk(g_ctxMutex);
             HookCtx* slot = nullptr;
             for (HookCtx& c : g_ctx) if (!c.bbKey || c.bbKey == (void*)bb) { slot = &c; break; }
-            if (slot && ensureResources(*slot, bb, *cfg)) {
+            if (slot && ensureResources(*slot, bb, *cfg, oslot, slotIdx)) {
                 HookCtx& c = *slot;
                 c.ctx->CopyResource(c.copyTex, bb);
                 D3D11_VIEWPORT vp = { 0, 0, (float)c.w, (float)c.h, 0, 1 };

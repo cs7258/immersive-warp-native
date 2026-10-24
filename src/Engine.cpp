@@ -994,14 +994,18 @@ void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
             idx.insert(idx.end(), tri, tri + 6);
         }
 
-    // scanout Phase 2: publish the first enabled output's full mesh + blend
-    // band to the injected hook DLL (IWN_WarpHook_v2 mapping). Called from
-    // inside buildMesh so every grid revision reaches the hook pipeline.
+    // scanout Phase 2+: publish EVERY enabled output's full mesh + blend band
+    // to the injected hook DLL (IWN_WarpHook_v3 mapping, one slot per output).
+    // Called from inside buildMesh so every grid revision reaches the hook
+    // pipeline; the DLL matches slots by monitor DeviceName.
     {
-        const OutputCfg* first = nullptr;
-        for (auto& o : g_cfg.outputs)
-            if (o.enabled) { first = &o; break; }
-        if (first == &cfg) {
+        int slot = -1, total = 0;
+        for (auto& o : g_cfg.outputs) {
+            if (!o.enabled) continue;
+            if (&o == &cfg) slot = total;
+            total++;
+        }
+        if (slot >= 0) {
             float bl[16];
             for (int e = 0; e < 4; e++) {
                 bl[e * 4 + 0] = cfg.blend[e].fade;
@@ -1010,7 +1014,7 @@ void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
                 bl[e * 4 + 3] = cfg.blend[e].slope;
             }
             float ch[3] = { cfg.blend[0].chanR, cfg.blend[0].chanG, cfg.blend[0].chanB };
-            hookIpcPublishMesh(&vtx[0].sx, 6, RV, CV, bl, ch, cfg.edges, cfg.deviceName.c_str());
+            hookIpcPublishMesh(slot, total, &vtx[0].sx, 6, RV, CV, bl, ch, cfg.edges, cfg.deviceName.c_str());
         }
     }
 
