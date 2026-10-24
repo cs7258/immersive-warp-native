@@ -705,6 +705,9 @@ bool paintMagMask(HWND ov, HWND host) {
                 break;
             }
     }
+    // blackout participates in the change hash so toggling always repaints
+    bool bo = g_blackout.load();
+    hash = (hash ^ (bo ? 0x9E3779B9u : 0u)) * 16777619u;
     for (auto& m : masks) {
         auto mix = [&hash](float f) {
             unsigned v;
@@ -730,7 +733,12 @@ bool paintMagMask(HWND ov, HWND host) {
     HBITMAP bmp = CreateDIBSection(sdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (bmp && bits) {
         auto* px = (unsigned*)bits;
-        for (auto& m : masks) {
+        if (bo) {
+            // show blackout: the whole overlay is opaque black (covers test
+            // pattern; the blend bars above just multiply more black onto it)
+            unsigned black = 0xFF000000;
+            for (int i = 0; i < w * h; i++) px[i] = black;
+        } else for (auto& m : masks) {
             // premultiplied opaque black = alpha 255, color 0
             unsigned black = 0xFF000000;
             int x0 = (int)(m.x * w), y0 = (int)(m.y * h);
@@ -816,7 +824,7 @@ static bool paintMagProbe(HWND ov, HWND host) {
     if (!st) return false;
     auto displays = enumerateDisplays();
     if (st->displayIdx < 0 || st->displayIdx >= (int)displays.size()) return false;
-    bool on = g_probe.load();
+    bool on = g_probe.load() && !g_blackout.load();   // blackout hides markers
     int rows = 10, cols = 10;
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -1184,6 +1192,7 @@ static bool g_tgtBusy = false;      // suppress CBN_SELCHANGE during programmati
 #define IDM_VIEW_DISP  2111   // +0..3 = the four pages
 #define IDM_VIEW_INPLACE 2115 // in-place overlay toggle (checkable)
 #define IDM_VIEW_HIDE  2116
+#define IDM_VIEW_BLACKOUT 2117   // show blackout: all outputs full black (checkable)
 #define IDM_WARP_ALIGN 2121
 #define IDM_WARP_EDGES 2122
 #define IDM_WARP_SNAP  2123
@@ -1226,6 +1235,7 @@ constexpr UINT WM_MAGTEST = WM_APP + 14;      // test pattern changed off-thread
 constexpr UINT WM_TGTREFRESH = WM_APP + 15;   // refresh the Target combo (off-thread)
 constexpr UINT WM_DISPCHANGE = WM_APP + 16;   // deferred output rebuild after
 constexpr UINT WM_MAGPROBE = WM_APP + 17;     // probe markers toggled off-thread
+constexpr UINT WM_BLACKOUT = WM_APP + 18;     // blackout toggled off-thread
                                               // WM_DISPLAYCHANGE (the handler
                                               // must not do heavy work inline)
 static DWORD uiThreadId = 0;
@@ -1602,6 +1612,31 @@ static void invalidateToolbarToggles() {
     if (!g_ctl) return;
     if (HWND b = GetDlgItem(g_ctl, IDM_VIEW_INPLACE)) InvalidateRect(b, nullptr, TRUE);
     if (HWND b = GetDlgItem(g_ctl, IDM_WARP_TEST)) InvalidateRect(b, nullptr, TRUE);
+}
+
+// UI thread only: make every MAG overlay reflect g_blackout right now -
+// wake the mask overlays (their 250 ms poll would also catch up, but a show
+// blackout must land immediately) and repaint the probe markers (they sit
+// ABOVE the mask overlay and must not shine through a blackout).
+static void syncBlackoutUI(HWND hwnd) {
+    if (!hwnd && g_ctl) hwnd = g_ctl;
+    if (hwnd)
+        if (HMENU m = GetMenu(hwnd))
+            CheckMenuItem(m, IDM_VIEW_BLACKOUT, MF_BYCOMMAND |
+                          (g_blackout.load() ? MF_CHECKED : MF_UNCHECKED));
+    for (HWND t : g_magMasks) PostMessageW(t, WM_TIMER, 1, 0);
+    bool engineMag;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        engineMag = g_cfg.engine == 1;
+    }
+    if (engineMag)
+        syncMagProbeOverlays(g_probe.load() && !g_outWins.empty());
+}
+
+// socket thread safe: route the resync through the UI thread's message loop
+void requestBlackoutSync() {
+    if (g_ctl) PostMessageW(g_ctl, WM_BLACKOUT, 0, 0);
 }
 
 void notifyOutputRaised() {
@@ -3080,6 +3115,7 @@ static HMENU buildMenuBar() {
         AppendMenuW(mView, MF_STRING, IDM_VIEW_DISP + i, pageNames[i]);
     AppendMenuW(mView, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(mView, MF_STRING, IDM_VIEW_INPLACE, L"In-place overlay (click-through)\tCtrl+F9");
+    AppendMenuW(mView, MF_STRING, IDM_VIEW_BLACKOUT, L"Blackout (all outputs black)");
     AppendMenuW(mView, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(mView, MF_STRING, IDM_VIEW_HIDE, L"Hide console to tray");
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)mView, L"&View");
@@ -3630,6 +3666,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         syncMagProbeOverlays(on && g_probe.load() && !g_outWins.empty());
         return 0;
     }
+    case WM_BLACKOUT: {     // blackout toggled from the socket thread
+        syncBlackoutUI();
+        return 0;
+    }
     case WM_LAYSET: {   // tiled layout changed from the socket thread
         LayMsg m;
         {
@@ -3661,6 +3701,11 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 showTab(pg);
             } else if (id == IDM_VIEW_INPLACE) {
                 toggleInplaceOverlay();
+            } else if (id == IDM_VIEW_BLACKOUT) {
+                g_blackout.store(!g_blackout.load());
+                syncBlackoutUI(hwnd);
+                setStatus(g_blackout.load() ? L"Blackout: ON (all outputs black)."
+                                            : L"Blackout: off.");
             } else if (id == IDM_VIEW_HIDE) {
                 ShowWindow(hwnd, SW_HIDE);
             } else if (id == IDM_WARP_ALIGN) {

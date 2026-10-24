@@ -169,6 +169,7 @@ static std::string dispatch(std::string line) {
             return buf;
         }
         if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
+        if (k == "blackout") return std::string("OK blackout=") + (g_blackout.load() ? "on" : "off") + "\n";
         if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
         if (k == "layout") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -405,6 +406,7 @@ static std::string dispatch(std::string line) {
                ";probe=" + std::string(g_probe.load() ? "on" : "off") +
                ";perflog=" + std::string(g_perfLog.load() ? "on" : "off") +
                ";inplace=" + std::string(g_inplace.load() ? "on" : "off") +
+               ";blackout=" + std::string(g_blackout.load() ? "on" : "off") +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
@@ -431,6 +433,16 @@ static std::string dispatch(std::string line) {
         requestCalibrationSync();
         refreshStatusBar();
         return std::string("OK calib=") + (g_calib.load() ? "on" : "off") + "\n";
+    }
+
+    // show blackout: every output renders full black (View menu / lighting
+    // desk convention). Toggle semantics; deliberately not persisted.
+    if (cmd == "BLACKOUT") {
+        bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_blackout.load();
+        g_blackout.store(want);
+        requestBlackoutSync();   // menu checkbox + MAG overlays follow now
+        refreshStatusBar();
+        return std::string("OK blackout=") + (g_blackout.load() ? "on" : "off") + "\n";
     }
 
     if (cmd == "MODE") {
@@ -930,6 +942,11 @@ static std::string dispatch(std::string line) {
                 g_probe.store(val == "ON" || val == "1" || val == "true");
                 applied = true;
                 requestMagProbeSync();   // engine=1: overlays follow
+            }
+            if (!applied && key == "blackout") {
+                g_blackout.store(val == "ON" || val == "1" || val == "true");
+                applied = true;
+                requestBlackoutSync();   // menu checkbox + MAG overlays follow
             }
             if (!applied && key == "perflog") {
                 g_perfLog.store(val == "ON" || val == "1" || val == "true");

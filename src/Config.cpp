@@ -14,6 +14,9 @@ std::atomic<bool> g_previewNoCapture{ false };
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_snapshot{ false };
 std::atomic<bool> g_probe{ false };
+// show blackout: every output renders full black (View menu / CMDNET BLACKOUT).
+// Deliberately NOT persisted - a restarted console must never come up dark.
+std::atomic<bool> g_blackout{ false };
 // periodic perf snapshot into debug.log (SET perflog=on; 1 line / 10 s)
 std::atomic<bool> g_perfLog{ false };
 std::atomic<int>  g_dispChange{ 0 };

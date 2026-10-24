@@ -132,6 +132,7 @@ void requestMagBlendSync();    // any thread: MAG edge-blend overlays resync (UI
 void requestOutputRebuild();   // any thread: destroy+recreate output windows on the UI thread
 void requestMagTestSync();     // any thread: test pattern overlays follow (engine=1)
 void requestMagProbeSync();    // any thread: probe marker overlays follow (engine=1)
+void requestBlackoutSync();    // any thread: blackout overlays + menu checkbox follow
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
 void refreshSampComboUI();     // socket thread safe: sampling dropdown follows shared state
 
@@ -168,6 +169,9 @@ extern std::atomic<bool> g_snapshot;
 // a calibration camera can detect where each grid point actually landed and
 // feed the measured positions back through SET warp.load (auto-alignment)
 extern std::atomic<bool> g_probe;
+// show blackout: all outputs render black (View menu, CMDNET BLACKOUT).
+// Session-only state - never persisted to config.txt.
+extern std::atomic<bool> g_blackout;
 // WM_DISPLAYCHANGE counter (resolution change / monitor hotplug). The console
 // window reposts itself into a deferred rebuild of the output windows; the
 // counter is read back via GET dispchange for test/observability.

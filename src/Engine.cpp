@@ -1075,6 +1075,14 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
 
 // ---------------- frame ----------------
 void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
+    // show blackout: clear to black and present, skip mesh + overlay entirely
+    // (atomic read per frame - toggling needs no rebuild, hits next vsync)
+    if (g_blackout.load()) {
+        float black[4] = { 0, 0, 0, 1 };
+        m_ctx->ClearRenderTargetView(oc.rtv, black);
+        oc.swap->Present(0, 0);
+        return;
+    }
     float clr[4] = { 0, 0, 0, 1 };
     m_ctx->ClearRenderTargetView(oc.rtv, clr);
     D3D11_VIEWPORT vp{ 0, 0, (FLOAT)oc.w, (FLOAT)oc.h, 0, 1 };
