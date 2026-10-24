@@ -1310,8 +1310,9 @@ static void oscHandle(const char* d, int len, sockaddr_in* from) {
                 sprintf_s(tmp, sizeof(tmp), "%u", v);
                 args += tmp;
             } else if (t == 'f' && p + 4 <= end) {
-                unsigned char b4[4] = { (unsigned char)p[0], (unsigned char)p[1],
-                                        (unsigned char)p[2], (unsigned char)p[3] };
+                // OSC numbers are big-endian: reverse into LE float memory
+                unsigned char b4[4] = { (unsigned char)p[3], (unsigned char)p[2],
+                                        (unsigned char)p[1], (unsigned char)p[0] };
                 p += 4;
                 float f; memcpy(&f, b4, 4);
                 sprintf_s(tmp, sizeof(tmp), "%g", f);
