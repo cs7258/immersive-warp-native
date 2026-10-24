@@ -282,6 +282,8 @@ void toggleSnapshot();         // global hotkey Ctrl+F3: freeze / resume capture
 void toggleInplaceOverlay();   // global hotkey Ctrl+F9: in-place overlay safety switch
 void toggleWindowWarping();    // global hotkey F4: start/stop outputs (Enabled flip)
 void loadPresetByIndex(int i); // global hotkey Ctrl+Shift+1..8: Nth preset by name (0-based)
+std::wstring enabledOutputsSignature(); // pipe-joined names of enabled outputs (Sets hot switching)
+void requestOutputsRebuild();  // any thread: rebuild running output windows live (WM_DISPCHANGE)
 void openColorDialogEx();      // global hotkey D: color adjustment dialog
 // per-projector "Configure display" dialog (Bezels/Align/Geometry/Blending/
 // Color/Masking/Help tabs, edits the output selected in the console list)

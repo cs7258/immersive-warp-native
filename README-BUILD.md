@@ -159,9 +159,9 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 
 ## P0 边界与后续路线
 
-- 本版：单 GPU（adapter 0）、无色彩均衡 UI（数据模型已含）、无 Sets 热切换、无状态栏文字（引擎覆盖层后续补）
-- **P1（当前最高优先级）：scanout 级交付 = swapchain/Present hook 注入管线**（WarpHook.dll + IWNInject.exe + 宿主参数通道）。NVAPI Warp and Blend / 内核驱动暂缓——无对应硬件，待硬件到位再排
-- P1 其余：Sets 热切换补全、MQTT 对接（CMDNET/OSC 已覆盖自有远控）
+- 本版：单 GPU（adapter 0）、无状态栏文字（引擎覆盖层后续补）。Sets 热切换已补全：预设（Settings 页 Preset 下拉 / 托盘 / Ctrl+Shift+1..8 / CMDNET SAVEAS·LOADAS）加载后若启用输出集变化，输出窗口经 WM_DISPCHANGE 实时重建，无需重启
+- **P1（当前最高优先级）：scanout 级交付 = swapchain/Present hook 注入管线**（WarpHook.dll + IWNInject.exe + 宿主参数通道 IPC v3 per-output 多槽位）。NVAPI Warp and Blend / 内核驱动暂缓——无对应硬件，待硬件到位再排
+- P1 其余：MQTT 对接（CMDNET/OSC 已覆盖自有远控）
 - P2（暂缓）: 内核驱动 DXGK 级（届时需 EV 代码签名 + 杀软白名单，对应原版 WSupportLdr.exe 的合规路径）
 - P3: 相机自动对准、AI 帧插值
 

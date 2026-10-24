@@ -3427,10 +3427,30 @@ void refreshTargetComboUI() {
     refreshTargetComboNow();
 }
 
+// enabled-output signature for Sets hot switching: the pipe-joined device
+// names of every enabled output. A change means the preset retargeted the
+// projector rig -> the output windows must be rebuilt live (WM_DISPCHANGE).
+std::wstring enabledOutputsSignature() {
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    std::wstring s;
+    for (auto& o : g_cfg.outputs)
+        if (o.enabled) { s += o.deviceName; s += L'|'; }
+    return s;
+}
+
+void requestOutputsRebuild() {
+    // any thread: the console's WM_DISPCHANGE handler rebuilds the output
+    // windows only when they are actually running (no-op otherwise)
+    if (g_ctl) PostMessageW(g_ctl, WM_DISPCHANGE, 0, 0);
+}
+
+// signature as of the last applied load - applyLoadedConfig compares against
+// it so every load path (button, preset combo, hotkey, tray) hot-rebuilds
+static std::wstring g_prevOutSig;
+
 // shared by Load Config and preset load: resync all UI + engine state after
 // loadConfig() swapped g_cfg. Must be called WITHOUT g_cfgMutex held.
-static void applyLoadedConfig() {
-    refreshList();
+static void applyLoadedConfig() {    refreshList();
     populateOvrSrcCombo();   // overrides may differ in the loaded config
     g_previewMode.store(g_cfg.previewMode);
     g_inplace.store(g_cfg.inplace);
@@ -3462,6 +3482,14 @@ static void applyLoadedConfig() {
         SetWindowTextW(g_imgLabel, line);
     }
     refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
+    // Sets hot switching: if the loaded config retargeted the enabled
+    // outputs, rebuild the output windows live (handler no-ops when no
+    // output is running, so a config edit before Start is unaffected)
+    std::wstring sig = enabledOutputsSignature();
+    if (sig != g_prevOutSig) {
+        g_prevOutSig = sig;
+        requestOutputsRebuild();
+    }
 }
 
 // preset enumeration in name order (Ctrl+Shift+1..8 pick deterministically)
@@ -4118,6 +4146,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         refreshTargetComboUI();
         trayInit(hwnd);
         refreshPresetCombo();
+        g_prevOutSig = enabledOutputsSignature();
         refreshStatusBar();
         return 0;
     }

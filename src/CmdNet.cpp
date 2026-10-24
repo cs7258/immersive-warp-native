@@ -617,7 +617,10 @@ static std::string dispatch(std::string line) {
     // shared tail of LOAD / LOADAS: resync the state the UI's Load button also
     // refreshes. loadConfig has already released g_cfgMutex by the time this
     // runs, and refreshStatusBar locks it itself -> call it unlocked.
-    auto finishLoad = [&](const std::string& what) -> std::string {
+    // sigBefore = enabled-output signature captured BEFORE loadConfig: when
+    // the preset retargets the projector rig the output windows must be
+    // rebuilt live (Sets hot switching; the handler no-ops when nothing runs)
+    auto finishLoad = [&](const std::string& what, const std::wstring& sigBefore) -> std::string {
         g_previewMode.store(g_cfg.previewMode);
         g_inplace.store(g_cfg.inplace);
         requestInplaceRestyle();   // restyle outputs
@@ -640,12 +643,14 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             for (auto& o : g_cfg.outputs) if (o.enabled) outs++;
         }
+        if (enabledOutputsSignature() != sigBefore) requestOutputsRebuild();
         return "OK loaded " + what + ";outputs=" + std::to_string(outs) + "\n";
     };
 
     if (cmd == "LOAD") {
+        std::wstring sigBefore = enabledOutputsSignature();
         if (!loadConfig(L"")) return "ERR LOAD (no config file)\n";
-        return finishLoad("default");
+        return finishLoad("default", sigBefore);
     }
     if (cmd == "SAVEAS" || cmd == "LOADAS" || cmd == "DELPRESET") {
         // preset name: A-Z 0-9 '_' '-' only (dispatch uppercases the whole
@@ -663,8 +668,9 @@ static std::string dispatch(std::string line) {
             if (!DeleteFileW(presetPath(arg).c_str())) return "ERR DELPRESET (no such preset)\n";
             return "OK deleted preset=" + arg + "\n";
         }
+        std::wstring sigBefore = enabledOutputsSignature();
         if (!loadConfig(presetPath(arg))) return "ERR LOADAS (no such preset)\n";
-        return finishLoad("preset=" + arg);
+        return finishLoad("preset=" + arg, sigBefore);
     }
 
     if (cmd == "AUTOSTART") {
