@@ -101,12 +101,53 @@ int wmain(int argc, wchar_t** argv) {
     printf("probe: running (swapchain=%p)%s\n", (void*)sw, secs ? " auto-exit" : "");
     if (secs) SetTimer(wnd, 1, secs * 1000, nullptr);
 
-    float t = 0;
     bool running = true;
     MSG msg;
+
+    // ---- calibration pattern (visually verifiable warp target) ----
+    // White background, 40 px grid, 160 px major grid, red center cross,
+    // checker quadrant, and a bottom RGB bar that cycles each frame (proves
+    // Present is live and gives a visual latency cue). Uploaded via
+    // UpdateSubresource + CopyResource - no shaders needed.
+    const int PW = 640, PH = 480;
+    unsigned int* img = (unsigned int*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                                 (size_t)PW * PH * 4);
+    if (!img) { printf("probe: alloc failed\n"); return 1; }
+#define PX(x, y, rgb) img[(y) * PW + (x)] = (rgb)
+    for (int y = 0; y < PH; y++)
+        for (int x = 0; x < PW; x++) {
+            unsigned int c = 0x00FFFFFF;               // white base
+            if (x % 40 == 0 || y % 40 == 0) c = 0x00C8C8C8;   // minor grid
+            if (x % 160 < 2 || y % 160 < 2) c = 0x00787878;   // major grid
+            if ((x / 80 + y / 80) % 2 && x < 320 && y < 320)  // checker corner
+                c = (c == 0x00FFFFFF) ? 0x00E8E8E8 : c;
+            int cx = x - PW / 2, cy = y - PH / 2;
+            if (cy > -2 && cy < 2 && cx > -40 && cx < 40) c = 0x000000C8;  // cross H
+            if (cx > -2 && cx < 2 && cy > -40 && cy < 40) c = 0x00C80000;  // cross V (red)
+            PX(x, y, c);
+        }
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = PW; td.Height = PH;
+    td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D* pat = nullptr;
+    D3D11_SUBRESOURCE_DATA init = {img, PW * 4, 0};
+    if (FAILED(dev->CreateTexture2D(&td, &init, &pat))) {
+        printf("probe: pattern texture failed\n"); return 1;
+    }
+    // CPU-side row buffer for the animated bottom bar; UpdateSubresource
+    // pushes it straight into the default-usage pattern texture (a DYNAMIC
+    // texture would reject initial data and is not needed here).
+    unsigned int row[8][PW] = {};
+#undef PX
+
     // PeekMessage, not GetMessage: a blocking pump renders nothing while no
     // messages arrive, so the Present counter would stall (and WM_TIMER
     // auto-exit would still fire - the render loop is the bug, not the timer).
+    unsigned long frame = 0;
     while (running) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) { running = false; break; }
@@ -114,14 +155,37 @@ int wmain(int argc, wchar_t** argv) {
             DispatchMessageW(&msg);
         }
         if (!running) break;
-        t += 0.01f;
-        float c[4] = {0.5f + 0.5f * sinf(t),
-                      0.5f + 0.5f * sinf(t + 2.1f),
-                      0.5f + 0.5f * sinf(t + 4.2f), 1.0f};
-        ctx->ClearRenderTargetView(rtv, c);
+        frame++;
+        // bottom bar: hue cycles with the frame count (visual Present liveness)
+        for (int x = 0; x < PW; x++) {
+            double h = 6.0 * ((x / 80.0) + frame / 90.0);
+            int s = (int)h % 6;
+            double f = h - (int)h, v = 1.0;
+            double r = 0, g = 0, b = 0;
+            switch (s) {
+            case 0: r = v; g = f; break;
+            case 1: r = 1 - f; g = v; break;
+            case 2: g = v; b = f; break;
+            case 3: g = 1 - f; b = v; break;
+            case 4: r = f; b = v; break;
+            default: r = v; b = 1 - f; break;
+            }
+            unsigned int rgb = 0x00FFFFFF & ((unsigned int)(r * 255) << 16 |
+                                             (unsigned int)(g * 255) << 8 |
+                                             (unsigned int)(b * 255));
+            for (int y = 0; y < 8; y++) row[y][x] = rgb;
+        }
+        ctx->UpdateSubresource(pat, 0, &dst, row, PW * 4, 0);
+        ID3D11Texture2D* back = nullptr;
+        if (SUCCEEDED(sw->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back)) && back) {
+            ctx->CopyResource(back, pat);
+            back->Release();
+        }
         sw->Present(1, 0);
     }
 
+    if (pat) pat->Release();
+    HeapFree(GetProcessHeap(), 0, img);
     if (rtv) rtv->Release();
     if (sw) sw->Release();
     if (ctx) ctx->Release();
