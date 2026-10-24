@@ -181,6 +181,11 @@ static std::string dispatch(std::string line) {
             return "OK srcs=" + std::to_string(n) + s + "\n";
         }
         if (k == "blackout") return std::string("OK blackout=") + (g_blackout.load() ? "on" : "off") + "\n";
+        if (k == "testpause") return std::string("OK testpause=") + (g_testPause.load() ? "on" : "off") + "\n";
+        if (k == "testanim") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK testanim=" + std::to_string(g_cfg.testAnim) + "\n";
+        }
         if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
         if (k == "layout") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -257,6 +262,11 @@ static std::string dispatch(std::string line) {
             s += std::string("probe=") + (g_probe.load() ? "on" : "off") + ";";
             s += std::string("perflog=") + (g_perfLog.load() ? "on" : "off") + ";";
             s += std::string("inplace=") + (g_inplace.load() ? "on" : "off") + ";";
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                s += "testanim=" + std::to_string(g_cfg.testAnim) + ";";
+            }
+            s += std::string("testpause=") + (g_testPause.load() ? "on" : "off") + ";";
             s += std::string("autostart=") + (queryAutostart() ? "on" : "off") + ";";
             std::wstring src = currentSourceDevice();   // locks g_cfgMutex itself
             s += "source=" + (src.empty() ? std::string("auto") : shortDev(src)) + ";";
@@ -454,6 +464,13 @@ static std::string dispatch(std::string line) {
         requestBlackoutSync();   // menu checkbox + MAG overlays follow now
         refreshStatusBar();
         return std::string("OK blackout=") + (g_blackout.load() ? "on" : "off") + "\n";
+    }
+
+    if (cmd == "TESTPAUSE") {
+        // freeze the dynamic test pattern bands (original's Animation/Paused)
+        bool want = (arg == "ON") ? true : (arg == "OFF") ? false : !g_testPause.load();
+        g_testPause.store(want);
+        return std::string("OK testpause=") + (g_testPause.load() ? "on" : "off") + "\n";
     }
 
     if (cmd == "MODE") {
@@ -984,6 +1001,16 @@ static std::string dispatch(std::string line) {
                 g_cfg.testPattern = (val == "ON" || val == "1" || val == "true");
                 applied = true;
                 requestMagTestSync();   // engine=1: GDI overlays follow
+            }
+            if (!applied && key == "testanim") {
+                int v = atoi(val.c_str());
+                if (v < 0 || v > 3) return "ERR SET testanim (want 0..3)\n";
+                g_cfg.testAnim = v;
+                applied = true;
+            }
+            if (!applied && key == "testpause") {
+                g_testPause.store(val == "ON" || val == "1" || val == "true");
+                applied = true;
             }
             if (!applied && key == "probe") {
                 g_probe.store(val == "ON" || val == "1" || val == "true");

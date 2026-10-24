@@ -92,6 +92,7 @@ struct AppConfig {
     bool useImage = false;            // image source instead of pattern/capture
     std::wstring imagePath;
     int testImg = -1;                 // built-in test image library (0..3), -1 = none
+    int testAnim = 0;                 // dynamic pattern scroll: 0 off, 1 H, 2 V, 3 diagonal
     int subdivide = 8;                // mesh subdivision per control cell
     int curved = 0;                   // 1 = Catmull-Rom curved grid interp (needs rows>=4 && cols>=4), 0 = bilinear
     int cmdnet = 0;                   // CMDNET ASCII TCP show-control service on/off
@@ -176,6 +177,7 @@ extern std::atomic<bool> g_probe;
 // show blackout: all outputs render black (View menu, CMDNET BLACKOUT).
 // Session-only state - never persisted to config.txt.
 extern std::atomic<bool> g_blackout;
+extern std::atomic<bool> g_testPause;   // dynamic test pattern paused (session-only)
 // WM_DISPLAYCHANGE counter (resolution change / monitor hotplug). The console
 // window reposts itself into a deferred rebuild of the output windows; the
 // counter is read back via GET dispchange for test/observability.

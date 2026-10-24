@@ -17,6 +17,9 @@ std::atomic<bool> g_probe{ false };
 // show blackout: every output renders full black (View menu / CMDNET BLACKOUT).
 // Deliberately NOT persisted - a restarted console must never come up dark.
 std::atomic<bool> g_blackout{ false };
+// dynamic test pattern pause (Animation/Paused toggle in the original's Images
+// area). Session-only like blackout: a fresh console resumes animating.
+std::atomic<bool> g_testPause{ false };
 // periodic perf snapshot into debug.log (SET perflog=on; 1 line / 10 s)
 std::atomic<bool> g_perfLog{ false };
 std::atomic<int>  g_dispChange{ 0 };
@@ -107,6 +110,7 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "useImage=" << (g_cfg.useImage ? 1 : 0) << "\n";
     os << "image=" << toUtf8(g_cfg.imagePath) << "\n";
     os << "testImg=" << g_cfg.testImg << "\n";
+    os << "testAnim=" << g_cfg.testAnim << "\n";
     os << "cmdnet=" << g_cfg.cmdnet << "\n";
     os << "cmdnetPort=" << g_cfg.cmdnetPort << "\n";
     os << "sampling=" << g_cfg.sampling << "\n";
@@ -185,6 +189,7 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "useImage") c.useImage = val == "1";
         else if (key == "image") c.imagePath = fromUtf8(val);
         else if (key == "testImg") c.testImg = atoi(val.c_str());
+        else if (key == "testAnim") { c.testAnim = atoi(val.c_str()); if (c.testAnim < 0 || c.testAnim > 3) c.testAnim = 0; }
         else if (key == "cmdnet") c.cmdnet = atoi(val.c_str());
         else if (key == "cmdnetPort") c.cmdnetPort = atoi(val.c_str());
         else if (key == "sampling") c.sampling = atoi(val.c_str());

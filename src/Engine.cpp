@@ -52,6 +52,7 @@ cbuffer FrameCB : register(b0) {
     float4 chanG;           // per-side G blend gamma
     float4 chanB;           // per-side B blend gamma
     float4 sampInfo;        // x=bicubic on, y=srcW, z=srcH (for catmull-rom)
+    float4 animT;           // dynamic test pattern: x=on, y=phase 0..1, zw=scroll dir
 }
 // parametric blend curve: f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1).
 // gain=0, slope=0 -> f(x)=x (the plain linear ramp); slope=1 -> hard step;
@@ -76,7 +77,7 @@ void edgeParams(float4 pts[8], int count, float c, float baseF, float baseG,
     }
     fw = pts[count - 1].y; g = pts[count - 1].z;
 }
-float3 testPattern(float2 p) {
+float3 testPattern(float2 p, float4 anim) {
     float2 g = frac(p * float2(12, 8));
     float chk = step(0.5, fmod(floor(p.x * 24) + floor(p.y * 16), 2));
     float3 col = lerp(float3(0.06, 0.06, 0.06), float3(0.38, 0.38, 0.38), chk);
@@ -84,6 +85,12 @@ float3 testPattern(float2 p) {
     float2 b = min(p, 1 - p);
     if (min(b.x, b.y) < 0.004) col = float3(1, 0.25, 0.25);
     if (abs(p.x - 0.5) < 0.0015) col = float3(0.15, 1, 0.15);
+    // dynamic1: theme-orange bands scrolling across the grid - makes warping
+    // smoothness, tearing and blend-seam motion visible at a glance
+    if (anim.x > 0.5) {
+        float s = frac(dot(p, anim.zw) * 6.0 + anim.y);
+        if (s < 0.16) col = float3(0.91, 0.58, 0.04);   // #E8940A
+    }
     return col;
 }
 // Catmull-Rom bicubic: 16 taps sampled at texel centers (linear sampler with
@@ -143,7 +150,7 @@ float4 main(VOut i) : SV_Target {
         else if (sampInfo.x > 0.5 && sampInfo.y > 0 && sampInfo.z > 0)
             c = sampleBicubic(uv, sampInfo.yz);
         else c = tex.Sample(samp, uv).rgb;
-    } else c = testPattern(i.nom);
+    } else c = testPattern(i.nom, animT);
     c = pow(saturate(c), color.rgb);
     c = (c - 0.5) * contrast + 0.5;
     c *= color.w;
@@ -1008,6 +1015,7 @@ struct FrameCBData {
     float gains[4]; float slopes[4];
     float chanR[4]; float chanG[4]; float chanB[4];
     float sampInfo[4];   // x=bicubic on, y=srcW, z=srcH
+    float animT[4];      // dynamic pattern: x=on, y=phase, zw=scroll dir
 };
 static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
@@ -1078,6 +1086,15 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
         D3D11_TEXTURE2D_DESC td{};
         oc.frameTex->GetDesc(&td);
         d.sampInfo[1] = (float)td.Width; d.sampInfo[2] = (float)td.Height;
+    }
+    // dynamic test pattern (original's Animation toggle over the test image):
+    // only while the mini pattern is what's on screen and a direction is set
+    if (d.flags[1] && g_cfg.testAnim > 0) {
+        d.animT[0] = 1.0f;
+        d.animT[1] = (float)m_animAcc;
+        if (g_cfg.testAnim == 1)      { d.animT[2] = 1.0f;   d.animT[3] = 0.0f;   } // horizontal
+        else if (g_cfg.testAnim == 2) { d.animT[2] = 0.0f;   d.animT[3] = 1.0f;   } // vertical
+        else                          { d.animT[2] = 0.707f; d.animT[3] = 0.707f; } // diagonal
     }
 
     D3D11_MAPPED_SUBRESOURCE mp{};
@@ -1165,6 +1182,16 @@ void Engine::renderAll() {
     LARGE_INTEGER freq{}, tFrame{}; QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&tFrame);
     double capMs = 0, drawMs = 0;
+    // dynamic test pattern phase: render-thread-only state, 3 s cycle, frozen
+    // while paused (Animation/Paused toggle). Clamp dt so a debugger pause or
+    // tab-away spike doesn't jump the bands halfway across the screen.
+    ULONGLONG animNow = GetTickCount64();
+    if (m_animTick && !g_testPause.load()) {
+        double dt = (double)(animNow - m_animTick) / 1000.0;
+        if (dt > 0.25) dt = 0.25;
+        m_animAcc = fmod(m_animAcc + dt / 3.0, 1.0);
+    }
+    m_animTick = animNow;
     // snapshot the output list under lock; entries stay alive via shared_ptr
     // even if the UI thread destroys outputs while this frame is drawing
     std::vector<std::shared_ptr<OutputCtx>> outs;

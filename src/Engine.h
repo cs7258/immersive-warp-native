@@ -90,6 +90,9 @@ private:
     // objects from the UI thread
     ID3D11SamplerState* m_samplers[4] = { nullptr, nullptr, nullptr, nullptr };
     std::atomic<int> m_sampIdx{ 0 };
+    // dynamic test pattern phase (render-thread-only state, no locking)
+    double m_animAcc = 0.0;
+    ULONGLONG m_animTick = 0;
     // image source. Old textures are retired (not released) on reload so the
     // render thread can never touch a freed object mid-frame.
     ID3D11Texture2D* m_imgTex = nullptr;
