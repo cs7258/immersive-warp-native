@@ -121,6 +121,8 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "roiBorder=" << g_cfg.roiBorder << "\n";
     os << "cmdnet=" << g_cfg.cmdnet << "\n";
     os << "cmdnetPort=" << g_cfg.cmdnetPort << "\n";
+    os << "osc=" << g_cfg.osc << "\n";
+    os << "oscPort=" << g_cfg.oscPort << "\n";
     os << "sampling=" << g_cfg.sampling << "\n";
     os << "autostart=" << g_cfg.autostart << "\n";
     os << "perflog=" << (g_perfLog.load() ? 1 : 0) << "\n";
@@ -209,6 +211,11 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "roiBorder") { c.roiBorder = (std::max)(0, (std::min)(atoi(val.c_str()), 64)); }
         else if (key == "cmdnet") c.cmdnet = atoi(val.c_str());
         else if (key == "cmdnetPort") c.cmdnetPort = atoi(val.c_str());
+        else if (key == "osc") c.osc = atoi(val.c_str());
+        else if (key == "oscPort") {
+            int p = atoi(val.c_str());
+            c.oscPort = (p >= 1024 && p <= 65535) ? p : 8000;
+        }
         else if (key == "sampling") c.sampling = atoi(val.c_str());
         else if (key == "autostart") c.autostart = atoi(val.c_str());
         else if (key == "perflog") g_perfLog.store(val == "1");

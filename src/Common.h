@@ -101,6 +101,8 @@ struct AppConfig {
     int curved = 0;                   // 1 = Catmull-Rom curved grid interp (needs rows>=4 && cols>=4), 0 = bilinear
     int cmdnet = 0;                   // CMDNET ASCII TCP show-control service on/off
     int cmdnetPort = 5252;            // CMDNET listen port (loopback only)
+    int osc = 0;                      // OSC over UDP remote control on/off (loopback)
+    int oscPort = 8000;               // OSC listen port (standard OSC 8000)
     int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x, 3 bicubic
     int autostart = 0;                // start with Windows (HKCU Run mirror)
     // explicit capture source. empty = auto (first display that is not an
@@ -259,6 +261,12 @@ void setBlendEdgesMask(int mask); // explicit edge set (CMDNET), complements cyc
 // CMDNET ASCII TCP show-control service: "<COMMAND> <PARAM>;\n", one request one reply
 void cmdnetStart(int port);       // loopback only
 void cmdnetStop();
+// OSC over UDP (loopback only): address segment = command word, args join
+// into CMDNET line ("set" + s"engine=1" -> SET ENGINE=1); text reply to sender
+void oscStart(int port);
+void oscStop();
+bool oscRunning();
+std::string cmdnetExecute(const std::string& line); // run a CMDNET line programmatically (OSC)
 // start with Windows: HKCU\...\Run value "ImmersiveWarpNative" (no admin needed)
 void setAutostart(bool on);
 bool queryAutostart();

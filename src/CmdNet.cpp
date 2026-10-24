@@ -13,9 +13,16 @@
 #include <cstdlib>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 
 static std::atomic<bool> g_netRun{ false };
 static std::thread g_netThread;
+// OSC server globals (defined up here: the SET osc/oscport handlers in
+// dispatch() reference g_oscPortLive, and definitions must precede use)
+static std::atomic<bool> g_oscRun{ false };
+static std::atomic<int>  g_oscPortLive{ 8000 };
+static SOCKET g_oscSock = INVALID_SOCKET;
+static std::thread g_oscThread;
 static SOCKET g_listenSock = INVALID_SOCKET;
 
 static std::string toNarrow(const std::wstring& w) {
@@ -148,6 +155,11 @@ static std::string dispatch(std::string line) {
         if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
         if (k == "probe")    return std::string("OK probe=")    + (g_probe.load() ? "on" : "off") + "\n";
         if (k == "perflog")  return std::string("OK perflog=")  + (g_perfLog.load() ? "on" : "off") + "\n";
+        if (k == "osc")      return std::string("OK osc=")      + (oscRunning() ? "on" : "off") + "\n";
+        if (k == "oscport") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK oscport=" + std::to_string(g_cfg.oscPort) + "\n";
+        }
         if (k == "inplace")  return std::string("OK inplace=")  + (g_inplace.load() ? "on" : "off") + "\n";
         // remote health monitoring: one line, key=value; pairs (STATUS style)
         if (k == "perf") {
@@ -249,6 +261,8 @@ static std::string dispatch(std::string line) {
                 s += "overlap=" + std::to_string(g_cfg.overlap) + ";";
                 s += std::string("curved=") + (g_cfg.curved ? "on" : "off") + ";";
                 s += std::string("engine=") + (g_cfg.engine == 1 ? "mag" : "desktopduplication") + ";";
+                s += "osc=" + std::to_string(g_cfg.osc) + ";";
+                s += "oscport=" + std::to_string(g_cfg.oscPort) + ";";
                 int n = 0;
                 for (auto& o : g_cfg.outputs) {
                     char p[8];
@@ -433,6 +447,7 @@ static std::string dispatch(std::string line) {
         int edges = 15, outs = 0, masks = 0;
         int layoutC = 1, layoutR = 1, overlap = 0, eng = 0, testAnim = 0, checker = 0;
         int roiL = 0, roiT = 0, roiR = 0, roiB = 0, roiCir = 0, roiBrd = 0;
+        int oscCfg = 0, oscPortV = 8000;
         bool curved = false, tp = false;
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -441,6 +456,7 @@ static std::string dispatch(std::string line) {
             eng = g_cfg.engine; testAnim = g_cfg.testAnim; checker = g_cfg.checker;
             roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1]; roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
             roiCir = g_cfg.roiCircle; roiBrd = g_cfg.roiBorder;
+            oscCfg = g_cfg.osc; oscPortV = g_cfg.oscPort;
             for (auto& o : g_cfg.outputs) if (o.enabled) {
                 outs++;
                 if (outs == 1) { edges = o.edges; masks = (int)o.masks.size(); }
@@ -472,6 +488,8 @@ static std::string dispatch(std::string line) {
                           std::to_string(roiR) + "," + std::to_string(roiB) +
                ";roicircle=" + std::string(roiCir ? "on" : "off") +
                ";roiborder=" + std::to_string(roiBrd) +
+               ";osc=" + std::string(oscRunning() || oscCfg ? "on" : "off") +
+               ";oscport=" + std::to_string(oscPortV) +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
@@ -1125,6 +1143,29 @@ static std::string dispatch(std::string line) {
                 requestInplaceRestyle();
                 applied = true;
             }
+            if (!applied && key == "osc") {
+                if (val != "ON" && val != "1" && val != "OFF" && val != "0")
+                    return "ERR SET osc=on|off\n";
+                bool want = (val == "ON" || val == "1");
+                {
+                    std::lock_guard<std::mutex> lk(g_cfgMutex);
+                    g_cfg.osc = want ? 1 : 0;
+                }
+                if (want && !oscRunning()) oscStart(g_oscPortLive.load());
+                else if (!want) oscStop();
+                applied = true;
+            }
+            if (!applied && key == "oscport") {
+                int p = atoi(val.c_str());
+                if (p < 1024 || p > 65535) return "ERR SET oscport (1024..65535)\n";
+                {
+                    std::lock_guard<std::mutex> lk(g_cfgMutex);
+                    g_cfg.oscPort = p;
+                }
+                g_oscPortLive.store(p);
+                if (oscRunning()) { oscStop(); oscStart(p); }
+                applied = true;
+            }
             if (!applied) return "ERR SET " + key + "\n";
             g_rev++;
         }
@@ -1202,6 +1243,123 @@ void cmdnetStop() {
     if (g_listenSock != INVALID_SOCKET) {
         closesocket(g_listenSock);
         g_listenSock = INVALID_SOCKET;
+    }
+    WSACleanup();
+}
+
+std::string cmdnetExecute(const std::string& line) { return dispatch(line); }
+
+// ---------- OSC over UDP (loopback only) ----------
+// The original's remote-control stack is CMDNET + OSC. Mapping contract:
+//   address segment after '/' = command word, OSC args join with spaces into
+//   one CMDNET line ("set" + s"engine=1" -> SET ENGINE=1, "get" + s"perf" ->
+//   GET PERF), and the textual response is sent back to the sender. Bundles
+//   and exotic typetags are ignored. Loopback bind keeps the control surface
+//   off the network (widening it is a deliberate later decision).
+
+bool oscRunning() { return g_oscRun.load(); }
+
+// read one null-terminated, 4-byte-aligned OSC blob; p advances past padding
+static bool oscBlob(const char*& p, const char* end, const char** out, int* outLen) {
+    const char* q = p;
+    while (q < end && *q) q++;
+    if (q >= end) return false;
+    *out = p; *outLen = (int)(q - p);
+    q++;                                        // skip NUL
+    int pad = (int)(4 - ((q - p) & 3)) & 3;
+    if (q + pad > end) return false;
+    p = q + pad;
+    return true;
+}
+
+static void oscHandle(const char* d, int len, sockaddr_in* from) {
+    if (len >= 8 && memcmp(d, "#bundle", 8) == 0) return;   // bundles unsupported
+    const char* p = d; const char* end = d + len;
+    const char* addr; int alen;
+    if (!oscBlob(p, end, &addr, &alen)) return;
+    std::string a(addr, alen);
+    if (a.empty() || a[0] != '/') return;
+    std::string line = a.substr(1);
+    for (auto& c : line) c = (char)toupper((unsigned char)c);
+    if (p < end && *p == ',') {
+        const char* tags; int tlen;
+        if (!oscBlob(p, end, &tags, &tlen)) return;
+        std::string args;
+        for (int i = 1; i < tlen; i++) {
+            char t = tags[i];
+            char tmp[64];
+            if (t == 'i' && p + 4 <= end) {
+                unsigned v = ((unsigned)(unsigned char)p[0] << 24) |
+                             ((unsigned)(unsigned char)p[1] << 16) |
+                             ((unsigned)(unsigned char)p[2] << 8) |
+                             (unsigned)(unsigned char)p[3];
+                p += 4;
+                sprintf_s(tmp, sizeof(tmp), "%u", v);
+                args += tmp;
+            } else if (t == 'f' && p + 4 <= end) {
+                unsigned char b4[4] = { (unsigned char)p[0], (unsigned char)p[1],
+                                        (unsigned char)p[2], (unsigned char)p[3] };
+                p += 4;
+                float f; memcpy(&f, b4, 4);
+                sprintf_s(tmp, sizeof(tmp), "%g", f);
+                args += tmp;
+            } else if (t == 's' || t == 'S') {
+                const char* sv; int sl;
+                if (!oscBlob(p, end, &sv, &sl)) return;
+                args.append(sv, sl);
+            } else if (t == 'T') {
+                args += "on";
+            } else if (t == 'F') {
+                args += "off";
+            } else {
+                return;   // unknown typetag (b/h/d/timestamps): ignore packet
+            }
+            args += ' ';
+        }
+        while (!args.empty() && args.back() == ' ') args.pop_back();
+        if (!args.empty()) { line += ' '; line += args; }
+    }
+    if (line.empty()) return;
+    std::string rep = cmdnetExecute(line);
+    sendto(g_oscSock, rep.c_str(), (int)rep.size(), 0, (sockaddr*)from, sizeof(*from));
+}
+
+void oscStart(int port) {
+    if (g_oscRun.load()) return;
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;   // ref-counted: own pair
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) { WSACleanup(); return; }
+    BOOL reuse = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((u_short)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) {
+        closesocket(s); WSACleanup(); return;
+    }
+    g_oscSock = s;
+    g_oscPortLive.store(port);
+    g_oscRun.store(true);
+    dbgLogLine("osc: listening on udp/127.0.0.1:" + std::to_string(port));
+    g_oscThread = std::thread([s]() {
+        char buf[2048];
+        while (g_oscRun.load()) {
+            sockaddr_in from{}; int fl = sizeof(from);
+            int n = recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+            if (n <= 0) break;
+            oscHandle(buf, n, &from);
+        }
+    });
+    g_oscThread.detach();
+}
+
+void oscStop() {
+    if (!g_oscRun.exchange(false)) return;
+    if (g_oscSock != INVALID_SOCKET) {
+        closesocket(g_oscSock);
+        g_oscSock = INVALID_SOCKET;
     }
     WSACleanup();
 }

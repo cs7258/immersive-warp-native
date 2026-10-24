@@ -77,6 +77,16 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 - 控制台勾选 "TCP control (CMDNET)" 或配置 `cmdnet=1` 后，监听 `127.0.0.1:5252`（仅本机回环，端口由 `cmdnetPort=` 配置）。
 - 协议与原版 CMDNET 一致：ASCII 明文 `<COMMAND> <PARAM>;\n`，一请求一应答。命令不区分大小写。
 
+## OSC over UDP 控制服务（回环）
+
+- 配置 `osc=1`（或 CMDNET `SET osc=on;`）后监听 `127.0.0.1:8000`（仅本机回环，端口由 `oscPort=` / `SET oscport=1024..65535` 配置，改端口即重启监听）。
+- **映射契约**：OSC 地址段（去掉 `/`）= CMDNET 命令词，OSC 参数（i/f/s/T/F 类型标签）转字符串后用空格拼接成 CMDNET 行执行；应答为**纯文本**回发到发包方（便于集成方调试与自动化测试）。
+  - `/ping` → `PING` → 回 `OK`
+  - `/get` + s"perf" → `GET PERF` → 回 `OK perf=...`
+  - `/set` + s"engine=1" → `SET ENGINE=1`（注意 CMDNET 整行大写语义继承）
+- 不支持 `#bundle`（忽略）与扩展类型标签（b/h/d 等，整包忽略）；`T`→`on`、`F`→`off`。
+- 与 CMDNET 共享同一 dispatch，故命令全集与下表完全一致；安全姿态同为仅回环（开放网段为后续显式决策）。
+
 | 命令 | 应答 | 说明 |
 |---|---|---|
 | `PING;` | `OK` | 连通性 |
