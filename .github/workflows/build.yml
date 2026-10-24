@@ -26,6 +26,7 @@ jobs:
             build/ImmersiveWarpNative.exe
             build/WarpHook.dll
             build/IWNInject.exe
+            build/IWND3DProbe.exe
           if-no-files-found: error
 
       # 只有 main 分支的构建才允许覆盖 latest release。
@@ -38,6 +39,6 @@ jobs:
         shell: bash
         run: |
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create latest build/ImmersiveWarpNative.exe build/WarpHook.dll build/IWNInject.exe \
+          gh release create latest build/ImmersiveWarpNative.exe build/WarpHook.dll build/IWNInject.exe build/IWND3DProbe.exe \
             --title "latest" \
             --notes "commit ${{ github.sha }} · $(date -u +%Y-%m-%dT%H:%M:%SZ)"

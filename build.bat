@@ -34,8 +34,15 @@ cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE ^
   /link /SUBSYSTEM:CONSOLE /ENTRY:wmainCRTStartup kernel32.lib user32.lib
 if errorlevel 1 goto FAIL
 
+REM ---- external D3D11 injection target for regression (injecttest) ----
+cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE ^
+  src\probe\D3DProbe.cpp ^
+  /Fe:build\IWND3DProbe.exe /Fo:build\ ^
+  /link /SUBSYSTEM:CONSOLE /ENTRY:wmainCRTStartup d3d11.lib dxgi.lib user32.lib
+if errorlevel 1 goto FAIL
+
 echo.
-echo BUILD OK: build\ImmersiveWarpNative.exe build\WarpHook.dll build\IWNInject.exe
+echo BUILD OK: build\ImmersiveWarpNative.exe build\WarpHook.dll build\IWNInject.exe build\IWND3DProbe.exe
 exit /b 0
 
 :NOTOOLS
