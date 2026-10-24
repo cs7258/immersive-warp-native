@@ -274,12 +274,12 @@ static PFN_Present patchSwapchainVt(IDXGISwapChain* sw) {
         if (g_vts[i].vt == vt) return g_vts[i].orig;
     if (g_vtCount >= 4) return nullptr;
     DWORD old{};
-    if (!VirtualProtect(&vt[13], sizeof(void*), PAGE_READWRITE, &old)) return nullptr;
-    PFN_Present orig = (PFN_Present)vt[13];
-    *(void* volatile*)&vt[13] = (void*)&HookPresent;
-    VirtualProtect(&vt[13], sizeof(void*), old, &old);
+    if (!VirtualProtect(&vt[8], sizeof(void*), PAGE_READWRITE, &old)) return nullptr;
+    PFN_Present orig = (PFN_Present)vt[8];
+    *(void* volatile*)&vt[8] = (void*)&HookPresent;
+    VirtualProtect(&vt[8], sizeof(void*), old, &old);
     // volatile readback - the compiler must not fold this into the store
-    void* now = *(void* volatile*)&vt[13];
+    void* now = *(void* volatile*)&vt[8];
     if (now != (void*)&HookPresent) {
         hookLog("Present patch VERIFY FAILED - readback differs");
         return orig;
@@ -535,9 +535,9 @@ static DWORD WINAPI initThread(LPVOID) {
         std::lock_guard<std::mutex> lk(g_vtMutex);
         if (g_vtCount > 0 && g_vts[0].probe) {
             void** vt = g_vts[0].vt;
-            if (*(void* volatile*)&vt[13] == (void*)&HookPresent) {
+            if (*(void* volatile*)&vt[8] == (void*)&HookPresent) {
                 hookLog("probe: calling hooked slot with PRESENT_TEST");
-                ((PFN_Present)vt[13])(g_vts[0].probe, 0, DXGI_PRESENT_TEST);
+                ((PFN_Present)vt[8])(g_vts[0].probe, 0, DXGI_PRESENT_TEST);
             }
         }
     }
@@ -568,15 +568,15 @@ static DWORD WINAPI initThread(LPVOID) {
             } else if (!objVptrLogged) {
                 objVptrLogged = true;
                 char buf[160];
-                wsprintfA(buf, "vptr check: obj=%p vt=%p slot13=%p hook=%p",
-                          (void*)g_vts[i].probe, (void*)vt, vt[13], (void*)&HookPresent);
+                wsprintfA(buf, "vptr check: obj=%p vt=%p slot8=%p hook=%p",
+                          (void*)g_vts[i].probe, (void*)vt, vt[8], (void*)&HookPresent);
                 hookLog(buf);
             }
-            if (*(void* volatile*)&vt[13] != (void*)&HookPresent) {
+            if (*(void* volatile*)&vt[8] != (void*)&HookPresent) {
                 DWORD old{};
-                if (VirtualProtect(&vt[13], sizeof(void*), PAGE_READWRITE, &old)) {
-                    *(void* volatile*)&vt[13] = (void*)&HookPresent;
-                    VirtualProtect(&vt[13], sizeof(void*), old, &old);
+                if (VirtualProtect(&vt[8], sizeof(void*), PAGE_READWRITE, &old)) {
+                    *(void* volatile*)&vt[8] = (void*)&HookPresent;
+                    VirtualProtect(&vt[8], sizeof(void*), old, &old);
                     char buf[96];
                     wsprintfA(buf, "vtable reverted (vt=%p) - repatched", (void*)vt);
                     hookLog(buf);
