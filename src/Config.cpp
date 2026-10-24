@@ -146,6 +146,7 @@ bool saveConfig(const std::wstring& pathIn) {
     os << "osc=" << g_cfg.osc << "\n";
     os << "oscPort=" << g_cfg.oscPort << "\n";
     os << "sampling=" << g_cfg.sampling << "\n";
+    os << "maxfps=" << g_cfg.maxfps << "\n";
     os << "autostart=" << g_cfg.autostart << "\n";
     os << "perflog=" << (g_perfLog.load() ? 1 : 0) << "\n";
     os << "source=" << toUtf8(g_cfg.sourceDev) << "\n";
@@ -239,6 +240,7 @@ bool loadConfig(const std::wstring& pathIn) {
             c.oscPort = (p >= 1024 && p <= 65535) ? p : 8000;
         }
         else if (key == "sampling") c.sampling = atoi(val.c_str());
+        else if (key == "maxfps") { c.maxfps = atoi(val.c_str()); if (c.maxfps < 0) c.maxfps = 0; if (c.maxfps > 240) c.maxfps = 240; }   // render-loop pacing; garbage values clamp, 0 = uncapped
         else if (key == "autostart") c.autostart = atoi(val.c_str());
         else if (key == "perflog") g_perfLog.store(val == "1");
         else if (key == "source") c.sourceDev = fromUtf8(val);

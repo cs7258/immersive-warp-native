@@ -33,8 +33,42 @@ static LONG WINAPI iwnExcHandler(EXCEPTION_POINTERS* ep) {
 
 static void renderLoop() {
     dbgLogLine("renderLoop tid=" + std::to_string((long)GetCurrentThreadId()));
+    LARGE_INTEGER qpf{};
+    QueryPerformanceFrequency(&qpf);
+    LARGE_INTEGER nextFrame{};   // QPC deadline of the next capped frame
+    bool paced = false;
     while (g_running.load()) {
         Engine::inst().renderAll();
+        // output frame cap (config maxfps, 0 = uncapped): hold the loop until
+        // the next frame is due. Falls behind -> resync instead of bursting.
+        // MAG engine has no render loop; the cap is a DXGI-engine setting.
+        int cap = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            cap = g_cfg.maxfps;
+        }
+        if (cap > 0) {
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            LONG64 period = qpf.QuadPart / (cap > 240 ? 240 : cap);
+            if (!paced) {   // first capped frame: start the schedule now
+                paced = true;
+                nextFrame.QuadPart = now.QuadPart + period;
+            } else if (now.QuadPart < nextFrame.QuadPart) {
+                LONG64 remainMs = (nextFrame.QuadPart - now.QuadPart) * 1000 / qpf.QuadPart;
+                if (remainMs > 2) Sleep((DWORD)(remainMs - 2));
+                while (g_running.load()) {   // short spin for the last ~2 ms
+                    QueryPerformanceCounter(&now);
+                    if (now.QuadPart >= nextFrame.QuadPart) break;
+                    Sleep(0);
+                }
+                nextFrame.QuadPart += period;
+            } else {   // missed the slot (slow machine / stall): resync
+                nextFrame.QuadPart = now.QuadPart + period;
+            }
+        } else {
+            paced = false;
+        }
         Sleep(6);
     }
 }

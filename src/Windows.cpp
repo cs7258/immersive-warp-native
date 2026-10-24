@@ -1350,6 +1350,7 @@ static HWND g_ckPreview = nullptr, g_ckImage = nullptr, g_imgLabel = nullptr;
 static HWND g_ckInplace = nullptr;  // in-place overlay (fullscreen click-through)
 static HWND g_ckNet = nullptr;
 static HWND g_ckAuto = nullptr, g_cbSamp = nullptr;
+static HWND g_cbFps = nullptr;         // Settings page: output max-fps dropdown
 static HWND g_cbLayout = nullptr, g_cbOvl = nullptr, g_cbEng = nullptr;
 static HWND g_cbSrc = nullptr;
 static HWND g_cbOvrSrc = nullptr;      // per-output source override dropdown
@@ -1883,6 +1884,7 @@ void notifyOutputRaised() {
 #define IDC_PRESETSAVE 1028
 #define IDC_PRESETLOAD 1029
 #define IDC_PRESETDEL  1030
+#define IDC_CBFPS     1031   // Settings page: output max-fps dropdown
 #define IDC_CBTARGET   1031   // per-output command target dropdown (SET out=)
 #define IDC_TABS       1032   // main-console tab strip
 #define IDC_CKINPLACE  1033   // in-place overlay (fullscreen click-through)
@@ -2074,6 +2076,24 @@ void refreshSampComboUI() {
     if (g_ctl && g_cbSamp) {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         PostMessageW(g_cbSamp, CB_SETCURSEL, g_cfg.sampling, 0);
+    }
+}
+
+// Settings "Max FPS" dropdown options; index 0 = Off (uncapped)
+static const int kFpsOpts[] = { 0, 24, 30, 60, 120 };
+static int maxFpsIndex(int v) {
+    for (int i = 0; i < 5; i++) if (kFpsOpts[i] == v) return i;
+    // arbitrary saved value: snap to the nearest option below (or Off)
+    int idx = 0;
+    for (int i = 1; i < 5; i++) if (kFpsOpts[i] <= v) idx = i;
+    return idx;
+}
+
+void refreshMaxFpsUI() {
+    // socket thread safe: plain CB_SETCURSEL PostMessage (no CBN_SELCHANGE)
+    if (g_ctl && g_cbFps) {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        PostMessageW(g_cbFps, CB_SETCURSEL, maxFpsIndex(g_cfg.maxfps), 0);
     }
 }
 
@@ -3424,6 +3444,7 @@ static void applyLoadedConfig() {
     Button_SetCheck(g_ckAuto, queryAutostart() ? BST_CHECKED : BST_UNCHECKED);
     Engine::inst().setSampling(g_cfg.sampling);
     ComboBox_SetCurSel(g_cbSamp, g_cfg.sampling);
+    ComboBox_SetCurSel(g_cbFps, maxFpsIndex(g_cfg.maxfps));   // max-fps combo follows the load
     ComboBox_SetCurSel(g_cbAnim, g_cfg.testAnim);   // animation direction follows the load
     Button_SetCheck(g_ckCheck, g_cfg.checker ? BST_CHECKED : BST_UNCHECKED);
     roiReloadNow();   // ROI edits follow the load
@@ -4017,6 +4038,18 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
             70, 166, 260, 220,
             hwnd, (HMENU)IDC_CBTARGET, nullptr, nullptr));
+        add(PAGE_SETTINGS, CreateWindowW(L"STATIC", L"Max FPS:",
+            WS_CHILD | SS_LEFT, 16, 210, 52, 18,
+            hwnd, nullptr, nullptr, nullptr));
+        add(PAGE_SETTINGS, g_cbFps = CreateWindowW(L"COMBOBOX", nullptr,
+            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            70, 206, 140, 220,
+            hwnd, (HMENU)IDC_CBFPS, nullptr, nullptr));
+        ComboBox_AddString(g_cbFps, L"Off");
+        ComboBox_AddString(g_cbFps, L"24");
+        ComboBox_AddString(g_cbFps, L"30");
+        ComboBox_AddString(g_cbFps, L"60");
+        ComboBox_AddString(g_cbFps, L"120");
 
         // --- bottom strip, always visible (mirrors the original's bottom bar).
         // The transient status line ("Ready." + one-shot messages) lives at the
@@ -4516,6 +4549,16 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 setStatus(sel == 0 ? L"Sampling: trilinear."
                          : sel == 3 ? L"Sampling: bi-cubic."
                                     : L"Sampling: anisotropic.");
+            }
+        } else if (id == IDC_CBFPS && HIWORD(wp) == CBN_SELCHANGE) {
+            int sel = ComboBox_GetCurSel(g_cbFps);
+            if (sel >= 0 && sel < 5) {
+                int v = kFpsOpts[sel];
+                { std::lock_guard<std::mutex> lk(g_cfgMutex); g_cfg.maxfps = v; }
+                wchar_t msg[64];
+                if (v == 0) wsprintfW(msg, L"Max FPS: off (uncapped).");
+                else wsprintfW(msg, L"Max FPS: %d (render loop paced).", v);
+                setStatus(msg);
             }
         } else if (id == IDC_CBSRC && HIWORD(wp) == CBN_SELCHANGE) {
             if (g_srcBusy) return 0;   // reentrancy guard (combo repopulation)

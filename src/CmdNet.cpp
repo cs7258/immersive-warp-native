@@ -181,6 +181,7 @@ static std::string dispatch(std::string line) {
             return buf;
         }
         if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
+        if (k == "maxfps") return "OK maxfps=" + std::to_string(g_cfg.maxfps) + "\n";
         if (k == "srcs") {   // per-output source overrides (empty "-" = global pin)
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             std::string s;
@@ -264,6 +265,7 @@ static std::string dispatch(std::string line) {
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 s += "sampling=" + std::to_string(g_cfg.sampling) + ";";
+                s += "maxfps=" + std::to_string(g_cfg.maxfps) + ";";
                 s += std::string("testpattern=") + (g_cfg.testPattern ? "on" : "off") + ";";
                 s += "layout=" + std::to_string(g_cfg.layoutC) + "x" + std::to_string(g_cfg.layoutR) + ";";
                 s += "overlap=" + std::to_string(g_cfg.overlap) + ";";
@@ -455,6 +457,7 @@ static std::string dispatch(std::string line) {
         // the end, so older parsers reading "key=value;" pairs keep working.
         int edges = 15, outs = 0, masks = 0;
         int layoutC = 1, layoutR = 1, overlap = 0, eng = 0, testAnim = 0, checker = 0, subd = 8;
+        int maxFps = 0;
         int roiL = 0, roiT = 0, roiR = 0, roiB = 0, roiCir = 0, roiBrd = 0;
         int oscCfg = 0, oscPortV = 8000;
         bool curved = false, tp = false;
@@ -464,6 +467,7 @@ static std::string dispatch(std::string line) {
             curved = g_cfg.curved != 0; tp = g_cfg.testPattern;
             eng = g_cfg.engine; testAnim = g_cfg.testAnim; checker = g_cfg.checker;
             subd = g_cfg.subdivide;
+            maxFps = g_cfg.maxfps;
             roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1]; roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
             roiCir = g_cfg.roiCircle; roiBrd = g_cfg.roiBorder;
             oscCfg = g_cfg.osc; oscPortV = g_cfg.oscPort;
@@ -494,6 +498,7 @@ static std::string dispatch(std::string line) {
                ";testpause=" + std::string(g_testPause.load() ? "on" : "off") +
                ";checker=" + std::string(checker ? "on" : "off") +
                ";subdivide=" + std::to_string(subd) +
+               ";maxfps=" + std::to_string(maxFps) +
                ";move=" + std::string(g_moveMode.load() == 1 ? "xy" : g_moveMode.load() == 2 ? "all" : "single") +
                ";roi=" + std::to_string(roiL) + "," + std::to_string(roiT) + "," +
                           std::to_string(roiR) + "," + std::to_string(roiB) +
@@ -605,6 +610,7 @@ static std::string dispatch(std::string line) {
         Engine::inst().setTestImage(g_cfg.testImg);   // <0 clears the overlay
         if (!g_cfg.imagePath.empty()) engineLoadImage(g_cfg.imagePath);
         refreshSampComboUI();   // engine/sampling dropdowns follow loaded config
+        refreshMaxFpsUI();      // Settings max-fps combo follows loaded config
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             refreshAnimUI(g_cfg.testAnim, g_testPause.load());   // animation combo follows
@@ -769,6 +775,20 @@ static std::string dispatch(std::string line) {
             Engine::inst().setSampling(q);   // atomic publish, no rebuild needed
             refreshSampComboUI();            // keep the console dropdown in sync
             return "OK sampling=" + std::to_string(q) + "\n";
+        }
+        // output frame cap: 0 = uncapped, else the render loop holds each
+        // frame until its slot is due (power/heat friendly on site). MAG has
+        // no render loop - the cap is a DXGI-engine setting.
+        if (key == "maxfps") {
+            int v = atoi(val.c_str());
+            if (val.empty() || v < 0 || v > 240)
+                return "ERR SET maxfps (0..240)\n";
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.maxfps = v;
+            }
+            refreshMaxFpsUI();   // keep the Settings combo in sync
+            return "OK maxfps=" + std::to_string(v) + "\n";
         }
         if (key == "engine") {
             // MAG mode is a different kind of output window: the shared

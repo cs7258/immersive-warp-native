@@ -104,6 +104,7 @@ struct AppConfig {
     int osc = 0;                      // OSC over UDP remote control on/off (loopback)
     int oscPort = 8000;               // OSC listen port (standard OSC 8000)
     int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x, 3 bicubic
+    int maxfps = 0;                   // output frame cap (0 = uncapped); paces the DXGI render loop
     int autostart = 0;                // start with Windows (HKCU Run mirror)
     // explicit capture source. empty = auto (first display that is not an
     // output). A non-empty value pins the desktop that gets warped, which is
@@ -147,6 +148,7 @@ void requestOvrSrcSync();      // any thread: override combo follows SET src=
 void requestBlackoutSync();    // any thread: blackout overlays + menu checkbox follow
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
 void refreshSampComboUI();     // socket thread safe: sampling dropdown follows shared state
+void refreshMaxFpsUI();        // socket thread safe: Settings max-fps combo follows shared state
 // socket thread safe AND callable while holding g_cfgMutex: no internal
 // locking, the caller passes the captured values (SET testanim runs inside
 // the CMDNET locked region - an internal lock would self-deadlock)
