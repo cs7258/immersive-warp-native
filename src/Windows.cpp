@@ -2003,13 +2003,15 @@ void openColorDialogEx() {   // hotkey D (registered only while calibrating)
 // w(t) = pow(blendCurve(t, gain, slope), gamma), lets the user tweak the
 // three parameters and keep a per-side history. Fade (the band width) is
 // edited on the Blending page - this dialog shapes the ramp response only.
-// R/G/B per-channel curves need a data-model upgrade first (P2).
+// The R/G/B channel gammas edit the same side's per-channel curve
+// exponents (weight_c = pow(curve, gamma*chanC); 1/1/1 = the luma curve).
 static OutputCfg* cfgOutput();   // fwd: defined in the Configure-dialog section
 static HWND g_curveDlg = nullptr;
 static HWND g_cuvSide = nullptr, g_cuvGain = nullptr,
-            g_cuvSlope = nullptr, g_cuvGamma = nullptr;
-struct CurveSnap { float gain, slope, gamma; };
-static CurveSnap g_cuvSnap{ 0, 0, 1 };       // painted snapshot: no lock in paint
+            g_cuvSlope = nullptr, g_cuvGamma = nullptr,
+            g_cuvChanR = nullptr, g_cuvChanG = nullptr, g_cuvChanB = nullptr;
+struct CurveSnap { float gain, slope, gamma, chanR, chanG, chanB; };
+static CurveSnap g_cuvSnap{ 0, 0, 1, 1, 1, 1 };   // painted snapshot: no lock in paint
 static std::vector<CurveSnap> g_cuvHist[4];  // per-side history, newest last
 
 #define CUV_SIDE     2050
@@ -2020,6 +2022,9 @@ static std::vector<CurveSnap> g_cuvHist[4];  // per-side history, newest last
 #define CUV_HADD     2055
 #define CUV_HRESTORE 2056
 #define CUV_AREA     2057   // owner-draw static: the curve plot
+#define CUV_CHANR    2058   // per-channel blend gamma edits
+#define CUV_CHANG    2059
+#define CUV_CHANB    2060
 
 static int cuvSide() {
     int s = g_cuvSide ? ComboBox_GetCurSel(g_cuvSide) : -1;
@@ -2034,13 +2039,13 @@ static float cuvEditF(HWND edit) {
 
 // load the selected side's parameters from the config into the edits + snapshot
 static void cuvReload() {
-    CurveSnap c{ 0, 0, 1 };
+    CurveSnap c{ 0, 0, 1, 1, 1, 1 };
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         OutputCfg* o = cfgOutput();
         if (o) {
             const BlendSide& b = o->blend[cuvSide()];
-            c = { b.gain, b.slope, b.gamma };
+            c = { b.gain, b.slope, b.gamma, b.chanR, b.chanG, b.chanB };
         }
     }
     wchar_t t[16];
@@ -2050,6 +2055,12 @@ static void cuvReload() {
     SetWindowTextW(g_cuvSlope, t);
     _snwprintf_s(t, _TRUNCATE, L"%.3f", c.gamma);
     SetWindowTextW(g_cuvGamma, t);
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", c.chanR);
+    SetWindowTextW(g_cuvChanR, t);
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", c.chanG);
+    SetWindowTextW(g_cuvChanG, t);
+    _snwprintf_s(t, _TRUNCATE, L"%.3f", c.chanB);
+    SetWindowTextW(g_cuvChanB, t);
     g_cuvSnap = c;
     if (g_curveDlg) InvalidateRect(g_curveDlg, nullptr, TRUE);
 }
@@ -2059,7 +2070,10 @@ static void cuvApply() {
     int side = cuvSide();
     CurveSnap c{ clampf(cuvEditF(g_cuvGain), 0.0f, 2.0f),
                  clampf(cuvEditF(g_cuvSlope), 0.0f, 1.0f),
-                 clampf(cuvEditF(g_cuvGamma), 0.1f, 5.0f) };
+                 clampf(cuvEditF(g_cuvGamma), 0.1f, 5.0f),
+                 clampf(cuvEditF(g_cuvChanR), 0.1f, 5.0f),
+                 clampf(cuvEditF(g_cuvChanG), 0.1f, 5.0f),
+                 clampf(cuvEditF(g_cuvChanB), 0.1f, 5.0f) };
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         OutputCfg* o = cfgOutput();
@@ -2067,6 +2081,9 @@ static void cuvApply() {
             o->blend[side].gain = c.gain;
             o->blend[side].slope = c.slope;
             o->blend[side].gamma = c.gamma;
+            o->blend[side].chanR = c.chanR;
+            o->blend[side].chanG = c.chanG;
+            o->blend[side].chanB = c.chanB;
             g_rev++;
         }
     }
@@ -2087,10 +2104,13 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         for (const wchar_t* n : { L"Left", L"Right", L"Top", L"Bottom" })
             ComboBox_AddString(g_cuvSide, n);
         ComboBox_SetCurSel(g_cuvSide, 0);
-        static const struct { const wchar_t* name; int id; HWND* slot; } prm[3] = {
+        static const struct { const wchar_t* name; int id; HWND* slot; } prm[6] = {
             { L"Gain", CUV_GAIN, &g_cuvGain },
             { L"Slope", CUV_SLOPE, &g_cuvSlope },
-            { L"Gamma", CUV_GAMMA, &g_cuvGamma } };
+            { L"Gamma", CUV_GAMMA, &g_cuvGamma },
+            { L"R chan", CUV_CHANR, &g_cuvChanR },
+            { L"G chan", CUV_CHANG, &g_cuvChanG },
+            { L"B chan", CUV_CHANB, &g_cuvChanB } };
         for (int i = 0; i < 3; i++) {
             CreateWindowW(L"STATIC", prm[i].name, WS_CHILD | WS_VISIBLE,
                 246, 55 + i * 32, 44, 18, hwnd, nullptr, nullptr, nullptr);
@@ -2117,10 +2137,33 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             MoveToEx(dc, rc.left, y, nullptr);
             LineTo(dc, rc.right, y);
         }
-        // the response curve, sampled at 128 points
+        // the response curve, sampled at 128 points; when a channel gamma
+        // deviates from 1 its per-channel weight curve is drawn beneath the
+        // luma curve in that channel's color
+        struct CuCurve { COLORREF col; float chan; };
+        const CuCurve chans[3] = {
+            { RGB(220, 60, 60), g_cuvSnap.chanR },
+            { RGB(60, 200, 60), g_cuvSnap.chanG },
+            { RGB(80, 120, 255), g_cuvSnap.chanB } };
+        int W = rc.right - rc.left, H = rc.bottom - rc.top;
+        for (const CuCurve& cc : chans) {
+            if (fabsf(cc.chan - 1.0f) < 0.001f) continue;
+            HPEN cp = CreatePen(PS_SOLID, 1, cc.col);
+            SelectObject(dc, cp);
+            for (int i = 0; i <= 128; i++) {
+                float t = i / 128.0f;
+                float w = powf(magBlendCurve(t, g_cuvSnap.gain, g_cuvSnap.slope),
+                               g_cuvSnap.gamma * cc.chan);
+                int x = rc.left + (int)(t * (W - 2)) + 1;
+                int y = rc.bottom - 1 - (int)(clampf(w, 0.0f, 1.0f) * (H - 2));
+                if (i == 0) MoveToEx(dc, x, y, nullptr);
+                else LineTo(dc, x, y);
+            }
+            SelectObject(dc, oldPen);
+            DeleteObject(cp);
+        }
         HPEN curve = CreatePen(PS_SOLID, 2, RGB(255, 140, 0));
         SelectObject(dc, curve);
-        int W = rc.right - rc.left, H = rc.bottom - rc.top;
         for (int i = 0; i <= 128; i++) {
             float t = i / 128.0f;
             float w = powf(magBlendCurve(t, g_cuvSnap.gain, g_cuvSnap.slope),
@@ -2152,6 +2195,9 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 _snwprintf_s(t, _TRUNCATE, L"%.3f", c.gain);   SetWindowTextW(g_cuvGain, t);
                 _snwprintf_s(t, _TRUNCATE, L"%.3f", c.slope);  SetWindowTextW(g_cuvSlope, t);
                 _snwprintf_s(t, _TRUNCATE, L"%.3f", c.gamma);  SetWindowTextW(g_cuvGamma, t);
+                _snwprintf_s(t, _TRUNCATE, L"%.3f", c.chanR);  SetWindowTextW(g_cuvChanR, t);
+                _snwprintf_s(t, _TRUNCATE, L"%.3f", c.chanG);  SetWindowTextW(g_cuvChanG, t);
+                _snwprintf_s(t, _TRUNCATE, L"%.3f", c.chanB);  SetWindowTextW(g_cuvChanB, t);
                 cuvApply();
             }
         }
@@ -2163,6 +2209,7 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_DESTROY:
         g_curveDlg = nullptr;
         g_cuvSide = g_cuvGain = g_cuvSlope = g_cuvGamma = nullptr;
+        g_cuvChanR = g_cuvChanG = g_cuvChanB = nullptr;
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -2185,7 +2232,7 @@ static void openCurveDialog(HINSTANCE hInst, HWND owner) {
     g_curveDlg = CreateWindowExW(WS_EX_TOPMOST, L"IWN_CurveDlg",
         L"Blend curve editor (selected projector)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        180, 180, 430, 300, nullptr, nullptr, hInst, nullptr);
+        180, 180, 430, 400, nullptr, nullptr, hInst, nullptr);
     if (g_curveDlg) {
         // the plot + remaining buttons (created here so the dialog frame
         // exists before we ask for client-relative positions)
@@ -2193,13 +2240,13 @@ static void openCurveDialog(HINSTANCE hInst, HWND owner) {
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
             10, 10, 220, 220, g_curveDlg, (HMENU)CUV_AREA, nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Apply",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 148, 100, 26,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 244, 100, 26,
             g_curveDlg, (HMENU)CUV_APPLY, nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Add to history",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 186, 120, 24,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 276, 120, 24,
             g_curveDlg, (HMENU)CUV_HADD, nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Restore history(0)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 216, 120, 24,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 246, 304, 120, 24,
             g_curveDlg, (HMENU)CUV_HRESTORE, nullptr, nullptr);
         cuvReload();
     }

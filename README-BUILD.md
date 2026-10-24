@@ -34,7 +34,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 7. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载；"Preset:" 行可把当前整套配置（几何/融合/掩码/布局）存为命名预设并随时一键切回——预设文件与 CMDNET 的 `SAVEAS`/`LOADAS` 命令共用同一目录，名称规则同为 A-Z 0-9 `_` `-`；**托盘图标右键菜单也带 "Load preset" 子菜单**（逐项列出预设，单击即切换）
 8. "Configure display..." 打开每投影机配置对话框（对应原版同名牌）：七标签页 **Bezels / Align / Geometry / Blending / Color / Masking / Help**
    - **Geometry**：控制点 Horiz/Vert 密度（3–24，Apply 会重置网格）、水平/垂直镜像、旋转 90°、Reset grid
-   - **Blending**：按边（Left/Right/Top/Bottom）设置 Fade/Gamma/Gain/Slope，可勾选"Apply to all 4 edges"同步；**Curve editor...** 打开融合曲线编辑器（对应原版 Advanced blend control）：绘制所选边响应曲线 w(t)=pow(blendCurve(t,gain,slope),gamma)，Gain/Slope/Gamma 参数编辑 + Apply，Add to history / Restore history(0) 每边历史栈（最多 8 条）；R/G/B 分通道融合伽马已上线（shader 数据模型 + CMDNET `SET left.chanr/chang/chanb`，曲线编辑器 UI 控件待加）
+   - **Blending**：按边（Left/Right/Top/Bottom）设置 Fade/Gamma/Gain/Slope，可勾选"Apply to all 4 edges"同步；**Curve editor...** 打开融合曲线编辑器（对应原版 Advanced blend control）：绘制所选边响应曲线 w(t)=pow(blendCurve(t,gain,slope),gamma)，Gain/Slope/Gamma + **R/G/B chan** 三通道伽马参数编辑 + Apply，通道伽马≠1 时曲线图叠加该通道的彩色响应曲线，Add to history / Restore history(0) 每边历史栈（最多 8 条，含通道值）；分通道数据与 CMDNET `SET left.chanr/chang/chanb` 共享同一存储
    - **Color**：本投影机独立的 亮度/对比度/Gamma RGB 滑杆（与全局 Color adjustment 对话框区分，后者改所有启用输出）
    - **Masking**：黑位掩码矩形列表（最多 8 个，渲染为黑色）。选中列表项后在 X/Y/W/H 输入框按百分比编辑位置与尺寸，Apply 写入（自动限幅保证矩形不出屏），Reset 10% 复位为左上角 10%x10%；**也可直接在输出窗口上右键拖拽画掩码**（拖拽中实时黑块预览，松手落地，任何模式可用；误点 <1% 自动忽略）；结果随 Save Config 持久化为 `mask=x,y,w,h`（归一化 0..1）
    - Bezels / Align 为占位说明（未实现）；Help 是快捷键速查
