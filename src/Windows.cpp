@@ -1249,6 +1249,7 @@ constexpr UINT WM_DISPCHANGE = WM_APP + 16;   // deferred output rebuild after
 constexpr UINT WM_MAGPROBE = WM_APP + 17;     // probe markers toggled off-thread
 constexpr UINT WM_BLACKOUT = WM_APP + 18;     // blackout toggled off-thread
 constexpr UINT WM_OVRSYNC = WM_APP + 20;      // per-output source override UI sync
+constexpr UINT WM_SBFRESH = WM_APP + 21;      // status bar refresh from off-thread
                                               // WM_DISPLAYCHANGE (the handler
                                               // must not do heavy work inline)
 static DWORD uiThreadId = 0;
@@ -1372,6 +1373,14 @@ static void setStatus(const wchar_t* s) {
 // of its console: "Projector: 1 [1]" / mode / "Color balancing: R() G() B()".
 // Never call while holding g_cfgMutex.
 void refreshStatusBar() {
+    // socket threads must not SendMessage UI controls directly: the console
+    // may be mid-rebuild and the cross-thread call would block the CMDNET
+    // worker indefinitely (RPC timeouts drifting with rebuild load). Post
+    // instead - the 1 s status timer repaints anyway, this just speeds it up.
+    if (uiThreadId && GetCurrentThreadId() != uiThreadId) {
+        if (g_ctl) PostMessageW(g_ctl, WM_SBFRESH, 0, 0);
+        return;
+    }
     if (!g_statusInfo) return;
     int nProj = 0, sel = g_list ? ListBox_GetCurSel(g_list) : -1;
     ColorAdj c;
@@ -3696,6 +3705,9 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case WM_OVRSYNC:    // per-output override changed from the socket thread
         populateOvrSrcCombo();
+        return 0;
+    case WM_SBFRESH:    // status bar refresh requested from the socket thread
+        refreshStatusBar();
         return 0;
     case WM_INPLACESET: {   // in-place overlay toggled (UI or socket thread):
         // only the window style changes, but CreateWindowExW takes the full
