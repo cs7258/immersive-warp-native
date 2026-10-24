@@ -453,14 +453,16 @@ static void logThrowType(PEXCEPTION_POINTERS ep) {
     __try {
         ULONG_PTR* ei = ep->ExceptionRecord->ExceptionInformation;
         if (ei[0] != 0x19930520u) { hookLog("throw: unknown magic"); return; }
-        // x64 MSVC ABI: ei[1] = image-relative offset of ThrowInfo,
-        // ei[3] = image base of the throwing module
-        void* ownerMb = (void*)ei[3];
+        // verified on this machine: ei[1] is the ABSOLUTE address of the
+        // ThrowInfo (it landed inside msvcprt.dll for a std::system_error)
+        const void* tiAbs = (const void*)ei[1];
+        void* dum = nullptr;
+        void* ownerMb = RtlPcToFileHeader((PVOID)tiAbs, &dum);
         char buf2[96];
-        wsprintfA(buf2, "throw module: %p (rva=0x%X)", ownerMb, (DWORD)ei[1]);
+        wsprintfA(buf2, "throw module: %p (ti=%p)", ownerMb, tiAbs);
         hookLog(buf2);
-        if (!ownerMb || (DWORD)ei[1] == 0) { hookLog("throw: no base/rva"); return; }
-        const TiLite* ti = (const TiLite*)((const BYTE*)ownerMb + (DWORD)ei[1]);
+        if (!ownerMb) { hookLog("throw: no base"); return; }
+        const TiLite* ti = (const TiLite*)tiAbs;
         if (ti->ctaRva <= 0) { hookLog("throw: no catchable types"); return; }
         const CtaLite* cta = (const CtaLite*)((const BYTE*)ownerMb + ti->ctaRva);
         if (cta->n <= 0) { hookLog("throw: empty cta"); return; }
@@ -524,13 +526,19 @@ static DWORD WINAPI initThread(LPVOID) {
     }
     // one-shot dispatch probe: call the (hooked) slot directly 5 s in.
     // PRESENT_TEST never displays; proves the detour is live end-to-end.
+    // NOTE: the lock guard MUST die here - a bare declaration would keep
+    // g_vtMutex held for the rest of initThread, and the watchdog's own
+    // lock_guard below would recursively lock the same std::mutex, which
+    // throws system_error (0xE06D7363) and kills the process 2 s later.
     Sleep(5000);
-    std::lock_guard<std::mutex> lk(g_vtMutex);
-    if (g_vtCount > 0 && g_vts[0].probe) {
-        void** vt = g_vts[0].vt;
-        if (*(void* volatile*)&vt[13] == (void*)&HookPresent) {
-            hookLog("probe: calling hooked slot with PRESENT_TEST");
-            ((PFN_Present)vt[13])(g_vts[0].probe, 0, DXGI_PRESENT_TEST);
+    {
+        std::lock_guard<std::mutex> lk(g_vtMutex);
+        if (g_vtCount > 0 && g_vts[0].probe) {
+            void** vt = g_vts[0].vt;
+            if (*(void* volatile*)&vt[13] == (void*)&HookPresent) {
+                hookLog("probe: calling hooked slot with PRESENT_TEST");
+                ((PFN_Present)vt[13])(g_vts[0].probe, 0, DXGI_PRESENT_TEST);
+            }
         }
     }
     // watchdog: re-apply the detour if something restored the original entry.
