@@ -420,12 +420,19 @@ void createOutputWindows() {
                " engine=" + std::to_string(g_cfg.engine) +
                " tid=" + std::to_string((long)GetCurrentThreadId()));
     std::lock_guard<std::mutex> lk(g_cfgMutex);
-    // source desktop rectangle for the Magnification hosts: pinned source,
-    // else the first display that is not an enabled output; a single-display
-    // machine mirrors the primary monitor (hosts are filter-excluded so no
-    // infinite-mirror recursion)
-    auto sourceRect = [&]() -> RECT {
+    // source desktop rectangle for the Magnification hosts: per-output
+    // override first, then the pinned source, else the first display that is
+    // not an enabled output; a single-display machine mirrors the primary
+    // monitor (hosts are filter-excluded so no infinite-mirror recursion)
+    auto sourceRect = [&](const OutputCfg* ovr) -> RECT {
         std::wstring src = g_cfg.sourceDev;
+        if (ovr && !ovr->srcOverride.empty()) {
+            // recursion guard: never film an enabled output display
+            bool isOut = false;
+            for (auto& o : g_cfg.outputs)
+                if (o.enabled && o.deviceName == ovr->srcOverride) { isOut = true; break; }
+            if (!isOut) src = ovr->srcOverride;
+        }
         if (src.empty()) {
             for (auto& d : displays) {
                 bool isOut = false;
@@ -524,7 +531,7 @@ void createOutputWindows() {
             // NxN tile: the host mirrors THIS tile's source window - same
             // geometry as the DXGI pipeline (screen x shows source
             // x + c*(1-ov)), clamped to the source desktop.
-            RECT src = sourceRect();
+            RECT src = sourceRect(cfg);
             auto it = tileOf.find(cfg->deviceName);
             int tr = it != tileOf.end() ? it->second.first : 0;
             int tc = it != tileOf.end() ? it->second.second : 0;
@@ -1237,6 +1244,7 @@ constexpr UINT WM_MAGTEST = WM_APP + 14;      // test pattern changed off-thread
 constexpr UINT WM_TGTREFRESH = WM_APP + 15;   // refresh the Target combo (off-thread)
 constexpr UINT WM_DISPCHANGE = WM_APP + 16;   // deferred output rebuild after
 constexpr UINT WM_MAGPROBE = WM_APP + 17;     // probe markers toggled off-thread
+constexpr UINT WM_SRCSET = WM_APP + 19;       // per-output source override changed
 constexpr UINT WM_BLACKOUT = WM_APP + 18;     // blackout toggled off-thread
                                               // WM_DISPLAYCHANGE (the handler
                                               // must not do heavy work inline)
@@ -1826,6 +1834,12 @@ void requestMagProbeSync() {
     // socket thread: probe markers toggled -> overlays follow on the UI
     // thread (engine=1 only; the DXGI engine draws them in its overlay pass)
     if (g_ctl) PostMessageW(g_ctl, WM_MAGPROBE, 0, 0);
+}
+
+// socket thread: a per-output source override changed (SET src=). The
+// duplication binds at attach time, so outputs must rebuild on the UI thread.
+void requestSourceRebuild() {
+    if (g_ctl) PostMessageW(g_ctl, WM_SRCSET, 0, 0);
 }
 
 // ---- NxN tiled layout -------------------------------------------------------
@@ -3661,6 +3675,10 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         syncMagBlendOverlays();
         return 0;
     }
+    case WM_SRCSET:         // per-output source override changed (socket thread)
+        rebuildForSource();
+        refreshStatusBar();
+        return 0;
     case WM_MAGPROBE: {     // probe markers toggled from the socket thread
         bool on;
         {

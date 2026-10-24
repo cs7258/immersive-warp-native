@@ -580,18 +580,31 @@ bool Engine::createDuplication(OutputCtx& oc) {
            " preview=" + (preview ? "1" : "0") +
            " displays=" + std::to_string(displays.size()) +
            " requested='" + narrow(g_cfg.sourceDev) + "'");
+    // 0) per-output source override (SET src= / config per-output src=) wins
+    //    over the global pin; same recursion guard applies below
+    std::wstring ovr;
+    if (oc.displayIdx >= 0 && oc.displayIdx < (int)displays.size()) {
+        const std::wstring& own = displays[oc.displayIdx].deviceName;
+        for (auto& o : g_cfg.outputs)
+            if (o.enabled && o.deviceName == own && !o.srcOverride.empty()) {
+                ovr = o.srcOverride;
+                break;
+            }
+    }
+    const std::wstring* want = ovr.empty() ? &g_cfg.sourceDev : &ovr;
     // 1) explicit source (console combo / CMDNET SET source=) wins, as long as
     //    it is not one of the output displays (that would film ourselves)
-    if (!g_cfg.sourceDev.empty()) {
+    if (!want->empty()) {
         for (auto& d : displays) {
-            if (!sameDisplayName(d.deviceName, g_cfg.sourceDev)) continue;
+            if (!sameDisplayName(d.deviceName, *want)) continue;
             if (isOutputDisplay(d)) {
                 dbgLog("dupl: requested source is an enabled output -> recursion guard");
                 break;
             }
             src = &d;
-            dbgLog("dupl: explicit source accepted, display index " +
-                   std::to_string((int)(&d - displays.data())));
+            dbgLog(std::string(ovr.empty() ? "dupl: global source accepted"
+                                           : "dupl: per-output override accepted") +
+                   ", display index " + std::to_string((int)(&d - displays.data())));
             break;
         }
         if (!src) dbgLog("dupl: requested source not usable, falling back");

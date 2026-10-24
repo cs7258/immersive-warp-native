@@ -56,6 +56,8 @@ struct MaskRect { float x = 0, y = 0, w = 0.10f, h = 0.10f; };   // default = 10
 struct OutputCfg {
     std::wstring deviceName;          // DXGI output device name e.g. \\.\DISPLAY1
     std::wstring label;               // "1: DISPLAY1 [Primary]"
+    std::wstring srcOverride;         // per-output capture source (SET src=).
+                                      // empty = follow the global sourceDev pin
     bool enabled = false;
     int rows = 10, cols = 12;
     // dest positions of control points, row-major, 2*rows*cols floats, normalized [0..1]
@@ -132,6 +134,7 @@ void requestMagBlendSync();    // any thread: MAG edge-blend overlays resync (UI
 void requestOutputRebuild();   // any thread: destroy+recreate output windows on the UI thread
 void requestMagTestSync();     // any thread: test pattern overlays follow (engine=1)
 void requestMagProbeSync();    // any thread: probe marker overlays follow (engine=1)
+void requestSourceRebuild();   // any thread: per-output src override -> rebuild outputs
 void requestBlackoutSync();    // any thread: blackout overlays + menu checkbox follow
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
 void refreshSampComboUI();     // socket thread safe: sampling dropdown follows shared state

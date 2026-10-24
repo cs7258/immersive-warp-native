@@ -106,6 +106,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET config;` | `OK sampling=8;…;out0.dev=DISPLAY1;out0.rows=10;out0.left.fade=0.150;out0.masks=1 0.1,0.2,0.3,0.4;…;calib=off;out=auto` | **全量状态导出**：全局键 + 每输出一个 `outN.*` 块（网格密度、edges、四边融合参数、颜色调节、掩码列表——矩形间用空格分隔），与 STATUS 同为 `key=value;` 配对格式，一次往返镜像全部 UI 状态 |
 | `GET displays;` | `OK displays=2;DISPLAY1=1920x1080*;DISPLAY2=1920x1080;` | 列出显示器拓扑（`*` = 主显示器），便于节目控制端挑捕获源 |
 | `SET source=DISPLAY2;` / `SET source=auto;` | `OK source=DISPLAY2` | 指定捕获源桌面（auto = 第一个非输出的显示器）。改动会重建输出窗口；若指定的显示器本身是输出，引擎按防递归规则回退自动选择 |
+| `SET out=DISPLAY1;` + `SET src=DISPLAY2;` / `SET src=auto;` / `GET srcs;` | `OK src=DISPLAY2 on 1 output(s)` / `OK srcs=1;src1=DISPLAY1>DISPLAY2` | **每输出口独立捕获源覆盖**（多屏异源：不同屏显示不同桌面/程序）：先 `SET out=` 定向，再 `SET src=<显示器名>`；无 target 时对所有启用输出生效；`auto`/`clear` 清除回退全局源。配置每输出持久化（`src=` 行）；覆盖指向启用输出屏时防递归守卫拒绝（回退全局源）；改动异步重建输出窗口（duplication 绑定在 attach 时）。`-` 表示跟随全局源 |
 | `GET out;` / `SET out=DISPLAY2;` / `SET out=auto;` | `OK out=DISPLAY2` | **per-output 定向**：设定后续 per-output 命令（masks、各边 fade/gamma/gain/slope、rows/cols、flip/rotate、edges 的 GET/SET）只作用于该输出（按显示器名或 label 匹配，名字须存在否则 ERR）。auto = 旧默认（掩码/融合写第一台启用输出，网格操作写全部）。与控制台 "Target:" 下拉共享同一存储，任一入口修改另一侧实时同步 |
 | `GET outputs;` | `OK outputs=2;DISPLAY1;DISPLAY2;` | 列出启用输出的短设备名（旧解析端只读首个数字不受影响） |
 | `GET layout;` / `SET layout=2x2;` | `OK layout=2x2` | NxN 平铺布局：按物理位置（先上后下、先左后右）把启用的输出排进网格，第 (r,c) 格只显示源桌面对应窗口，出界部分被裁掉。会重建所有 warp 网格并把内部边界设为融合边；**内部边的融合宽度自动 = 重叠带宽**（相邻 tile 渐变互补，线性曲线下权重和恒为 1），外侧边保留手工值 |

@@ -124,6 +124,7 @@ bool saveConfig(const std::wstring& pathIn) {
         os << "dev=" << toUtf8(o.deviceName) << "\n";
         os << "label=" << toUtf8(o.label) << "\n";
         os << "enabled=" << (o.enabled ? 1 : 0) << "\n";
+        os << "src=" << toUtf8(o.srcOverride) << "\n";
         os << "grid=" << o.rows << " " << o.cols << "\n";
         os << "edges=" << o.edges << "\n";
         for (size_t i = 0; i + 1 < o.points.size(); i += 2)
@@ -204,6 +205,7 @@ bool loadConfig(const std::wstring& pathIn) {
         }
         else if (!cur) { if (key == "enabled") c.enabled = val == "1"; }  // global keys
         else if (key == "enabled") cur->enabled = val == "1";             // per-output
+        else if (key == "src") cur->srcOverride = fromUtf8(val);
         else if (key == "label") cur->label = fromUtf8(val);
         else if (key == "grid") sscanf_s(val.c_str(), "%d %d", &cur->rows, &cur->cols);
         else if (key == "edges") cur->edges = atoi(val.c_str()) & 15;

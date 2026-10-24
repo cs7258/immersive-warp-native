@@ -169,6 +169,17 @@ static std::string dispatch(std::string line) {
             return buf;
         }
         if (k == "sampling") return "OK sampling=" + std::to_string(g_cfg.sampling) + "\n";
+        if (k == "srcs") {   // per-output source overrides (empty "-" = global pin)
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            std::string s;
+            int n = 0;
+            for (auto& o : g_cfg.outputs) {
+                if (!o.enabled) continue;
+                s += ";src" + std::to_string(++n) + "=" + shortDev(o.deviceName) + ">" +
+                     (o.srcOverride.empty() ? std::string("-") : shortDev(o.srcOverride));
+            }
+            return "OK srcs=" + std::to_string(n) + s + "\n";
+        }
         if (k == "blackout") return std::string("OK blackout=") + (g_blackout.load() ? "on" : "off") + "\n";
         if (k == "autostart")return std::string("OK autostart=") + (queryAutostart() ? "on" : "off") + "\n";
         if (k == "layout") {
@@ -559,6 +570,41 @@ static std::string dispatch(std::string line) {
             setSourceDisplay(dev);
             std::wstring cur = currentSourceDevice();
             return "OK source=" + (cur.empty() ? std::string("auto") : shortDev(cur)) + "\n";
+        }
+        // Per-output capture source override (OutputCfg.srcOverride). Targets
+        // the SET out=<name> output, or every enabled output without one.
+        // "auto"/"clear" removes the override (follows the global pin).
+        // Rebuilds the outputs -> run without holding g_cfgMutex.
+        if (key == "src") {
+            std::wstring dev;
+            if (val != "AUTO" && val != "CLEAR" && !val.empty()) {
+                dev.assign(val.begin(), val.end());
+                if (dev.compare(0, 4, L"\\\\.\\") != 0) dev = L"\\\\.\\" + dev;
+                bool known = false;
+                for (auto& d : enumerateDisplays())
+                    if (sameDisplayName(d.deviceName, dev)) { known = true; break; }
+                if (!known) return "ERR SET src (no such display: " + val + ")\n";
+            }
+            int n = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                std::string t = currentTarget();
+                for (auto& o : g_cfg.outputs) {
+                    if (!o.enabled) continue;
+                    if (!t.empty() &&
+                        _stricmp(shortDev(o.deviceName).c_str(), t.c_str()) != 0 &&
+                        _stricmp(toNarrow(o.label).c_str(), t.c_str()) != 0)
+                        continue;
+                    o.srcOverride = dev;
+                    n++;
+                }
+                if (n) g_rev++;
+            }
+            if (!n) return "ERR no output (SET out=<name>?)\n";
+            requestSourceRebuild();
+            refreshStatusBar();
+            return "OK src=" + (dev.empty() ? std::string("auto") : shortDev(dev)) +
+                   " on " + std::to_string(n) + " output(s)\n";
         }
         // Point the following per-output commands at one output. AUTO (or an
         // empty value) restores the legacy defaults. The name is validated so
