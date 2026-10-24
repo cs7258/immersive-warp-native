@@ -2063,6 +2063,8 @@ static void cuvApply() {
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         OutputCfg* o = cfgOutput();
+        dbgLogLine("cuvApply side=" + std::to_string(side) + " gain="
+                   + std::to_string(c.gain) + " out=" + (o ? "ok" : "null"));
         if (o) {
             o->blend[side].gain = c.gain;
             o->blend[side].slope = c.slope;
@@ -2135,6 +2137,8 @@ static LRESULT CALLBACK CurveDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     }
     case WM_COMMAND: {
         int id = LOWORD(wp);
+        dbgLogLine("CurveDlg WM_COMMAND id=" + std::to_string(id)
+                   + " hi=" + std::to_string(HIWORD(wp)));
         if (id == CUV_SIDE && HIWORD(wp) == CBN_SELCHANGE) cuvReload();
         else if (id == CUV_APPLY) cuvApply();
         else if (id == CUV_HADD) {
