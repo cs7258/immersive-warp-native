@@ -224,7 +224,7 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "layoutC") c.layoutC = atoi(val.c_str());
         else if (key == "overlap") c.overlap = atoi(val.c_str());
         else if (key == "engine") c.engine = atoi(val.c_str());
-        else if (key == "subdivide") c.subdivide = atoi(val.c_str());
+        else if (key == "subdivide") { c.subdivide = atoi(val.c_str()); if (c.subdivide < 1) c.subdivide = 1; if (c.subdivide > 64) c.subdivide = 64; }   // mesh VB rebuilds per rev; huge values explode the vertex count
         else if (key == "curved") c.curved = atoi(val.c_str());
         else if (key == "outputs") c.outputs.resize((size_t)atoi(val.c_str()));
         else if (key == "dev") {

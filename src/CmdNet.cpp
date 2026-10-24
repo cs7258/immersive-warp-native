@@ -202,6 +202,10 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return std::string("OK checker=") + (g_cfg.checker ? "on" : "off") + "\n";
         }
+        if (k == "subdivide") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK subdivide=" + std::to_string(g_cfg.subdivide) + "\n";
+        }
         if (k == "move") {
             int m = g_moveMode.load();
             return std::string("OK move=") + (m == 1 ? "xy" : m == 2 ? "all" : "single") + "\n";
@@ -303,6 +307,7 @@ static std::string dispatch(std::string line) {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 s += "testanim=" + std::to_string(g_cfg.testAnim) + ";";
                 s += std::string("checker=") + (g_cfg.checker ? "on" : "off") + ";";
+                s += "subdivide=" + std::to_string(g_cfg.subdivide) + ";";
                 {
                     int m = g_moveMode.load();
                     s += std::string("move=") + (m == 1 ? "xy" : m == 2 ? "all" : "single") + ";";
@@ -445,7 +450,7 @@ static std::string dispatch(std::string line) {
         // layout/overlap/curved/masks/testpattern/source. Keys are appended at
         // the end, so older parsers reading "key=value;" pairs keep working.
         int edges = 15, outs = 0, masks = 0;
-        int layoutC = 1, layoutR = 1, overlap = 0, eng = 0, testAnim = 0, checker = 0;
+        int layoutC = 1, layoutR = 1, overlap = 0, eng = 0, testAnim = 0, checker = 0, subd = 8;
         int roiL = 0, roiT = 0, roiR = 0, roiB = 0, roiCir = 0, roiBrd = 0;
         int oscCfg = 0, oscPortV = 8000;
         bool curved = false, tp = false;
@@ -454,6 +459,7 @@ static std::string dispatch(std::string line) {
             layoutC = g_cfg.layoutC; layoutR = g_cfg.layoutR; overlap = g_cfg.overlap;
             curved = g_cfg.curved != 0; tp = g_cfg.testPattern;
             eng = g_cfg.engine; testAnim = g_cfg.testAnim; checker = g_cfg.checker;
+            subd = g_cfg.subdivide;
             roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1]; roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
             roiCir = g_cfg.roiCircle; roiBrd = g_cfg.roiBorder;
             oscCfg = g_cfg.osc; oscPortV = g_cfg.oscPort;
@@ -483,6 +489,7 @@ static std::string dispatch(std::string line) {
                ";testanim=" + std::to_string(testAnim) +
                ";testpause=" + std::string(g_testPause.load() ? "on" : "off") +
                ";checker=" + std::string(checker ? "on" : "off") +
+               ";subdivide=" + std::to_string(subd) +
                ";move=" + std::string(g_moveMode.load() == 1 ? "xy" : g_moveMode.load() == 2 ? "all" : "single") +
                ";roi=" + std::to_string(roiL) + "," + std::to_string(roiT) + "," +
                           std::to_string(roiR) + "," + std::to_string(roiB) +
@@ -1096,6 +1103,12 @@ static std::string dispatch(std::string line) {
                 g_cfg.checker = want;
                 applied = true;
                 refreshCheckerUI(want);   // Image-page checkbox follows
+            }
+            if (!applied && key == "subdivide") {
+                int n = atoi(val.c_str());
+                if (n < 1 || n > 64) return "ERR SET subdivide (1..64)\n";
+                g_cfg.subdivide = n;   // outer lock already held; g_rev++ below retriggers buildMesh
+                applied = true;
             }
             if (!applied && key == "move") {
                 // session-only editor mode; dispatch uppercased the line so
