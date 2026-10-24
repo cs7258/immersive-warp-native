@@ -1996,7 +1996,6 @@ static void roiReloadNow() {
     _snwprintf_s(t, _TRUNCATE, L"%d", brd);
     SetWindowTextW(g_edRoiBrd, t);
     for (HWND w : g_magTests) InvalidateRect(w, nullptr, FALSE);
-    if (g_curveDlg) InvalidateRect(g_curveDlg, nullptr, FALSE);
 }
 
 // edits -> cfg (UI thread). Values are the raw px insets; the shader clamps
@@ -2005,10 +2004,17 @@ static void roiApplyNow() {
     int v[4];
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
-        for (int i = 0; i < 4; i++)
-            g_cfg.roi[i] = (std::max)(0, (std::min)(GetDlgItemInt(g_ctl, IDC_EDROIL + i, nullptr, TRUE), 2048));
+        for (int i = 0; i < 4; i++) {
+            int n = GetDlgItemInt(g_ctl, IDC_EDROIL + i, nullptr, TRUE);
+            if (n < 0) n = 0;
+            if (n > 2048) n = 2048;
+            g_cfg.roi[i] = n;
+        }
         g_cfg.roiCircle = Button_GetCheck(g_ckRoiCir) == BST_CHECKED;
-        g_cfg.roiBorder = (std::max)(0, (std::min)(GetDlgItemInt(g_ctl, IDC_EDROIBRD, nullptr, TRUE), 64));
+        int nb = GetDlgItemInt(g_ctl, IDC_EDROIBRD, nullptr, TRUE);
+        if (nb < 0) nb = 0;
+        if (nb > 64) nb = 64;
+        g_cfg.roiBorder = nb;
         for (int i = 0; i < 4; i++) v[i] = g_cfg.roi[i];
         g_rev++;
     }
