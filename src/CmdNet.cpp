@@ -188,7 +188,9 @@ static std::string dispatch(std::string line) {
             return "OK hook=" + std::string(hookIpcEnabled() ? "on" : "off") +
                    ";pass=" + std::to_string(hookIpcPassCount()) +
                    ";exc=0x" + hex +
-                   ";etid=" + std::to_string(hookIpcExcTid()) + "\n";
+                   ";etid=" + std::to_string(hookIpcExcTid()) +
+                   ";mesh=" + std::to_string(hookIpcMeshVerts()) +
+                   ";rev=" + std::to_string(hookIpcMeshRev()) + "\n";
         }
         if (k == "srcs") {   // per-output source overrides (empty "-" = global pin)
             std::lock_guard<std::mutex> lk(g_cfgMutex);

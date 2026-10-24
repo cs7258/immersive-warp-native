@@ -95,8 +95,39 @@ VSOut main(VSIn i) {
 static const char* kPS = R"(
 Texture2D srcTex : register(t0);
 SamplerState sam : register(s0);
+// blend-band constants, packed by the DLL from IWNHookCfg:
+//  fadeW = per-edge fade width (L,R,T,B), uv fraction
+//  edgeG = per-edge gamma exponent
+//  gainS = per-edge gain, slopeS = per-edge slope (parametric curve,
+//          same formula as the host engine: (g+1)x / (s(x-1)+gx+1))
+//  misc  = x: edges mask (bit0 L, 1 R, 2 T, 3 B)
+//  chan  = per-channel blend gamma R,G,B (1/1/1 = legacy scalar weight)
+cbuffer BlendCB : register(b0) {
+    float4 fadeW; float4 edgeG; float4 gainS; float4 slopeS; float4 misc; float4 chan;
+};
 struct PSIn { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
-float4 main(PSIn i) : SV_TARGET { return srcTex.Sample(sam, i.uv); }
+static float curve(float t, float g, float s) {
+    return (g + 1.0) * t / (s * (t - 1.0) + g * t + 1.0);
+}
+static float3 edgeFactor(float t, int idx) {
+    float fade = fadeW[idx];
+    if (fade <= 0.0) return 1.0.xxx;
+    float x = saturate(t / fade);
+    float b = curve(x, gainS[idx], slopeS[idx]);
+    float g = edgeG[idx];
+    return float3(pow(b, g * chan.x), pow(b, g * chan.y), pow(b, g * chan.z));
+}
+float4 main(PSIn i) : SV_TARGET {
+    float4 c = srcTex.Sample(sam, i.uv);
+    uint m = (uint)misc.x;
+    float3 w = 1.0.xxx;
+    if (m & 1u)  w *= edgeFactor(i.uv.x, 0);
+    if (m & 2u)  w *= edgeFactor(1.0 - i.uv.x, 1);
+    if (m & 4u)  w *= edgeFactor(i.uv.y, 2);
+    if (m & 8u)  w *= edgeFactor(1.0 - i.uv.y, 3);
+    c.rgb *= w;
+    return c;
+}
 )";
 
 // ---------------------------------------------------------------- per-swapchain context
@@ -111,10 +142,14 @@ struct HookCtx {
     ID3D11PixelShader*      ps = nullptr;
     ID3D11SamplerState*     ss = nullptr;
     ID3D11InputLayout*      il = nullptr;
+    ID3D11Buffer*           cb = nullptr;   // blend constants (b0)
     UINT w = 0, h = 0;          // back buffer size of cached resources
     UINT vertCount = 0;         // vertices in the cached VB
-    LONG  gridN = 0;            // mesh resolution of cached VB
-    float corner[4][2] = {};    // mesh of cached VB
+    LONG  gridN = 0;            // corner-model mesh resolution of cached VB
+    int   mode = -1;            // 0 = corner, 1 = full mesh (-1 = build pending)
+    LONG  meshRev = 0;          // host publish revision of cached VB
+    float corner[4][2] = {};    // corner model of cached VB
+    float blendCache[24] = {};  // last blend constants uploaded to cb
     DWORD frames = 0, logged = 0;
     void* bbKey = nullptr;      // ID3D11Texture2D* of back buffer
 };
@@ -131,6 +166,7 @@ static void releaseSlot(HookCtx& c) {
     if (c.ps) c.ps->Release();
     if (c.ss) c.ss->Release();
     if (c.il) c.il->Release();
+    if (c.cb) c.cb->Release();
     if (c.ctx) c.ctx->Release();
     if (c.dev) c.dev->Release();
     ZeroMemory(&c, sizeof(c));
@@ -164,42 +200,76 @@ static bool compileShaders(HookCtx& c) {
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(c.dev->CreateSamplerState(&sd, &c.ss))) { hookLog("sampler failed"); return false; }
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = 96;    // 6 float4: fadeW edgeG gainS slopeS misc chan
+    cbd.Usage = D3D11_USAGE_DEFAULT;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (FAILED(c.dev->CreateBuffer(&cbd, nullptr, &c.cb))) { hookLog("cb failed"); return false; }
     return true;
 }
 
 static bool buildMesh(HookCtx& c, const IWNHookCfg& cfg) {
     const LONG n = cfg.gridN >= 2 && cfg.gridN <= 64 ? cfg.gridN : 16;
-    const int verts = (int)((n - 1) * (n - 1) * 6);
     struct V { float pos[3]; float uv[2]; };
-    std::vector<V> data; data.reserve(verts);
-    const float* c00 = cfg.corner[0];  // TL
-    const float* c10 = cfg.corner[1];  // TR
-    const float* c01 = cfg.corner[2];  // BL
-    const float* c11 = cfg.corner[3];  // BR
-    for (LONG y = 0; y < n - 1; y++) {
-        for (LONG x = 0; x < n - 1; x++) {
-            float u0 = (float)x / (n - 1), u1 = (float)(x + 1) / (n - 1);
-            float v0 = (float)y / (n - 1), v1 = (float)(y + 1) / (n - 1);
-            float us[4] = { u0, u1, u0, u1 }, vs_[4] = { v0, v0, v1, v1 };
-            V quad[4];
-            for (int i = 0; i < 4; i++) {
-                float u = us[i], v = vs_[i];
-                // bilinear blend of the 4 corner offsets == Coons patch with
-                // straight edges (matches the host's per-corner warp model)
-                float dx = (1 - u) * (1 - v) * c00[0] + u * (1 - v) * c10[0] +
-                           (1 - u) * v * c01[0] + u * v * c11[0];
-                float dy = (1 - u) * (1 - v) * c00[1] + u * (1 - v) * c10[1] +
-                           (1 - u) * v * c01[1] + u * v * c11[1];
-                quad[i].pos[0] = (2 * u - 1) + dx;
-                quad[i].pos[1] = (1 - 2 * v) + dy;
-                quad[i].pos[2] = 0;
-                quad[i].uv[0] = u;
-                quad[i].uv[1] = v;
+    std::vector<V> data;
+    if (cfg.mode == 1 && cfg.vertCount > 0 && cfg.meshRows >= 2 && cfg.meshCols >= 2 &&
+        (LONG)cfg.meshRows * cfg.meshCols == (LONG)cfg.vertCount) {
+        // full control-point mesh published by the host: row-major grid of
+        // IWNMeshVtx (sx,sy = src uv, dx,dy = dest in 0..1 space)
+        const int RV = cfg.meshRows, CV = cfg.meshCols;
+        data.reserve((size_t)(RV - 1) * (CV - 1) * 6);
+        for (int i = 0; i < RV - 1; i++) {
+            for (int j = 0; j < CV - 1; j++) {
+                const IWNMeshVtx* q[4] = {
+                    &cfg.verts[(size_t)i * CV + j],       &cfg.verts[(size_t)i * CV + j + 1],
+                    &cfg.verts[(size_t)(i + 1) * CV + j], &cfg.verts[(size_t)(i + 1) * CV + j + 1],
+                };
+                V quad[4];
+                for (int k = 0; k < 4; k++) {
+                    quad[k].pos[0] = 2 * q[k]->dx - 1;
+                    quad[k].pos[1] = 1 - 2 * q[k]->dy;
+                    quad[k].pos[2] = 0;
+                    quad[k].uv[0] = q[k]->sx;
+                    quad[k].uv[1] = q[k]->sy;
+                }
+                const int idl[6] = { 0, 2, 1, 1, 2, 3 };
+                for (int k = 0; k < 6; k++) data.push_back(quad[idl[k]]);
             }
-            // two triangles: (0,2,1) (1,2,3) with TL,TR,BL,BR ordering
-            const int idx[6] = { 0, 2, 1, 1, 2, 3 };
-            for (int i = 0; i < 6; i++) data.push_back(quad[idx[i]]);
         }
+        c.mode = 1;
+        c.meshRev = cfg.meshRev;
+    } else {
+        // corner fallback (Phase 1 PoC): bilinear blend of 4 NDC offsets
+        const int verts = (int)((n - 1) * (n - 1) * 6);
+        data.reserve(verts);
+        const float* c00 = cfg.corner[0];  // TL
+        const float* c10 = cfg.corner[1];  // TR
+        const float* c01 = cfg.corner[2];  // BL
+        const float* c11 = cfg.corner[3];  // BR
+        for (LONG y = 0; y < n - 1; y++) {
+            for (LONG x = 0; x < n - 1; x++) {
+                float u0 = (float)x / (n - 1), u1 = (float)(x + 1) / (n - 1);
+                float v0 = (float)y / (n - 1), v1 = (float)(y + 1) / (n - 1);
+                float us[4] = { u0, u1, u0, u1 }, vs_[4] = { v0, v0, v1, v1 };
+                V quad[4];
+                for (int i = 0; i < 4; i++) {
+                    float u = us[i], v = vs_[i];
+                    float dx = (1 - u) * (1 - v) * c00[0] + u * (1 - v) * c10[0] +
+                               (1 - u) * v * c01[0] + u * v * c11[0];
+                    float dy = (1 - u) * (1 - v) * c00[1] + u * (1 - v) * c10[1] +
+                               (1 - u) * v * c01[1] + u * v * c11[1];
+                    quad[i].pos[0] = (2 * u - 1) + dx;
+                    quad[i].pos[1] = (1 - 2 * v) + dy;
+                    quad[i].pos[2] = 0;
+                    quad[i].uv[0] = u;
+                    quad[i].uv[1] = v;
+                }
+                const int idx[6] = { 0, 2, 1, 1, 2, 3 };
+                for (int i = 0; i < 6; i++) data.push_back(quad[idx[i]]);
+            }
+        }
+        c.mode = 0;
+        c.gridN = n;
     }
     if (c.vb) { c.vb->Release(); c.vb = nullptr; }
     D3D11_BUFFER_DESC bd = {};
@@ -208,9 +278,14 @@ static bool buildMesh(HookCtx& c, const IWNHookCfg& cfg) {
     bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     D3D11_SUBRESOURCE_DATA init = { data.data(), 0, 0 };
     if (FAILED(c.dev->CreateBuffer(&bd, &init, &c.vb))) { hookLog("vb create failed"); return false; }
-    c.gridN = n;
-    c.vertCount = (UINT)verts;
+    c.vertCount = (UINT)data.size();
     memcpy(c.corner, cfg.corner, sizeof(c.corner));
+    if (c.mode == 1) {
+        char buf[96];
+        wsprintfA(buf, "mesh v2: rows=%d cols=%d verts=%d",
+                  (int)cfg.meshRows, (int)cfg.meshCols, (int)cfg.vertCount);
+        hookLog(buf);
+    }
     return true;
 }
 
@@ -243,8 +318,35 @@ static bool ensureResources(HookCtx& c, ID3D11Texture2D* bb, const IWNHookCfg& c
         wsprintfA(buf, "resources built: %ux%u", (int)td.Width, (int)td.Height);
         hookLog(buf);
     }
-    if (!c.gridN || memcmp(c.corner, cfg.corner, sizeof(c.corner)) != 0) {
+    bool meshStale =
+        c.mode != cfg.mode ||
+        (cfg.mode == 1 && c.meshRev != cfg.meshRev) ||
+        (cfg.mode == 0 && (!c.gridN || memcmp(c.corner, cfg.corner, sizeof(c.corner)) != 0));
+    if (meshStale) {
         if (!buildMesh(c, cfg)) { releaseSlot(c); return false; }
+    }
+    // blend constants: repack the host's per-side AoS block
+    // (blend[e*4+{fade,gamma,gain,slope}]) into the shader's SoA float4s
+    // (fadeW / edgeG / gainS / slopeS = per-edge across the 4 sides), then
+    // upload when anything changed
+    {
+        float blk[24];
+        for (int e = 0; e < 4; e++) {
+            blk[e + 0]  = cfg.blend[e * 4 + 0];   // fadeW
+            blk[e + 4]  = cfg.blend[e * 4 + 1];   // edgeG
+            blk[e + 8]  = cfg.blend[e * 4 + 2];   // gainS
+            blk[e + 12] = cfg.blend[e * 4 + 3];   // slopeS
+        }
+        blk[16] = cfg.chanBlend[0];
+        blk[17] = cfg.chanBlend[1];
+        blk[18] = cfg.chanBlend[2];
+        blk[19] = 0.0f;
+        blk[20] = (float)cfg.edgesMask;
+        blk[21] = blk[22] = blk[23] = 0.0f;
+        if (memcmp(c.blendCache, blk, sizeof(blk)) != 0) {
+            c.ctx->UpdateSubresource(c.cb, 0, nullptr, blk, 0, 0);
+            memcpy(c.blendCache, blk, sizeof(blk));
+        }
     }
     return true;
 }
@@ -387,7 +489,20 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
     if (flags & DXGI_PRESENT_TEST) return S_OK;
     PFN_Present orig = origPresentFor(sw);
     IWNHookCfg* cfg = ensureCfg();
-    if (cfg && cfg->enabled && orig && sw) {
+    // per-swapchain output selection: if the host bound a target monitor,
+    // only swapchains ON that monitor get warped (everything else passes
+    // through untouched)
+    bool monitorOk = true;
+    if (cfg && cfg->monitor[0]) {
+        IDXGIOutput* out = nullptr;
+        if (SUCCEEDED(sw->GetContainingOutput(&out)) && out) {
+            DXGI_OUTPUT_DESC od{};
+            monitorOk = SUCCEEDED(out->GetDesc(&od)) &&
+                        lstrcmpiW(od.DeviceName, cfg->monitor) == 0;
+            out->Release();
+        }
+    }
+    if (cfg && cfg->enabled && orig && sw && monitorOk) {
         static bool firstPassLogged = false;
         if (!firstPassLogged) {
             firstPassLogged = true;
@@ -411,6 +526,7 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
                 c.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 c.ctx->VSSetShader(c.vs, nullptr, 0);
                 c.ctx->PSSetShader(c.ps, nullptr, 0);
+                c.ctx->PSSetConstantBuffers(0, 1, &c.cb);
                 c.ctx->PSSetSamplers(0, 1, &c.ss);
                 ID3D11ShaderResourceView* srvp = c.srv;
                 c.ctx->PSSetShaderResources(0, 1, &srvp);
