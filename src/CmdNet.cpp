@@ -398,13 +398,13 @@ static std::string dispatch(std::string line) {
         // layout/overlap/curved/masks/testpattern/source. Keys are appended at
         // the end, so older parsers reading "key=value;" pairs keep working.
         int edges = 15, outs = 0, masks = 0;
-        int layoutC = 1, layoutR = 1, overlap = 0, eng = 0;
+        int layoutC = 1, layoutR = 1, overlap = 0, eng = 0, testAnim = 0;
         bool curved = false, tp = false;
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             layoutC = g_cfg.layoutC; layoutR = g_cfg.layoutR; overlap = g_cfg.overlap;
             curved = g_cfg.curved != 0; tp = g_cfg.testPattern;
-            eng = g_cfg.engine;
+            eng = g_cfg.engine; testAnim = g_cfg.testAnim;
             for (auto& o : g_cfg.outputs) if (o.enabled) {
                 outs++;
                 if (outs == 1) { edges = o.edges; masks = (int)o.masks.size(); }
@@ -428,6 +428,8 @@ static std::string dispatch(std::string line) {
                ";perflog=" + std::string(g_perfLog.load() ? "on" : "off") +
                ";inplace=" + std::string(g_inplace.load() ? "on" : "off") +
                ";blackout=" + std::string(g_blackout.load() ? "on" : "off") +
+               ";testanim=" + std::to_string(testAnim) +
+               ";testpause=" + std::string(g_testPause.load() ? "on" : "off") +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
