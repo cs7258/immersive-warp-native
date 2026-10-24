@@ -159,7 +159,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | src/HookIPC.cpp | scanout 管线宿主侧：发布 WarpHook.dll 参数映射 |
 | src/Mqtt.cpp | MQTT broker 客户端：`<prefix>/command` JSON 命令 + `<prefix>/status` retain 上报 |
 | src/Inject.cpp | 内置注入集成：CMDNET `INJECT LAUNCH/PID` 复用 IWNInject 工作流（DLL 默认同目录 WarpHook.dll，拒绝自注入） |
-| src/probe/D3DProbe.cpp | IWND3DProbe.exe 测试宿主：最小 D3D11 应用（flip-model swapchain + 60fps Present 循环，`--secs N` 自动退出），供 injecttest 验证外部应用注入端到端 |
+| src/probe/D3DProbe.cpp | IWND3DProbe.exe 测试宿主：最小 D3D11 应用（标定图案=网格+棋盘+红十字+动态色带，flip-model swapchain + 60fps Present，`--secs N` 自动退出），供 injecttest 验证外部应用注入端到端 + 真机目视扭曲 |
 | src/hook/WarpHook.cpp | 注入 DLL：Present hook + 就地扭曲（scanout 前） |
 | src/hook/Injector.cpp | IWNInject.exe：挂起启动注入器 |
 
