@@ -487,6 +487,7 @@ static std::string dispatch(std::string line) {
         Engine::inst().setSampling(g_cfg.sampling);
         Engine::inst().setTestImage(g_cfg.testImg);   // <0 clears the overlay
         if (!g_cfg.imagePath.empty()) engineLoadImage(g_cfg.imagePath);
+        refreshSampComboUI();   // engine/sampling dropdowns follow loaded config
         int outs = 0;
         refreshStatusBar();
         {
@@ -590,6 +591,21 @@ static std::string dispatch(std::string line) {
             if (ov < 0 || ov > 40) return "ERR SET overlap (want 0..40)\n";
             setLayout(g_cfg.layoutR, g_cfg.layoutC, ov);
             return "OK overlap=" + std::to_string(ov) + "\n";
+        }
+        // image sampling quality: 0 trilinear, 1/2 anisotropic, 3 bi-cubic
+        // (DXGI engine only - MAG composites on the DWM and has no shader)
+        if (key == "sampling") {
+            int q = atoi(val.c_str());
+            if (val.empty() || q < 0 || q > 3)
+                return "ERR SET sampling (0..3)\n";
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                g_cfg.sampling = q;
+                g_rev++;
+            }
+            Engine::inst().setSampling(q);   // atomic publish, no rebuild needed
+            refreshSampComboUI();            // keep the console dropdown in sync
+            return "OK sampling=" + std::to_string(q) + "\n";
         }
         if (key == "engine") {
             // MAG mode is a different kind of output window: the shared

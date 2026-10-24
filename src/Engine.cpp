@@ -51,6 +51,7 @@ cbuffer FrameCB : register(b0) {
     float4 chanR;           // per-side R blend gamma (L/R/T/B)
     float4 chanG;           // per-side G blend gamma
     float4 chanB;           // per-side B blend gamma
+    float4 sampInfo;        // x=bicubic on, y=srcW, z=srcH (for catmull-rom)
 }
 // parametric blend curve: f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1).
 // gain=0, slope=0 -> f(x)=x (the plain linear ramp); slope=1 -> hard step;
@@ -85,6 +86,30 @@ float3 testPattern(float2 p) {
     if (abs(p.x - 0.5) < 0.0015) col = float3(0.15, 1, 0.15);
     return col;
 }
+// Catmull-Rom bicubic: 16 taps sampled at texel centers (linear sampler with
+// center hits behaves like point). Negative lobes are intentional - they are
+// what makes bicubic sharper than bilinear. Weights sum to 1 for any x in [0,1).
+float4 crW(float x) {
+    float x2 = x * x, x3 = x2 * x;
+    return float4(-0.5 * x3 + x2 - 0.5 * x,
+                   1.5 * x3 - 2.5 * x2 + 1.0,
+                  -1.5 * x3 + 2.0 * x2 + 0.5 * x,
+                   0.5 * x3 - 0.5 * x2);
+}
+float3 sampleBicubic(float2 uv, float2 ts) {
+    float2 pos = uv * ts - 0.5;
+    float2 fl = floor(pos);
+    float4 wx = crW(pos.x - fl.x);
+    float4 wy = crW(pos.y - fl.y);
+    float3 sum = float3(0, 0, 0);
+    [unroll] for (int j = 0; j < 4; j++)
+        [unroll] for (int i = 0; i < 4; i++) {
+            // CLAMP addressing on the sampler keeps edge taps inside the image
+            float2 t = (fl + float2(i - 1, j - 1) + 0.5) / ts;
+            sum += tex.SampleLevel(samp, t, 0).rgb * wx[i] * wy[j];
+        }
+    return sum;
+}
 float4 main(VOut i) : SV_Target {
     // per-channel weight: pow(curve, edgeGamma * chanC); all chan = 1 gives
     // the legacy scalar weight a. Each participating side multiplies in.
@@ -115,6 +140,8 @@ float4 main(VOut i) : SV_Target {
     float2 uv = (i.src - 0.5) * imgFit + 0.5;   // letterbox: keep source aspect
     if (flags.x > 0 && flags.y < 1) {
         if (any(uv < 0) || any(uv > 1)) c = float3(0, 0, 0);
+        else if (sampInfo.x > 0.5 && sampInfo.y > 0 && sampInfo.z > 0)
+            c = sampleBicubic(uv, sampInfo.yz);
         else c = tex.Sample(samp, uv).rgb;
     } else c = testPattern(i.nom);
     c = pow(saturate(c), color.rgb);
@@ -154,13 +181,16 @@ bool Engine::init() {
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.MaxLOD = 1e9f;
     // 0 = trilinear, 1/2 = anisotropic (warped meshes sample at steep angles,
-    // anisotropy keeps projected grid lines crisp)
+    // anisotropy keeps projected grid lines crisp), 3 = bi-cubic (same linear
+    // hardware sampler - the shader does 16 catmull-rom taps itself)
     sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     m_dev->CreateSamplerState(&sd, &m_samplers[0]);
     sd.Filter = D3D11_FILTER_ANISOTROPIC; sd.MaxAnisotropy = 4;
     m_dev->CreateSamplerState(&sd, &m_samplers[1]);
     sd.MaxAnisotropy = 8;
     m_dev->CreateSamplerState(&sd, &m_samplers[2]);
+    sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    m_dev->CreateSamplerState(&sd, &m_samplers[3]);
     m_sampIdx.store(0);
 
     D3D11_RASTERIZER_DESC rd{};
@@ -217,7 +247,7 @@ static void dbgLog(const std::string& line);   // defined below
 
 void Engine::setSampling(int q) {
     if (q < 0) q = 0;
-    if (q > 2) q = 2;
+    if (q > 3) q = 3;
     m_sampIdx.store(q);
 }
 
@@ -671,6 +701,7 @@ void Engine::shutdown() {
     if (m_samplers[0]) m_samplers[0]->Release();
     if (m_samplers[1]) m_samplers[1]->Release();
     if (m_samplers[2]) m_samplers[2]->Release();
+    if (m_samplers[3]) m_samplers[3]->Release();
     if (m_blendOpaque) m_blendOpaque->Release();
     if (m_raster) m_raster->Release();
     if (m_ctx) m_ctx->Release();
@@ -963,6 +994,7 @@ struct FrameCBData {
     float contrast; float pad0; float imgFit[2];
     float gains[4]; float slopes[4];
     float chanR[4]; float chanG[4]; float chanB[4];
+    float sampInfo[4];   // x=bicubic on, y=srcW, z=srcH
 };
 static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
@@ -1021,6 +1053,19 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
     d.color[0] = cfg.color.gammaR; d.color[1] = cfg.color.gammaG;
     d.color[2] = cfg.color.gammaB; d.color[3] = cfg.color.bright;
     d.contrast = cfg.color.contrast;
+
+    // sampling: bi-cubic needs the source texture size for catmull-rom taps.
+    // Image mode uses the loaded image; desktop mode the per-output frame
+    // copy (GetDesc is metadata only - safe every frame).
+    d.sampInfo[0] = (m_sampIdx.load() == 3) ? 1.0f : 0.0f;
+    d.sampInfo[1] = 0.0f; d.sampInfo[2] = 0.0f;
+    if (useImg && m_imgW > 0 && m_imgH > 0) {
+        d.sampInfo[1] = (float)m_imgW; d.sampInfo[2] = (float)m_imgH;
+    } else if (oc.frameTex) {
+        D3D11_TEXTURE2D_DESC td{};
+        oc.frameTex->GetDesc(&td);
+        d.sampInfo[1] = (float)td.Width; d.sampInfo[2] = (float)td.Height;
+    }
 
     D3D11_MAPPED_SUBRESOURCE mp{};
     m_ctx->Map(oc.frameCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp);

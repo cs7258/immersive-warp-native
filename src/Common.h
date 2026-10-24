@@ -94,7 +94,7 @@ struct AppConfig {
     int curved = 0;                   // 1 = Catmull-Rom curved grid interp (needs rows>=4 && cols>=4), 0 = bilinear
     int cmdnet = 0;                   // CMDNET ASCII TCP show-control service on/off
     int cmdnetPort = 5252;            // CMDNET listen port (loopback only)
-    int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x
+    int sampling = 0;                 // 0 trilinear, 1 aniso 4x, 2 aniso 8x, 3 bicubic
     int autostart = 0;                // start with Windows (HKCU Run mirror)
     // explicit capture source. empty = auto (first display that is not an
     // output). A non-empty value pins the desktop that gets warped, which is
@@ -133,6 +133,7 @@ void requestOutputRebuild();   // any thread: destroy+recreate output windows on
 void requestMagTestSync();     // any thread: test pattern overlays follow (engine=1)
 void requestMagProbeSync();    // any thread: probe marker overlays follow (engine=1)
 void refreshEngineComboUI();   // socket thread safe: engine dropdown follows shared state
+void refreshSampComboUI();     // socket thread safe: sampling dropdown follows shared state
 
 // ---- DWM Magnification engine (src/MagEngine.cpp) --------------------
 // engine=1: output windows are magnifier hosts mirroring the source

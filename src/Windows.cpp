@@ -1760,6 +1760,15 @@ void refreshEngineComboUI() {
                      g_cfg.engine == 1 ? 1 : 0, 0);
 }
 
+void refreshSampComboUI() {
+    // socket thread safe: same pattern as refreshEngineComboUI (CB_SETCURSEL
+    // is a plain message - no CBN_SELCHANGE, no cross-thread SendMessage)
+    if (g_ctl && g_cbSamp) {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        PostMessageW(g_cbSamp, CB_SETCURSEL, g_cfg.sampling, 0);
+    }
+}
+
 void requestOutputRebuild() {
     // engine switches (SET engine=) and any other state that changes WHAT the
     // output windows are: destroy + recreate on the UI thread. Reuses the
@@ -3391,6 +3400,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ComboBox_AddString(g_cbSamp, L"Trilinear");
         ComboBox_AddString(g_cbSamp, L"Anisotropic 4x");
         ComboBox_AddString(g_cbSamp, L"Anisotropic 8x");
+        ComboBox_AddString(g_cbSamp, L"Bi-cubic (Catmull-Rom)");
         add(PAGE_WARP, CreateWindowW(L"STATIC", L"Layout:",
             WS_CHILD | SS_LEFT, 260, 92, 50, 18,
             hwnd, nullptr, nullptr, nullptr));
@@ -3895,7 +3905,8 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                 { std::lock_guard<std::mutex> lk(g_cfgMutex); g_cfg.sampling = sel; }
                 Engine::inst().setSampling(sel);
                 setStatus(sel == 0 ? L"Sampling: trilinear."
-                                   : L"Sampling: anisotropic.");
+                         : sel == 3 ? L"Sampling: bi-cubic."
+                                    : L"Sampling: anisotropic.");
             }
         } else if (id == IDC_CBSRC && HIWORD(wp) == CBN_SELCHANGE) {
             if (g_srcBusy) return 0;   // reentrancy guard (combo repopulation)
