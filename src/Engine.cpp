@@ -48,6 +48,9 @@ cbuffer FrameCB : register(b0) {
     float2 imgFit;          // uv scale for aspect-preserving letterbox
     float4 gains;           // left/right/top/bottom blend curve gain
     float4 slopes;          // left/right/top/bottom blend curve slope
+    float4 chanR;           // per-side R blend gamma (L/R/T/B)
+    float4 chanG;           // per-side G blend gamma
+    float4 chanB;           // per-side B blend gamma
 }
 // parametric blend curve: f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1).
 // gain=0, slope=0 -> f(x)=x (the plain linear ramp); slope=1 -> hard step;
@@ -83,16 +86,30 @@ float3 testPattern(float2 p) {
     return col;
 }
 float4 main(VOut i) : SV_Target {
-    float a = 1;
+    // per-channel weight: pow(curve, edgeGamma * chanC); all chan = 1 gives
+    // the legacy scalar weight a. Each participating side multiplies in.
+    float aR = 1, aG = 1, aB = 1;
     float fw, g;
     edgeParams(advL, advCounts.x, i.nom.y, LR.x, LR.y, fw, g);
-    if (fw > 0.001 && i.nom.x < fw) a *= pow(blendCurve(saturate(i.nom.x / fw), gains.x, slopes.x), g);
+    if (fw > 0.001 && i.nom.x < fw) {
+        float cv = blendCurve(saturate(i.nom.x / fw), gains.x, slopes.x);
+        aR *= pow(cv, g * chanR.x); aG *= pow(cv, g * chanG.x); aB *= pow(cv, g * chanB.x);
+    }
     edgeParams(advR, advCounts.y, i.nom.y, LR.z, LR.w, fw, g);
-    if (fw > 0.001 && i.nom.x > 1 - fw) a *= pow(blendCurve(saturate((1 - i.nom.x) / fw), gains.y, slopes.y), g);
+    if (fw > 0.001 && i.nom.x > 1 - fw) {
+        float cv = blendCurve(saturate((1 - i.nom.x) / fw), gains.y, slopes.y);
+        aR *= pow(cv, g * chanR.y); aG *= pow(cv, g * chanG.y); aB *= pow(cv, g * chanB.y);
+    }
     edgeParams(advT, advCounts.z, i.nom.x, TB.x, TB.y, fw, g);
-    if (fw > 0.001 && i.nom.y < fw) a *= pow(blendCurve(saturate(i.nom.y / fw), gains.z, slopes.z), g);
+    if (fw > 0.001 && i.nom.y < fw) {
+        float cv = blendCurve(saturate(i.nom.y / fw), gains.z, slopes.z);
+        aR *= pow(cv, g * chanR.z); aG *= pow(cv, g * chanG.z); aB *= pow(cv, g * chanB.z);
+    }
     edgeParams(advB, advCounts.w, i.nom.x, TB.z, TB.w, fw, g);
-    if (fw > 0.001 && i.nom.y > 1 - fw) a *= pow(blendCurve(saturate((1 - i.nom.y) / fw), gains.w, slopes.w), g);
+    if (fw > 0.001 && i.nom.y > 1 - fw) {
+        float cv = blendCurve(saturate((1 - i.nom.y) / fw), gains.w, slopes.w);
+        aR *= pow(cv, g * chanR.w); aG *= pow(cv, g * chanG.w); aB *= pow(cv, g * chanB.w);
+    }
 
     float3 c;
     float2 uv = (i.src - 0.5) * imgFit + 0.5;   // letterbox: keep source aspect
@@ -108,7 +125,7 @@ float4 main(VOut i) : SV_Target {
         float2 d = i.nom - masks[k].xy;
         if (d.x >= 0 && d.y >= 0 && d.x <= masks[k].z && d.y <= masks[k].w) c = 0;
     }
-    return float4(saturate(c) * a, 1);
+    return float4(saturate(c) * float3(aR, aG, aB), 1);
 }
 )";
 
@@ -928,6 +945,7 @@ struct FrameCBData {
     float color[4];
     float contrast; float pad0; float imgFit[2];
     float gains[4]; float slopes[4];
+    float chanR[4]; float chanG[4]; float chanB[4];
 };
 static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
@@ -941,6 +959,9 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
     for (int s = 0; s < 4; s++) {
         d.gains[s] = cfg.blend[s].gain;
         d.slopes[s] = cfg.blend[s].slope;
+        d.chanR[s] = cfg.blend[s].chanR;
+        d.chanG[s] = cfg.blend[s].chanG;
+        d.chanB[s] = cfg.blend[s].chanB;
     }
     for (int s = 0; s < 4; s++) {
         auto& src = cfg.adv[s];

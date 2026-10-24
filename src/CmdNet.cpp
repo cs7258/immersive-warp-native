@@ -195,7 +195,7 @@ static std::string dispatch(std::string line) {
         // between rects because ';' would end the pair). A show controller
         // can mirror the whole UI state in one round trip.
         if (k == "config") {
-            char b[96];
+            char b[160];
             std::string s;
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -216,9 +216,10 @@ static std::string dispatch(std::string line) {
                     s += std::string(p) + "edges=" + edgesName(o.edges) + ";";
                     static const char* sd[4] = { "left", "right", "top", "bottom" };
                     for (int q = 0; q < 4; q++) {
-                        sprintf_s(b, "%s%s.fade=%.3f;%s%s.gamma=%.3f;%s%s.gain=%.3f;%s%s.slope=%.3f;",
+                        sprintf_s(b, "%s%s.fade=%.3f;%s%s.gamma=%.3f;%s%s.gain=%.3f;%s%s.slope=%.3f;%s%s.chan=%.3f,%.3f,%.3f;",
                                   p, sd[q], o.blend[q].fade, p, sd[q], o.blend[q].gamma,
-                                  p, sd[q], o.blend[q].gain, p, sd[q], o.blend[q].slope);
+                                  p, sd[q], o.blend[q].gain, p, sd[q], o.blend[q].slope,
+                                  p, sd[q], o.blend[q].chanR, o.blend[q].chanG, o.blend[q].chanB);
                         s += b;
                     }
                     const ColorAdj& c = o.color;
@@ -356,6 +357,9 @@ static std::string dispatch(std::string line) {
                 if (field == "gamma") { sprintf_s(b, "OK %s.gamma=%.3f\n", sides[s], o->blend[s].gamma); return b; }
                 if (field == "gain")  { sprintf_s(b, "OK %s.gain=%.3f\n",  sides[s], o->blend[s].gain);  return b; }
                 if (field == "slope") { sprintf_s(b, "OK %s.slope=%.3f\n", sides[s], o->blend[s].slope); return b; }
+                if (field == "chanr") { sprintf_s(b, "OK %s.chanr=%.3f\n", sides[s], o->blend[s].chanR); return b; }
+                if (field == "chang") { sprintf_s(b, "OK %s.chang=%.3f\n", sides[s], o->blend[s].chanG); return b; }
+                if (field == "chanb") { sprintf_s(b, "OK %s.chanb=%.3f\n", sides[s], o->blend[s].chanB); return b; }
                 return "ERR GET " + k + "\n";
             }
         }
@@ -883,6 +887,9 @@ static std::string dispatch(std::string line) {
                     if (field == "gamma") { o.blend[s].gamma = clampf(v, 0.1f, 5.0f); applied = true; }
                     if (field == "gain")  { o.blend[s].gain  = clampf(v, 0.0f, 2.0f); applied = true; }
                     if (field == "slope") { o.blend[s].slope = clampf(v, 0.0f, 1.0f); applied = true; }
+                    if (field == "chanr") { o.blend[s].chanR = clampf(v, 0.1f, 5.0f); applied = true; }
+                    if (field == "chang") { o.blend[s].chanG = clampf(v, 0.1f, 5.0f); applied = true; }
+                    if (field == "chanb") { o.blend[s].chanB = clampf(v, 0.1f, 5.0f); applied = true; }
                 }
             }
             if (!applied && key == "testpattern") {

@@ -31,6 +31,13 @@ struct BlendSide {
     // preserve existing configs pixel-for-pixel. gain 0..2, slope 0..1.
     float gain = 0.0f;
     float slope = 0.0f;
+    // per-channel blend gamma (R/G/B): the weight becomes
+    // pow(blendCurve(t), edgeGamma * chanC) per color channel, so 1/1/1
+    // reproduces the legacy scalar weight exactly. Used to trim the overlap
+    // zone's color balance (one projector's red stronger than the other's).
+    // DXGI engine applies this in the shader; the MAG engine's layered
+    // overlay has a single alpha per pixel and keeps the scalar weight.
+    float chanR = 1.0f, chanG = 1.0f, chanB = 1.0f;
 };
 
 struct AdvPoint {

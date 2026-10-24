@@ -82,6 +82,7 @@ std::wstring presetPath(const std::string& name) {
 static void writeSide(std::ostream& os, const char* name, const BlendSide& s, const std::vector<AdvPoint>& adv) {
     os << name << ".fade=" << s.fade << "\n" << name << ".gamma=" << s.gamma << "\n";
     os << name << ".gain=" << s.gain << "\n" << name << ".slope=" << s.slope << "\n";
+    os << name << ".chan=" << s.chanR << "," << s.chanG << "," << s.chanB << "\n";
     os << name << ".advN=" << adv.size() << "\n";
     for (auto& p : adv)
         os << name << ".adv=" << p.pos << "," << p.fade << "," << p.gamma << "\n";
@@ -140,6 +141,15 @@ static void parseSideVal(const std::string& key, const std::string& val, OutputC
     else if (key == "gamma") b.gamma = (float)atof(val.c_str());
     else if (key == "gain") b.gain = clampf((float)atof(val.c_str()), 0.0f, 2.0f);
     else if (key == "slope") b.slope = clampf((float)atof(val.c_str()), 0.0f, 1.0f);
+    else if (key == "chan") {
+        // per-channel blend gamma, R,G,B (same 0.1..5 range as edge gamma)
+        float r, g, bl;
+        if (sscanf_s(val.c_str(), "%f,%f,%f", &r, &g, &bl) == 3) {
+            b.chanR = clampf(r, 0.1f, 5.0f);
+            b.chanG = clampf(g, 0.1f, 5.0f);
+            b.chanB = clampf(bl, 0.1f, 5.0f);
+        }
+    }
     else if (key == "advN") adv.clear();
     else if (key == "adv") {
         AdvPoint p; sscanf_s(val.c_str(), "%f,%f,%f", &p.pos, &p.fade, &p.gamma);

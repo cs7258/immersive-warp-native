@@ -34,7 +34,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 7. "Save Config" 持久化（%APPDATA%\ImmersiveWarpNative\config.txt），下次启动自动加载；"Preset:" 行可把当前整套配置（几何/融合/掩码/布局）存为命名预设并随时一键切回——预设文件与 CMDNET 的 `SAVEAS`/`LOADAS` 命令共用同一目录，名称规则同为 A-Z 0-9 `_` `-`；**托盘图标右键菜单也带 "Load preset" 子菜单**（逐项列出预设，单击即切换）
 8. "Configure display..." 打开每投影机配置对话框（对应原版同名牌）：七标签页 **Bezels / Align / Geometry / Blending / Color / Masking / Help**
    - **Geometry**：控制点 Horiz/Vert 密度（3–24，Apply 会重置网格）、水平/垂直镜像、旋转 90°、Reset grid
-   - **Blending**：按边（Left/Right/Top/Bottom）设置 Fade/Gamma/Gain/Slope，可勾选"Apply to all 4 edges"同步；**Curve editor...** 打开融合曲线编辑器（对应原版 Advanced blend control）：绘制所选边响应曲线 w(t)=pow(blendCurve(t,gain,slope),gamma)，Gain/Slope/Gamma 参数编辑 + Apply，Add to history / Restore history(0) 每边历史栈（最多 8 条）；R/G/B 分通道曲线需数据模型升级（P2）
+   - **Blending**：按边（Left/Right/Top/Bottom）设置 Fade/Gamma/Gain/Slope，可勾选"Apply to all 4 edges"同步；**Curve editor...** 打开融合曲线编辑器（对应原版 Advanced blend control）：绘制所选边响应曲线 w(t)=pow(blendCurve(t,gain,slope),gamma)，Gain/Slope/Gamma 参数编辑 + Apply，Add to history / Restore history(0) 每边历史栈（最多 8 条）；R/G/B 分通道融合伽马已上线（shader 数据模型 + CMDNET `SET left.chanr/chang/chanb`，曲线编辑器 UI 控件待加）
    - **Color**：本投影机独立的 亮度/对比度/Gamma RGB 滑杆（与全局 Color adjustment 对话框区分，后者改所有启用输出）
    - **Masking**：黑位掩码矩形列表（最多 8 个，渲染为黑色）。选中列表项后在 X/Y/W/H 输入框按百分比编辑位置与尺寸，Apply 写入（自动限幅保证矩形不出屏），Reset 10% 复位为左上角 10%x10%；**也可直接在输出窗口上右键拖拽画掩码**（拖拽中实时黑块预览，松手落地，任何模式可用；误点 <1% 自动忽略）；结果随 Save Config 持久化为 `mask=x,y,w,h`（归一化 0..1）
    - Bezels / Align 为占位说明（未实现）；Help 是快捷键速查
@@ -90,12 +90,13 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `GET presets;` | `OK presets=NAME1;NAME2` / `OK presets=none` | 列出全部已保存预设 |
 | `SET left.fade=0.2;` / `SET top.gamma=1.3;` | `OK left.fade=0.2` | 远程调融合参数（fade 0–0.5、gamma 0.1–5，自动限幅并随配置生效） |
 | `SET left.gain=0.8;` / `SET left.slope=0.3;` | `OK left.gain=0.8` | 融合曲线增益/陡度（gain 0–2、slope 0–1；0/0 = 线性斜坡，slope=1 为硬切换） |
+| `SET left.chanr=1.5;` / `SET left.chang=0.8;` / `SET left.chanb=1.2;` | `OK left.chanr=1.5` | **R/G/B 分通道融合伽马**：该边权重变为逐通道 `pow(curve(t), gamma×chanC)`（chan 0.1–5，默认 1/1/1 与旧版逐像素一致），用于修平铺重叠区的色彩平衡。仅 DXGI 引擎在 shader 中生效；MAG 引擎 overlay 单 alpha 无法逐通道衰减桌面内容，保持标量权重（平台限制）。随配置持久化（`left.chan=R,G,B`），`GET config` 的 `outN.*.chan=` 可读 |
 | `GET perf;` | `OK perf=uptime=123;frames=4567;fps=59.9;outputs=1;running=1` | 运行健康诊断：进程运行秒数、累计渲染帧数、滚动 1 秒平均帧率（空闲/无输出时 0.0）、启用输出数、是否运行中（enabled 或 preview） |
 | `PROBE ON;` / `PROBE OFF;` / `PROBE;` / `GET probe;` / `SET probe=on;` | `OK probe=on` | **相机对位探针**：在每个 warp 目标点画白色十字标记（含中心块，约 24px），校准相机检测十字实际落点后经 `SET warp.load=` 回灌修正。独立于校准模式（calib 关着也显示）；无参数 PROBE 为切换。MAG 引擎下为均匀 rows×cols 点阵分层 overlay（无 warp 网格，网格密度跟随 `SET rows/cols`） |
 | `INPLACE ON;` / `INPLACE OFF;` / `INPLACE;` / `GET inplace;` / `SET inplace=on;` | `OK inplace=on` | **原位覆盖（主屏异型校正输出）**：输出窗口无边框覆盖整台显示器 + `WS_EX_TRANSPARENT` 鼠标穿透 + `WDA_EXCLUDEFROMCAPTURE` 捕获排除——扭曲后的桌面看起来就是桌面本身（用户态复刻原版 DWM 桌面扭曲的视觉效果）。切换会重建输出窗口；校准时先关掉（穿透模式下无法拖控制点），控制台窗口置顶可随时操作；随配置持久化 |
 | `SET testpattern=off;` | `OK testpattern=off` | 切换测试图 |
 | `GET color;` / `SET color=1.2,1.0,0.8,1.5,0.9;` | `OK color=1.200,1.000,0.800,1.500,0.900` | 命令目标输出的色彩调节：gammaR,gammaG,gammaB（0.2–3.0）+ bright,contrast（0.2–2.0），越界自动限幅到滑杆范围；遵循 `SET out=` 定向 |
-| `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/out/各边 fade·gamma·gain·slope） |
+| `GET left.fade;` / `GET calib;` / `GET sampling;` 等 | `OK left.fade=0.150` | 查询单项状态（calib/mode/edges/snapshot/outputs/testpattern/sampling/autostart/source/out/各边 fade·gamma·gain·slope·chanr/chang/chanb） |
 | `GET config;` | `OK sampling=8;…;out0.dev=DISPLAY1;out0.rows=10;out0.left.fade=0.150;out0.masks=1 0.1,0.2,0.3,0.4;…;calib=off;out=auto` | **全量状态导出**：全局键 + 每输出一个 `outN.*` 块（网格密度、edges、四边融合参数、颜色调节、掩码列表——矩形间用空格分隔），与 STATUS 同为 `key=value;` 配对格式，一次往返镜像全部 UI 状态 |
 | `GET displays;` | `OK displays=2;DISPLAY1=1920x1080*;DISPLAY2=1920x1080;` | 列出显示器拓扑（`*` = 主显示器），便于节目控制端挑捕获源 |
 | `SET source=DISPLAY2;` / `SET source=auto;` | `OK source=DISPLAY2` | 指定捕获源桌面（auto = 第一个非输出的显示器）。改动会重建输出窗口；若指定的显示器本身是输出，引擎按防递归规则回退自动选择 |
