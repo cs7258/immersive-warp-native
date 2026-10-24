@@ -142,6 +142,9 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | `SET mask.del=i;` / `SET mask.clear;` | `OK masks=1` / `OK masks=0` | 删除指定索引 / 清空全部掩码 |
 | `SET mask.load=x,y,w,h x,y,w,h …;` | `OK masks=3` | 批量导入并整体替换掩码列表（矩形间用空格分隔——分号是协议终结符；校验与限幅规则同 mask.add，超过 8 个报 ERR） |
 | `AUTOSTART ON;\|AUTOSTART OFF;` | `OK autostart=on` | 开机自启（写入 HKCU Run，无需管理员） |
+| `INJECT LAUNCH <exe> [args];` | `OK INJECT launch pid=N` | 挂起启动目标程序并注入 WarpHook.dll（补丁先于任何 swapchain 创建）；exe 路径可加引号支持空格；DLL 默认取主程序同目录 WarpHook.dll |
+| `INJECT PID <pid> [dll];` | `OK INJECT pid=N` | 注入运行中的进程（只捕获注入后创建的 swapchain）；拒绝注入引擎自身（防双重 hook）；坏 pid/缺 DLL 均 ERR 不伤主程序 |
+| `LOADFILE <path>;` | `OK loaded file;outputs=N` | 全路径配置加载（MQTT loadprocalib 映射） |
 | 其他 | `ERR UNKNOWN` | 未知命令 |
 
 ## 工程结构
@@ -155,6 +158,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 | src/main.cpp | 启动、渲染线程、消息循环 |
 | src/HookIPC.cpp | scanout 管线宿主侧：发布 WarpHook.dll 参数映射 |
 | src/Mqtt.cpp | MQTT broker 客户端：`<prefix>/command` JSON 命令 + `<prefix>/status` retain 上报 |
+| src/Inject.cpp | 内置注入集成：CMDNET `INJECT LAUNCH/PID` 复用 IWNInject 工作流（DLL 默认同目录 WarpHook.dll，拒绝自注入） |
 | src/hook/WarpHook.cpp | 注入 DLL：Present hook + 就地扭曲（scanout 前） |
 | src/hook/Injector.cpp | IWNInject.exe：挂起启动注入器 |
 

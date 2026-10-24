@@ -93,6 +93,12 @@
 - [ ] 引擎 Start 后 hook.log 出现 `Present vtable patched (vt=...)` 与后续
       `first warp pass attempt (enabled=1 seen)`
 - [ ] 备选路径验证：正常启动 exe 后 `IWNInject.exe --pid <pid> WarpHook.dll`，H.1 各行同样出现
+- [ ] **内置注入（轮 17）**：正常启动 exe（不依赖 IWNInject.exe），CMDNET 发
+      `INJECT LAUNCH notepad.exe;` → 回复 `OK INJECT launch pid=<N>`，hook.log 出现新的
+      `WarpHook.dll attached pid=<N> exe=...notepad.exe`
+- [ ] `INJECT PID <运行中进程pid>;` 同样回 OK 且 attach；`INJECT PID <引擎自身pid>;` 被拒
+      （ERR self-injection——引擎已自扭曲，防双重 hook）
+- [ ] 错误路径不伤主程序：坏 pid / 不存在 exe / `INJECT FROBNICATE` 均 ERR，控制台继续响应
 
 ### H.2 hook 状态机（CMDNET 驱动，telnet 127.0.0.1 5252）
 

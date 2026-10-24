@@ -25,7 +25,8 @@ static SOCKET g_oscSock = INVALID_SOCKET;
 static std::thread g_oscThread;
 static SOCKET g_listenSock = INVALID_SOCKET;
 
-static std::string toNarrow(const std::wstring& w) {
+// shared: also used by Inject.cpp (CMDNET INJECT result paths)
+std::string toNarrow(const std::wstring& w) {
     if (w.empty()) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
     std::string s((size_t)n, 0);
@@ -714,6 +715,49 @@ static std::string dispatch(std::string line) {
             return "ERR LOADFILE (no such file)\n";
         if (!loadConfig(wpath)) return "ERR LOADFILE (load failed)\n";
         return finishLoad("file", sigBefore);
+    }
+    if (cmd == "INJECT") {
+        // scanout workflow integration: same modes as IWNInject.exe.
+        //   INJECT LAUNCH <exe> [args...]   (first arg may be a quoted path)
+        //   INJECT PID <pid> [dll]
+        // dispatch uppercased the line - NTFS paths are case-insensitive.
+        std::string mode, rest;
+        {
+            size_t sp = arg.find(' ');
+            if (sp == std::string::npos) { mode = arg; }
+            else { mode = arg.substr(0, sp); rest = arg.substr(sp + 1); }
+        }
+        if (mode == "LAUNCH") {
+            if (rest.empty()) return "ERR INJECT launch (exe path required)\n";
+            // split exe from args: quoted path wins, else first space run
+            std::wstring exe, args;
+            if (rest[0] == '"') {
+                size_t endq = rest.find('"', 1);
+                if (endq == std::string::npos)
+                    return "ERR INJECT launch (unterminated quote)\n";
+                exe = toWide(rest.substr(1, endq - 1));
+                if (endq + 1 < rest.size()) args = toWide(rest.substr(endq + 1));
+                // strip one leading space of the remainder
+                if (!args.empty() && args[0] == ' ') args.erase(0, 1);
+            } else {
+                size_t sp2 = rest.find(' ');
+                if (sp2 == std::string::npos) exe = toWide(rest);
+                else { exe = toWide(rest.substr(0, sp2)); args = toWide(rest.substr(sp2 + 1)); }
+            }
+            return injectLaunch(exe, args, std::wstring());
+        }
+        if (mode == "PID") {
+            size_t sp = rest.find(' ');
+            std::string pidTok = (sp == std::string::npos) ? rest : rest.substr(0, sp);
+            std::string dllTok = (sp == std::string::npos) ? std::string() : rest.substr(sp + 1);
+            if (pidTok.empty() || pidTok.size() > 10)
+                return "ERR INJECT pid (pid required)\n";
+            for (char c : pidTok)
+                if (c < '0' || c > '9') return "ERR INJECT pid (numeric pid required)\n";
+            unsigned long pid = strtoul(pidTok.c_str(), nullptr, 10);
+            return injectPid(pid, dllTok.empty() ? std::wstring() : toWide(dllTok));
+        }
+        return "ERR INJECT (mode: LAUNCH|PID)\n";
     }
 
     if (cmd == "AUTOSTART") {

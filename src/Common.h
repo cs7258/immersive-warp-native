@@ -329,6 +329,14 @@ bool mqttRunning();
 bool mqttConnected();
 void mqttReconfigure(const std::string& host, int port, const std::string& prefix);
 std::string cmdnetExecute(const std::string& line); // run a CMDNET line programmatically (OSC)
+// scanout injection integration (src/Inject.cpp): drive the IWNInject
+// workflow from CMDNET ("INJECT LAUNCH <exe> [args]" / "INJECT PID <pid>").
+// Return an "OK ..."/"ERR ..." reply line. Socket-thread safe (no UI/locks).
+std::string injectLaunch(const std::wstring& exe, const std::wstring& args,
+                         const std::wstring& dllIn);
+std::string injectPid(unsigned long pid, const std::wstring& dllIn);
+// UTF-8 <-> UTF-16 conversion shared by CmdNet.cpp / Inject.cpp
+std::string toNarrow(const std::wstring& w);
 // start with Windows: HKCU\...\Run value "ImmersiveWarpNative" (no admin needed)
 void setAutostart(bool on);
 bool queryAutostart();
