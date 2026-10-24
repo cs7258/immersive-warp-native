@@ -189,6 +189,13 @@ extern std::atomic<bool> g_probe;
 // show blackout: all outputs render black (View menu, CMDNET BLACKOUT).
 // Session-only state - never persisted to config.txt.
 extern std::atomic<bool> g_blackout;
+
+// frame snapshot: render thread grabs the swapchain back buffer to PNG after
+// the frame is drawn (bypasses WDA_EXCLUDEFROMCAPTURE screen-capture blocks)
+extern std::atomic<int> g_snapReq;      // 0 = idle, 1 = snapshot requested
+extern std::mutex g_snapMutex;          // guards path + last result below
+extern std::wstring g_snapPath;         // target .png path (set by CMDNET)
+extern std::string g_lastSnap;          // last written path (narrow, for GET)
 extern std::atomic<bool> g_testPause;   // dynamic test pattern paused (session-only)
 // warp-point move mode (Geometry "Move: Single / Move XY / All points" analog):
 // 0 = single selected point, 1 = whole row+column of the grabbed point,
@@ -215,6 +222,7 @@ std::vector<DisplayInfo> enumerateDisplays();
 bool saveConfig(const std::wstring& path);
 bool loadConfig(const std::wstring& path);
 std::wstring presetPath(const std::string& name);  // %APPDATA%\...\presets\<NAME>.cfg
+std::wstring snapshotDefaultPath();               // %APPDATA%\...\snapshots\<ts>.png
 
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);

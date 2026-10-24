@@ -206,6 +206,10 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return "OK subdivide=" + std::to_string(g_cfg.subdivide) + "\n";
         }
+        if (k == "snapshot") {
+            std::lock_guard<std::mutex> lk(g_snapMutex);
+            return std::string("OK snapshot=") + (g_lastSnap.empty() ? "none" : g_lastSnap) + "\n";
+        }
         if (k == "move") {
             int m = g_moveMode.load();
             return std::string("OK move=") + (m == 1 ? "xy" : m == 2 ? "all" : "single") + "\n";
@@ -979,6 +983,26 @@ static std::string dispatch(std::string line) {
         // grid density (REBUILDS each warp grid, dropping manual point edits,
         // same as the Configure dialog's Apply). Targets the selected output
         // when one is set, else every enabled output (legacy).
+        if (key == "snapshot") {
+            // frame snapshot to PNG: 1/on -> %APPDATA%\...\snapshots\<ts>.png,
+            // or a custom path. Runs on the render thread (async); GET snapshot
+            // reports the last written file. dispatch uppercased the line, so a
+            // custom path arrives uppercase - Windows paths are case-insensitive
+            // but the directory must already exist.
+            std::wstring path;
+            if (val == "1" || val == "ON" || val == "TRUE" || val.empty()) {
+                path = snapshotDefaultPath();
+            } else {
+                path.assign(val.begin(), val.end());
+                if (path.rfind(L".png") != path.size() - 4) path += L".png";
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_snapMutex);
+                g_snapPath = path;
+            }
+            g_snapReq.store(1);
+            return "OK snapshot=requested\n";
+        }
         if (key == "rows" || key == "cols") {
             int n = atoi(val.c_str());
             if (n < 3 || n > 24) return "ERR SET " + key + " (3..24)\n";

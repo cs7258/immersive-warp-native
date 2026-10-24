@@ -331,6 +331,94 @@ bool Engine::uploadImage(UINT w, UINT h, const std::vector<BYTE>& bgra, const ch
     return true;
 }
 
+// Frame snapshot: copies the swapchain back buffer to a staging texture and
+// encodes it as PNG via WIC. Runs on the render thread right before Present
+// (the back buffer holds the complete frame at that point). Bypasses the
+// WDA_EXCLUDEFROMCAPTURE protection that blocks GetPixel/PrintWindow/BitBlt,
+// giving real machine verification a trustworthy image of the warped output.
+void Engine::captureSnapshot(OutputCtx& oc) {
+    if (!oc.swap) return;
+    int req = g_snapReq.exchange(0);
+    if (req != 1) return;
+    std::wstring path;
+    {
+        std::lock_guard<std::mutex> lk(g_snapMutex);
+        path = g_snapPath;
+    }
+    if (path.empty()) { dbgLog("snap: empty path"); return; }
+
+    ID3D11Texture2D* back = nullptr;
+    if (FAILED(oc.swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back)) || !back) {
+        dbgLog("snap: GetBuffer failed"); return;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    back->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    ID3D11Texture2D* staging = nullptr;
+    HRESULT hr = m_dev->CreateTexture2D(&td, nullptr, &staging);
+    if (SUCCEEDED(hr)) {
+        m_ctx->CopyResource(staging, back);
+        D3D11_MAPPED_SUBRESOURCE mp{};
+        hr = m_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mp);
+        if (SUCCEEDED(hr)) {
+            static bool comInit = false;
+            if (!comInit) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); comInit = true; }
+            IWICImagingFactory* fac = nullptr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                    CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (void**)&fac))) {
+                // row pitch may exceed width*4 - copy scanlines into one block
+                std::vector<uint8_t> px((size_t)td.Width * td.Height * 4);
+                const uint8_t* src = (const uint8_t*)mp.pData;
+                for (UINT y = 0; y < td.Height; y++)
+                    memcpy(px.data() + (size_t)y * td.Width * 4,
+                           src + (size_t)y * mp.RowPitch, (size_t)td.Width * 4);
+                IWICBitmap* bmp = nullptr;
+                if (SUCCEEDED(fac->CreateBitmapFromMemory(td.Width, td.Height,
+                        GUID_WICPixelFormat32bppBGRA, (UINT)mp.RowPitch > 0 ? td.Width * 4 : 4,
+                        (UINT)px.size(), px.data(), &bmp))) {
+                    IWICStream* stream = nullptr;
+                    if (SUCCEEDED(fac->CreateStream(&stream)) && stream &&
+                        SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) {
+                        IWICBitmapEncoder* enc = nullptr;
+                        if (SUCCEEDED(fac->CreateEncoder(GUID_ContainerFormatPng,
+                                nullptr, &enc)) && enc &&
+                            SUCCEEDED(enc->Initialize(stream, WICBitmapEncoderNoCache))) {
+                            IWICBitmapFrameEncode* frame = nullptr;
+                            if (SUCCEEDED(enc->CreateNewFrame(&frame, nullptr)) && frame &&
+                                SUCCEEDED(frame->Initialize(nullptr)) &&
+                                SUCCEEDED(frame->SetSize(td.Width, td.Height))) {
+                                WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+                                frame->SetPixelFormat(&fmt);
+                                hr = frame->WritePixels((UINT)td.Height, td.Width * 4,
+                                                        (UINT)px.size(), px.data());
+                                if (SUCCEEDED(hr) && SUCCEEDED(frame->Commit()) &&
+                                    SUCCEEDED(enc->Commit())) {
+                                    std::lock_guard<std::mutex> lk(g_snapMutex);
+                                    g_lastSnap = std::string(path.begin(), path.end());  // ASCII-safe: snapshot dir
+                                    dbgLog("snap: wrote " + g_lastSnap);
+                                } else dbgLog("snap: encode failed");
+                            }
+                            if (frame) frame->Release();
+                        }
+                        if (enc) enc->Release();
+                    }
+                    if (stream) stream->Release();
+                }
+                if (bmp) bmp->Release();
+            } else dbgLog("snap: no WIC factory");
+            m_ctx->Unmap(staging, 0);
+        } else dbgLog("snap: Map failed");
+        staging->Release();
+    } else dbgLog("snap: staging create failed");
+    back->Release();
+}
+
 // Decodes PNG / JPG / BMP / TIFF / GIF / ICO into a BGRA texture. Empty path
 // clears the image (falls back to desktop capture / test pattern).
 bool Engine::loadImage(const std::wstring& path) {
@@ -1215,6 +1303,7 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
     // when the window is briefly not composited (e.g. during startup or a
     // transient overlay) and never recovers -> permanent black output. The
     // render thread is already throttled by Sleep(6), so vsync is not needed.
+    if (g_snapReq.load()) captureSnapshot(oc);   // back buffer is the full frame here
     HRESULT phr = oc.swap->Present(0, 0);
     if (phr == (HRESULT)0x087A0001 /* DXGI_STATUS_OCCLUDED */) {
         // force a non-vsync blit so DWM re-attaches the swapchain, then pause

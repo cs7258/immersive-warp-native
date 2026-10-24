@@ -80,6 +80,7 @@ private:
     void buildOverlay(OutputCtx& oc, const OutputCfg& cfg);
     void updateFrameCB(OutputCtx& oc, const OutputCfg& cfg);
     void drawOutput(OutputCtx& oc, const OutputCfg& cfg);
+    void captureSnapshot(OutputCtx& oc);   // swapchain back buffer -> PNG (g_snapReq)
 
     ID3D11Device* m_dev = nullptr;
     ID3D11DeviceContext* m_ctx = nullptr;

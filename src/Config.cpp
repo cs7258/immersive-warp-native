@@ -23,6 +23,13 @@ std::atomic<bool> g_testPause{ false };
 // warp-point move mode: 0=single, 1=row+column (Move XY), 2=all points.
 // Session-only editor state (original's Geometry "Move:" radio group).
 std::atomic<int> g_moveMode{ 0 };
+
+// frame snapshot request surface (Common.h): CMDNET sets req+path, the render
+// thread consumes it right before Present and records the written path here
+std::atomic<int> g_snapReq{ 0 };
+std::mutex g_snapMutex;
+std::wstring g_snapPath;
+std::string g_lastSnap;
 // periodic perf snapshot into debug.log (SET perflog=on; 1 line / 10 s)
 std::atomic<bool> g_perfLog{ false };
 std::atomic<int>  g_dispChange{ 0 };
@@ -89,6 +96,21 @@ std::wstring presetPath(const std::string& name) {
     std::wstring dir = std::wstring(path) + L"\\ImmersiveWarpNative\\presets";
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\" + fromUtf8(name) + L".cfg";
+}
+
+// snapshot default target: %APPDATA%\ImmersiveWarpNative\snapshots\<ts>.png
+// (set snapshot=1 uses this; set snapshot=<path> overrides; rendered by Engine)
+std::wstring snapshotDefaultPath() {
+    wchar_t path[MAX_PATH];
+    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path);
+    std::wstring dir = std::wstring(path) + L"\\ImmersiveWarpNative\\snapshots";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t ts[32];
+    _snwprintf_s(ts, _TRUNCATE, L"%04u%02u%02u-%02u%02u%02u",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return dir + L"\\snapshot-" + ts + L".png";
 }
 
 static void writeSide(std::ostream& os, const char* name, const BlendSide& s, const std::vector<AdvPoint>& adv) {
