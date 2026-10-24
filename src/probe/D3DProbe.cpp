@@ -37,7 +37,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 int wmain(int argc, wchar_t** argv) {
     int secs = 0;
     for (int i = 1; i < argc; i++)
-        if (!lstrcmpW(argv[i], L"--secs") && i + 1 < argc)
+        // case-insensitive: CMDNET dispatch uppercases the whole command
+        // line, so "--secs" arrives as "--SECS"
+        if (!lstrcmpiW(argv[i], L"--secs") && i + 1 < argc)
             secs = (int)wcstoul(argv[++i], nullptr, 10);
 
     WNDCLASSW wc = {};
@@ -100,10 +102,18 @@ int wmain(int argc, wchar_t** argv) {
     if (secs) SetTimer(wnd, 1, secs * 1000, nullptr);
 
     float t = 0;
+    bool running = true;
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    // PeekMessage, not GetMessage: a blocking pump renders nothing while no
+    // messages arrive, so the Present counter would stall (and WM_TIMER
+    // auto-exit would still fire - the render loop is the bug, not the timer).
+    while (running) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { running = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!running) break;
         t += 0.01f;
         float c[4] = {0.5f + 0.5f * sinf(t),
                       0.5f + 0.5f * sinf(t + 2.1f),
