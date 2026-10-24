@@ -43,9 +43,67 @@ static void setStatus(const wchar_t* s);    // fwd: calibration-mode key handler
 // 24x16 checker, 12x8 grid lines, red border, green center cross. Drawn in
 // an overlay on top of the magnifier host because the MAG engine has no
 // render pipeline of its own.
+// Shared MAG scroll clock for the dynamic test pattern. The DXGI engine
+// advances its own accumulator inside renderAll; this one advances on the
+// test overlays' animation timer so all MAG overlays scroll in lockstep
+// (independent phase from DXGI is fine - the two engines never run at the
+// same time). Session-only, mirrors the 3 s cycle of the shader bands.
+static double g_magAnimPhase = 0.0;      // 0..1 within the 3 s cycle
+static bool   g_magAnimShown = false;    // last test paint had bands (one-shot clear)
+static void magAnimTick() {
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (!last) { last = now; return; }
+    double dt = (double)(now - last) / 1000.0;
+    last = now;
+    if (dt > 0.25) dt = 0.25;            // clamp like the DXGI accumulator
+    if (g_testPause.load()) return;      // frozen phase while paused
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    if (g_cfg.testAnim) g_magAnimPhase = fmod(g_magAnimPhase + dt / 3.0, 1.0);
+}
+
 // The test-pattern artwork itself, drawn into (ox,oy)-(ox+w,oy+h). Kept as a
 // helper so the ROI path can draw it clipped inside the region of interest.
-static void paintTestPatternDC(HDC dc, int ox, int oy, int W, int H) {
+// anim = g_cfg.testAnim (0 off, 1 H, 2 V, 3 diagonal), phase = shared MAG
+// scroll clock 0..1 (g_magAnimPhase) so every overlay scrolls in lockstep.
+static void paintTestPatternDC(HDC dc, int ox, int oy, int W, int H, int anim, double phase) {
+    // dynamic1 scroll bands (shader mirror: s=frac(dot(p,dir)*6+phase),
+    // orange where s<0.16). Drawn last so they cover the grid/cross like the
+    // shader's final colour overwrite.
+    if (anim) {
+        double dxx = anim == 1 ? 1.0 : anim == 2 ? 0.0 : 0.70710678;
+        double dyy = anim == 1 ? 0.0 : anim == 2 ? 1.0 : 0.70710678;
+        double cmax = dxx + dyy;              // c = dot(p,dir) range over the rect
+        HBRUSH ob = CreateSolidBrush(RGB(232, 148, 10));   // #E8940A
+        HGDIOBJ oldBr = SelectObject(dc, ob);
+        const double band = 0.16 / 6.0;
+        for (int k = -1; k < 8; k++) {
+            double a = k / 6.0 - phase;       // band start in c space
+            if (a + band < 0 || a > cmax) continue;
+            double b = a + band;
+            POINT pts[4];
+            if (anim == 1) {                  // vertical bands, x = c*W
+                pts[0] = { ox + (int)(a * W), oy };
+                pts[1] = { ox + (int)(b * W), oy };
+                pts[2] = { ox + (int)(b * W), oy + H };
+                pts[3] = { ox + (int)(a * W), oy + H };
+            } else if (anim == 2) {           // horizontal bands, y = c*H
+                pts[0] = { ox, oy + (int)(a * H) };
+                pts[1] = { ox + W, oy + (int)(a * H) };
+                pts[2] = { ox + W, oy + (int)(b * H) };
+                pts[3] = { ox, oy + (int)(b * H) };
+            } else {                          // diagonal: x/W + y/H = c/dxx
+                double s0 = a / dxx, s1 = b / dxx;   // s = nx + ny
+                pts[0] = { ox + (int)(s0 * W), oy };
+                pts[1] = { ox + (int)(s1 * W), oy };
+                pts[2] = { ox + (int)((s1 - 1) * W), oy + H };
+                pts[3] = { ox + (int)((s0 - 1) * W), oy + H };
+            }
+            Polygon(dc, pts, 4);
+        }
+        SelectObject(dc, oldBr);
+        DeleteObject(ob);
+    }
     // 24x16 checker (same greys as the shader)
     for (int row = 0; row < 16; row++)
         for (int col = 0; col < 24; col++) {
@@ -99,6 +157,16 @@ static void paintTestPatternDC(HDC dc, int ox, int oy, int W, int H) {
 static LRESULT CALLBACK MagTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
     if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_TIMER && wp == 1) {
+        magAnimTick();
+        bool anim;
+        { std::lock_guard<std::mutex> lk(g_cfgMutex); anim = g_cfg.testAnim != 0; }
+        bool want = anim && !g_testPause.load();
+        // repaint while animating; one extra repaint clears the bands when
+        // animation turns off (or pauses - a frozen band is the paused look)
+        if (want || g_magAnimShown) InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
@@ -106,17 +174,21 @@ static LRESULT CALLBACK MagTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         int W = rc.right, H = rc.bottom;
         // image-area ROI (mirrors the shader pass): insets in output px,
         // optional inscribed circle, optional green border line
-        int roiL, roiT, roiR, roiB, cir, brd;
+        int roiL, roiT, roiR, roiB, cir, brd, anim;
+        double phase;
         {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             roiL = g_cfg.roi[0]; roiT = g_cfg.roi[1];
             roiR = g_cfg.roi[2]; roiB = g_cfg.roi[3];
             cir = g_cfg.roiCircle; brd = g_cfg.roiBorder;
+            anim = g_cfg.testAnim;
         }
+        phase = g_magAnimPhase;
+        g_magAnimShown = anim != 0 && !g_testPause.load();
         bool hasRoi = (roiL + roiR) > 0 || (roiT + roiB) > 0 || cir || brd;
         int rx0 = roiL, ry0 = roiT, rx1 = W - roiR, ry1 = H - roiB;
         if (!hasRoi) {
-            paintTestPatternDC(dc, 0, 0, W, H);
+            paintTestPatternDC(dc, 0, 0, W, H, anim, phase);
         } else if (rx1 <= rx0 || ry1 <= ry0) {
             HBRUSH b = CreateSolidBrush(RGB(0, 0, 0));
             FillRect(dc, &rc, b);
@@ -130,7 +202,7 @@ static LRESULT CALLBACK MagTestWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                            : CreateRectRgn(rx0, ry0, rx1, ry1);
             SaveDC(dc);
             SelectClipRgn(dc, rgn);
-            paintTestPatternDC(dc, rx0, ry0, rx1 - rx0, ry1 - ry0);
+            paintTestPatternDC(dc, rx0, ry0, rx1 - rx0, ry1 - ry0, anim, phase);
             SelectClipRgn(dc, nullptr);
             RestoreDC(dc, -1);
             if (brd > 0) {   // green border inside the ROI edge
@@ -674,6 +746,7 @@ void destroyOutputWindows() {
     dbgLogLine("destroyOutputWindows: " + std::to_string(g_outWins.size()) + " window(s)");
     magDetachAll();   // no-op outside engine=1
     // test-pattern overlays are owned by the mag hosts: destroy them first
+    for (HWND t : g_magTests) KillTimer(t, 1);
     for (HWND t : g_magTests) magRemoveFilter(t);
     for (HWND t : g_magTests) DestroyWindow(t);
     g_magTests.clear();
@@ -699,6 +772,7 @@ void destroyOutputWindows() {
 // capture of the output.
 static void syncMagTestOverlays(bool on) {
     if (!on) {
+        for (HWND t : g_magTests) KillTimer(t, 1);
         for (HWND t : g_magTests) magRemoveFilter(t);
         for (HWND t : g_magTests) DestroyWindow(t);
         g_magTests.clear();
@@ -734,6 +808,7 @@ static void syncMagTestOverlays(bool on) {
         auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
                                            "SetWindowDisplayAffinity");
         if (fn) fn(ov, 0x11);
+        SetTimer(ov, 1, 60);   // scroll-band animation tick (~50 frames per 3 s cycle)
         g_magTests.push_back(ov);
         magAddFilter(ov);
     }
