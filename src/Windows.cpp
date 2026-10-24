@@ -2329,10 +2329,10 @@ void setLayout(int R, int C, int overlapPct) {
 // ---- color adjustment dialog (brightness / contrast / gamma R G B) ----
 // Edits ColorAdj of every ENABLED output live (shader applies per frame).
 static HWND g_colorDlg = nullptr;
-static HWND g_tb[5] = {}, g_tbVal[5] = {};
-static const wchar_t* tbName[5] = { L"Brightness", L"Contrast", L"Gamma R", L"Gamma G", L"Gamma B" };
-static const int tbMin[5] = { 20, 20, 20, 20, 20 };
-static const int tbMax[5] = { 200, 200, 300, 300, 300 };
+static HWND g_tb[7] = {}, g_tbVal[7] = {};
+static const wchar_t* tbName[7] = { L"Brightness", L"Contrast", L"Saturation", L"Luma", L"Gamma R", L"Gamma G", L"Gamma B" };
+static const int tbMin[7] = { 20, 20, 0, 20, 20, 20, 20 };
+static const int tbMax[7] = { 200, 200, 200, 200, 300, 300, 300 };
 
 static float tbPosF(int i) {
     return (float)SendMessageW(g_tb[i], TBM_GETPOS, 0, 0) / 100.0f;
@@ -2343,16 +2343,18 @@ static void colorApplyFromSliders() {
     ColorAdj c;
     c.bright = tbPosF(0);
     c.contrast = tbPosF(1);
-    c.gammaR = tbPosF(2);
-    c.gammaG = tbPosF(3);
-    c.gammaB = tbPosF(4);
+    c.saturation = tbPosF(2);
+    c.luma = tbPosF(3);
+    c.gammaR = tbPosF(4);
+    c.gammaG = tbPosF(5);
+    c.gammaB = tbPosF(6);
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         for (auto& o : g_cfg.outputs) if (o.enabled) o.color = c;
         g_rev++;
     }
     wchar_t t[32];
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 7; i++) {
         wsprintfW(t, L"%d.%02d", (int)tbPosF(i), (int)(tbPosF(i) * 100) % 100);
         SetWindowTextW(g_tbVal[i], t);
     }
@@ -2360,9 +2362,10 @@ static void colorApplyFromSliders() {
 }
 
 static void colorSetSliders(const ColorAdj& c) {
-    int pos[5] = { (int)(c.bright * 100), (int)(c.contrast * 100),
+    int pos[7] = { (int)(c.bright * 100), (int)(c.contrast * 100),
+                   (int)(c.saturation * 100), (int)(c.luma * 100),
                    (int)(c.gammaR * 100), (int)(c.gammaG * 100), (int)(c.gammaB * 100) };
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 7; i++)
         SendMessageW(g_tb[i], TBM_SETPOS, TRUE, (LPARAM)pos[i]);
 }
 
@@ -2374,7 +2377,7 @@ static void applyDarkThemeRecursive(HWND root);
 static LRESULT CALLBACK ColorDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 7; i++) {
             CreateWindowW(L"STATIC", tbName[i], WS_CHILD | WS_VISIBLE,
                 10, 14 + i * 42, 90, 18, hwnd, nullptr, nullptr, nullptr);
             g_tb[i] = CreateWindowW(TRACKBAR_CLASSW, L"",
@@ -2385,10 +2388,10 @@ static LRESULT CALLBACK ColorDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 298, 14 + i * 42, 50, 18, hwnd, nullptr, nullptr, nullptr);
         }
         CreateWindowW(L"BUTTON", L"Reset",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 104, 226, 90, 26,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 104, 310, 90, 26,
             hwnd, (HMENU)2005, nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Close",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 204, 226, 90, 26,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 204, 310, 90, 26,
             hwnd, (HMENU)2006, nullptr, nullptr);
         // init from the first enabled output (or identity defaults)
         ColorAdj c;
@@ -2443,7 +2446,7 @@ static void openColorDialog(HINSTANCE hInst, HWND owner) {
     g_colorDlg = CreateWindowExW(WS_EX_TOPMOST, L"IWN_ColorDlg",
         L"Color adjustment (applies to enabled outputs)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        140, 140, 370, 300, nullptr, nullptr, hInst, nullptr);
+        140, 140, 370, 384, nullptr, nullptr, hInst, nullptr);
     if (g_colorDlg) applyDarkThemeRecursive(g_colorDlg);   // theme + 9pt font
 }
 
@@ -3977,6 +3980,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         ComboBox_AddString(g_cbImg, L"Checkerboard");
         ComboBox_AddString(g_cbImg, L"Gray ramp");
         ComboBox_AddString(g_cbImg, L"Identity grid");
+        ComboBox_AddString(g_cbImg, L"RGBY band");
         // animation direction + pause: the original's Images area controls.
         // The scroll band lives in the DXGI test-pattern shader; MAG's GDI
         // replica stays static (single-alpha layered windows can't scroll it
@@ -4521,7 +4525,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                     g_rev++;
                 }
                 Button_SetCheck(g_ckImage, BST_CHECKED);
-                static const wchar_t* patName[4] = { L"Color bars", L"Checkerboard", L"Gray ramp", L"Identity grid" };
+                static const wchar_t* patName[5] = { L"Color bars", L"Checkerboard", L"Gray ramp", L"Identity grid", L"RGBY band" };
                 wchar_t line[160];
                 wsprintfW(line, L"Image: %s (built-in %dx%d)", patName[idx],
                           Engine::inst().imageWidth(), Engine::inst().imageHeight());

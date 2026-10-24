@@ -176,7 +176,8 @@ bool saveConfig(const std::wstring& pathIn) {
         writeSide(os, "top", o.blend[2], o.adv[2]);
         writeSide(os, "bottom", o.blend[3], o.adv[3]);
         os << "color=" << o.color.gammaR << "," << o.color.gammaG << "," << o.color.gammaB
-           << "," << o.color.bright << "," << o.color.contrast << "\n";
+           << "," << o.color.bright << "," << o.color.contrast
+           << "," << o.color.saturation << "," << o.color.luma << "\n";
         os << "masksN=" << o.masks.size() << "\n";
         for (auto& m : o.masks)
             os << "mask=" << m.x << "," << m.y << "," << m.w << "," << m.h << "\n";
@@ -295,8 +296,14 @@ bool loadConfig(const std::wstring& pathIn) {
         else if (key == "right") { advSide = 1; cur->adv[1].clear(); }
         else if (key == "top") { advSide = 2; cur->adv[2].clear(); }
         else if (key == "bottom") { advSide = 3; cur->adv[3].clear(); }
-        else if (key == "color") sscanf_s(val.c_str(), "%f,%f,%f,%f,%f",
-            &cur->color.gammaR, &cur->color.gammaG, &cur->color.gammaB, &cur->color.bright, &cur->color.contrast);
+        else if (key == "color") {
+            // 5-field legacy rows (pre-saturation/luma) parse fine: the extra
+            // two stay at their defaults when sscanf only converts 5
+            sscanf_s(val.c_str(), "%f,%f,%f,%f,%f,%f,%f",
+                &cur->color.gammaR, &cur->color.gammaG, &cur->color.gammaB,
+                &cur->color.bright, &cur->color.contrast,
+                &cur->color.saturation, &cur->color.luma);
+        }
         else if (key == "masksN") cur->masks.clear();
         else if (key == "mask") {
             MaskRect m; sscanf_s(val.c_str(), "%f,%f,%f,%f", &m.x, &m.y, &m.w, &m.h);

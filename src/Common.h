@@ -49,6 +49,7 @@ struct AdvPoint {
 struct ColorAdj {
     float gammaR = 1.0f, gammaG = 1.0f, gammaB = 1.0f;
     float bright = 1.0f, contrast = 1.0f;
+    float saturation = 1.0f, luma = 1.0f;   // original Color tab parity
 };
 
 struct MaskRect { float x = 0, y = 0, w = 0.10f, h = 0.10f; };   // default = 10%x10% at top-left
@@ -91,7 +92,7 @@ struct AppConfig {
     bool inplace = false;             // in-place overlay: fullscreen click-through output
     bool useImage = false;            // image source instead of pattern/capture
     std::wstring imagePath;
-    int testImg = -1;                 // built-in test image library (0..3), -1 = none
+    int testImg = -1;                 // built-in test image library (0..4), -1 = none
     int testAnim = 0;                 // dynamic pattern scroll: 0 off, 1 H, 2 V, 3 diagonal
     int checker = 0;                  // 20x10 checkerboard overlay (screen space, blend-alignment aid)
     int roi[4] = { 0, 0, 0, 0 };      // test-image region of interest, L,T,R,B inset px

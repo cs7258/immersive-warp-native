@@ -144,6 +144,10 @@ static OutputCfg* targetOutputLocked() {
     return nullptr;
 }
 
+// configuration lock state (session-level; never persisted - see dispatch)
+static std::mutex g_lockMtx;
+static std::string g_lockPwd;
+
 static std::string dispatch(std::string line) {
     // trim + uppercase
     while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(line.begin());
@@ -155,6 +159,31 @@ static std::string dispatch(std::string line) {
 
     if (cmd == "PING") return "OK\n";
 
+    // ---- configuration lock (original button-bar Lock/Unlock parity) ----
+    // Session-level only: the password is never written to config files, so a
+    // restart always starts unlocked (fail-safe). While locked, only read-only
+    // commands pass; everything else answers ERR locked.
+    if (cmd == "LOCK") {
+        if (arg.empty()) return "ERR LOCK <password>\n";
+        std::lock_guard<std::mutex> lk(g_lockMtx);
+        if (!g_lockPwd.empty()) return "ERR locked (UNLOCK <password> first)\n";
+        g_lockPwd = arg;
+        return "OK lock=on\n";
+    }
+    if (cmd == "UNLOCK") {
+        std::lock_guard<std::mutex> lk(g_lockMtx);
+        if (g_lockPwd.empty()) return "ERR not locked\n";
+        if (arg != g_lockPwd) return "ERR UNLOCK (bad password)\n";
+        g_lockPwd.clear();
+        return "OK lock=off\n";
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_lockMtx);
+        if (!g_lockPwd.empty() && cmd != "GET" && cmd != "STATUS" &&
+            cmd != "LOCK" && cmd != "UNLOCK" && cmd != "HELP")
+            return "ERR locked (UNLOCK <password> to change)\n";
+    }
+
     // GET key: query a single value (integration-friendly counterpart of SET)
     if (cmd == "GET") {
         std::string k = arg;
@@ -164,6 +193,10 @@ static std::string dispatch(std::string line) {
         if (k == "snapshot") return std::string("OK snapshot=") + (g_snapshot.load() ? "on" : "off") + "\n";
         if (k == "probe")    return std::string("OK probe=")    + (g_probe.load() ? "on" : "off") + "\n";
         if (k == "perflog")  return std::string("OK perflog=")  + (g_perfLog.load() ? "on" : "off") + "\n";
+        if (k == "lock") {
+            std::lock_guard<std::mutex> lk(g_lockMtx);
+            return std::string("OK lock=") + (g_lockPwd.empty() ? "off" : "on") + "\n";
+        }
         if (k == "osc")      return std::string("OK osc=")      + (oscRunning() ? "on" : "off") + "\n";
         if (k == "oscport") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -231,6 +264,10 @@ static std::string dispatch(std::string line) {
         if (k == "checker") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             return std::string("OK checker=") + (g_cfg.checker ? "on" : "off") + "\n";
+        }
+        if (k == "testimg") {
+            std::lock_guard<std::mutex> lk(g_cfgMutex);
+            return "OK testimg=" + std::to_string(g_cfg.testImg) + "\n";
         }
         if (k == "subdivide") {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
@@ -326,8 +363,9 @@ static std::string dispatch(std::string line) {
                         s += b;
                     }
                     const ColorAdj& c = o.color;
-                    sprintf_s(b, "%scolor=%.3f,%.3f,%.3f,%.3f,%.3f;",
-                              p, c.gammaR, c.gammaG, c.gammaB, c.bright, c.contrast);
+                    sprintf_s(b, "%scolor=%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f;",
+                              p, c.gammaR, c.gammaG, c.gammaB, c.bright, c.contrast,
+                              c.saturation, c.luma);
                     s += b;
                     sprintf_s(b, "%smasks=%d", p, (int)o.masks.size());
                     s += b;
@@ -386,10 +424,11 @@ static std::string dispatch(std::string line) {
             std::lock_guard<std::mutex> lk(g_cfgMutex);
             OutputCfg* o = targetOutputLocked();
             if (!o) return "ERR no output (SET out=<name>?)\n";
-            char b[80];
-            sprintf_s(b, "OK color=%.3f,%.3f,%.3f,%.3f,%.3f\n",
+            char b[96];
+            sprintf_s(b, "OK color=%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                       o->color.gammaR, o->color.gammaG, o->color.gammaB,
-                      o->color.bright, o->color.contrast);
+                      o->color.bright, o->color.contrast,
+                      o->color.saturation, o->color.luma);
             return b;
         }
         if (k == "presets") return listPresets();
@@ -552,6 +591,7 @@ static std::string dispatch(std::string line) {
                ";mqttport=" + std::to_string(mqttPortV) +
                ";mqtthost=" + mqttHostV +
                ";mqttprefix=" + mqttPrefixV +
+               ";lock=" + std::string([&]{ std::lock_guard<std::mutex> lk(g_lockMtx); return g_lockPwd.empty() ? "off" : "on"; }()) +
                ";engine=" + std::string(eng == 1 ? "mag" : "desktopduplication") + "\n";
     }
 
@@ -1068,13 +1108,18 @@ static std::string dispatch(std::string line) {
             }
             return "ERR SET mask (add|set|load|del|clear)\n";
         }
-        // per-output color adjustment (gamma RGB + brightness/contrast).
-        // Same clamps as the color dialog's sliders: bright/contrast 0.2..2.0,
-        // gamma 0.2..3.0. Targets the selected output, else the first enabled.
+        // per-output color adjustment (gamma RGB + brightness/contrast +
+        // saturation/luma). Same clamps as the color dialog's sliders:
+        // bright/contrast/luma/saturation 0.2..2.0 (sat also 0 = gray),
+        // gamma 0.2..3.0. 5 fields = legacy form (sat/luma untouched);
+        // 7 fields set everything. Targets selected output, else first enabled.
         if (key == "color") {
             float gr, gg, gb, br, ct;
-            if (sscanf_s(val.c_str(), "%f,%f,%f,%f,%f", &gr, &gg, &gb, &br, &ct) != 5)
-                return "ERR SET color (gammaR,gammaG,gammaB,bright,contrast)\n";
+            float st, lm;
+            int nf = sscanf_s(val.c_str(), "%f,%f,%f,%f,%f,%f,%f",
+                              &gr, &gg, &gb, &br, &ct, &st, &lm);
+            if (nf != 5 && nf != 7)
+                return "ERR SET color (gammaR,gammaG,gammaB,bright,contrast[,saturation,luma])\n";
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 OutputCfg* o = targetOutputLocked();
@@ -1084,6 +1129,10 @@ static std::string dispatch(std::string line) {
                 o->color.gammaB  = clampf(gb, 0.2f, 3.0f);
                 o->color.bright  = clampf(br, 0.2f, 2.0f);
                 o->color.contrast = clampf(ct, 0.2f, 2.0f);
+                if (nf == 7) {
+                    o->color.saturation = clampf(st, 0.0f, 2.0f);
+                    o->color.luma = clampf(lm, 0.2f, 2.0f);
+                }
                 g_rev++;
             }
             refreshStatusBar();   // locks g_cfgMutex itself: call unlocked
@@ -1296,6 +1345,17 @@ static std::string dispatch(std::string line) {
                 g_testPause.store(want);
                 applied = true;
                 refreshAnimUI(g_cfg.testAnim, want);   // Image-page checkbox follows
+            }
+            if (!applied && key == "testimg") {
+                // built-in library: -1 none, 0..4 = bars/checker/ramp/grid/RGBY
+                if (val.find_first_not_of("-0123456789") != std::string::npos)
+                    return "ERR SET testimg (-1..4)\n";
+                int v = atoi(val.c_str());
+                if (v < -1 || v > 4) return "ERR SET testimg (-1..4)\n";
+                g_cfg.testImg = v;
+                g_cfg.useImage = (v >= 0);
+                Engine::inst().setTestImage(v);   // render-thread safe (shared GL/D3D ctx path)
+                applied = true;
             }
             if (!applied && key == "checker") {
                 bool want = (val == "ON" || val == "1" || val == "true");

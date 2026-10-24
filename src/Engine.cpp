@@ -56,6 +56,7 @@ cbuffer FrameCB : register(b0) {
     float4 overlay;         // x=checker 20x10 on, yz=output resolution px
     float4 roiPx;           // test-image ROI insets: L,T,R,B (output px)
     float4 roiMode;         // x=inscribed circle, y=border width px
+    float4 extra;           // x=saturation, y=luma
 }
 // parametric blend curve: f(x) = (gain+1)x / (slope*(x-1) + gain*x + 1).
 // gain=0, slope=0 -> f(x)=x (the plain linear ramp); slope=1 -> hard step;
@@ -184,6 +185,9 @@ float4 main(VOut i, float4 px : SV_Position) : SV_Target {
     }
     c = pow(saturate(c), color.rgb);
     c = (c - 0.5) * contrast + 0.5;
+    float lum = dot(c, float3(0.299, 0.587, 0.114));   // Rec.601 luma
+    c = lerp(lum.xxx, c, extra.x);                     // saturation
+    c *= extra.y;                                      // luma (master level)
     c *= color.w;
     for (int k = 0; k < 8; k++) {
         if (k >= flags.z) break;
@@ -482,7 +486,7 @@ bool Engine::loadImage(const std::wstring& path) {
 bool Engine::setTestImage(int id) {
     if (!m_dev) return false;
     if (id < 0) { clearImage(); return true; }
-    if (id > 3) id = 3;
+    if (id > 5) id = 5;
 
     const UINT W = 1280, H = 720;
     std::vector<BYTE> buf((size_t)W * H * 4);
@@ -535,6 +539,30 @@ bool Engine::setTestImage(int id) {
             }
         break;
     }
+    case 4: {  // RGBY band: black/white/gray checker upper 2/3 + R/G/B/Y bars
+               // bottom third (original guide: "黑白灰棋盘格 + RGBY 色带横条")
+        for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++) {
+                BYTE r = 0, g = 0, b = 0;
+                if (y < H * 2 / 3) {
+                    // three-tone checker: white/black with a gray diagonal band
+                    bool w = ((x / 80) + (y / 80)) % 2 == 0;
+                    r = g = b = w ? 255 : 0;
+                    int diag = (x + y) / 40;
+                    if (diag % 4 == 1) r = g = b = 128;
+                } else {
+                    static const BYTE band[4][3] = {
+                        {255,0,0},{0,255,0},{0,0,255},{255,255,0} };
+                    UINT bh = (H - H * 2 / 3) / 4;
+                    int k = (int)((y - H * 2 / 3) / bh);
+                    if (k > 3) k = 3;
+                    r = band[k][0]; g = band[k][1]; b = band[k][2];
+                }
+                if (x < 2 || y < 2 || x > W - 3 || y > H - 3) { r = 0; g = 255; b = 0; }
+                put(x, y, r, g, b);
+            }
+        break;
+    }
     default: {  // identity grid: 10x12 control grid, center crosshair, border
         for (UINT y = 0; y < H; y++)
             for (UINT x = 0; x < W; x++) {
@@ -552,7 +580,7 @@ bool Engine::setTestImage(int id) {
         break;
     }
     }
-    static const char* names[4] = { "colorbars", "checkerboard", "grayramp", "grid" };
+    static const char* names[6] = { "colorbars", "checkerboard", "grayramp", "grid", "rgbyband", "grid" };
     if (!uploadImage(W, H, buf, names[id])) return false;
     m_testImg = id;
     return true;
@@ -1190,6 +1218,7 @@ struct FrameCBData {
     float overlay[4];    // x=checker 20x10 on, yz=output resolution px
     float roiPx[4];      // test-image ROI insets L,T,R,B (output px)
     float roiMode[4];    // x=inscribed circle, y=border width px
+    float extra[4];      // x=saturation, y=luma
 };
 static_assert(sizeof(FrameCBData) % 16 == 0, "cb must be 16-byte aligned");
 
@@ -1248,6 +1277,7 @@ void Engine::updateFrameCB(OutputCtx& oc, const OutputCfg& cfg) {
     d.color[0] = cfg.color.gammaR; d.color[1] = cfg.color.gammaG;
     d.color[2] = cfg.color.gammaB; d.color[3] = cfg.color.bright;
     d.contrast = cfg.color.contrast;
+    d.extra[0] = cfg.color.saturation; d.extra[1] = cfg.color.luma;
 
     // sampling: bi-cubic needs the source texture size for catmull-rom taps.
     // Image mode uses the loaded image; desktop mode the per-output frame
