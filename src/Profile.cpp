@@ -72,36 +72,34 @@ static void profilerThreadFn() {
         std::vector<std::wstring> rules;
         profRulesSnapshot(rules);
         if (!rules.empty()) {
-            // enumerate pids (K32* lives in kernel32 since Win7 - no psapi dep)
-            DWORD pids[2048], cb = 0;
-            if (K32EnumProcesses(pids, sizeof(pids), &cb)) {
-                int n = (int)(cb / sizeof(DWORD));
-                for (int i = 0; i < n; i++) {
-                    if (!g_profRun.load()) break;
-                    DWORD pid = pids[i];
-                    if (!pid || pid == GetCurrentProcessId()) continue;
-                    if (profSeenHas(pid)) continue;
-                    wchar_t path[MAX_PATH] = L"";
-                    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                    if (!p) continue;
-                    DWORD sz = MAX_PATH;
-                    BOOL got = QueryFullProcessImageNameW(p, 0, path, &sz);
-                    CloseHandle(p);
-                    if (!got || !sz) continue;
-                    const wchar_t* name = path;
-                    for (const wchar_t* q = path; *q; q++)
-                        if (*q == L'\\') name = q + 1;          // basename
-                    bool match = false;
-                    for (auto& r : rules)
-                        if (wcMatchWild(r.c_str(), name)) { match = true; break; }
-                    if (!match) continue;
-                    // inject; mark seen regardless of outcome so a target that
-                    // refuses (e.g. protected process) is not hammered forever
-                    profSeenAdd(pid);
-                    std::string res = injectPid(pid, L"");
-                    dbgLogLine("profile: auto-inject pid=" + std::to_string(pid) +
-                               " exe=" + toNarrow(name) + " -> " + res);
+            // enumerate pids via Toolhelp (tlhelp32.h - zero extra libs; the
+            // K32EnumProcesses route needs psapi versioning gymnastics)
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+                if (Process32FirstW(snap, &pe)) {
+                    do {
+                        if (!g_profRun.load()) break;
+                        DWORD pid = pe.th32ProcessID;
+                        if (!pid || pid == GetCurrentProcessId()) continue;
+                        if (profSeenHas(pid)) continue;
+                        // Toolhelp already hands us the exe basename - no
+                        // OpenProcess/QueryFullProcessImageName needed for
+                        // matching (avoids "Access denied" noise on system
+                        // processes entirely)
+                        bool match = false;
+                        for (auto& r : rules)
+                            if (wcMatchWild(r.c_str(), pe.szExeFile)) { match = true; break; }
+                        if (!match) continue;
+                        // inject; mark seen regardless of outcome so a target
+                        // that refuses (e.g. protected process) is not hammered
+                        profSeenAdd(pid);
+                        std::string res = injectPid(pid, L"");
+                        dbgLogLine("profile: auto-inject pid=" + std::to_string(pid) +
+                                   " exe=" + toNarrow(pe.szExeFile) + " -> " + res);
+                    } while (Process32NextW(snap, &pe));
                 }
+                CloseHandle(snap);
             }
         }
         profSeenSweep();
