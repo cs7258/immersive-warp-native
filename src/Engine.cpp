@@ -346,7 +346,8 @@ bool snapEncodePng(const std::wstring& path, UINT w, UINT h,
     bool ok = false;
     IWICBitmap* bmp = nullptr;
     if (SUCCEEDED(fac->CreateBitmapFromMemory(w, h,
-            GUID_WICPixelFormat32bppBGRA, stride, (UINT)stride * h, px, &bmp))) {
+            GUID_WICPixelFormat32bppBGRA, stride, (UINT)stride * h,
+            const_cast<BYTE*>(reinterpret_cast<const BYTE*>(px)), &bmp))) {
         IWICStream* stream = nullptr;
         if (SUCCEEDED(fac->CreateStream(&stream)) && stream &&
             SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) {
@@ -360,7 +361,8 @@ bool snapEncodePng(const std::wstring& path, UINT w, UINT h,
                     SUCCEEDED(frame->SetSize(w, h))) {
                     WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
                     frame->SetPixelFormat(&fmt);
-                    HRESULT hr = frame->WritePixels(h, stride, stride * h, (void*)px);
+                    HRESULT hr = frame->WritePixels(h, stride, stride * h,
+                                                    const_cast<BYTE*>(reinterpret_cast<const BYTE*>(px)));
                     if (SUCCEEDED(hr) && SUCCEEDED(frame->Commit()) &&
                         SUCCEEDED(enc->Commit())) {
                         ok = true;
