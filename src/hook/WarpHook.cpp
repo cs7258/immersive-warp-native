@@ -382,6 +382,9 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
         firstCallLogged = true;
         hookLog("HookPresent invoked (first call)");
     }
+    // PRESENT_TEST calls (our own probe) stop here: forwarding them would
+    // race the app's real Present on the same swapchain and crash DXGI.
+    if (flags & DXGI_PRESENT_TEST) return S_OK;
     PFN_Present orig = origPresentFor(sw);
     IWNHookCfg* cfg = ensureCfg();
     if (cfg && cfg->enabled && orig && sw) {
