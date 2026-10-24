@@ -453,24 +453,13 @@ static void logThrowType(PEXCEPTION_POINTERS ep) {
     __try {
         ULONG_PTR* ei = ep->ExceptionRecord->ExceptionInformation;
         if (ei[0] != 0x19930520u) { hookLog("throw: unknown magic"); return; }
-        // find the throwing module: walk the stack, keep distinct module
-        // bases in frame order; the first two are the RaiseException plumbing
-        // (KERNELBASE, ntdll), the third distinct base is the thrower
-        void* dum = nullptr;
-        UINT64* sp = (UINT64*)ep->ContextRecord->Rsp;
-        void* seen[4] = {}; int nSeen = 0;
-        void* ownerMb = nullptr;
-        for (int i = 0; i < 128 && !ownerMb; i++) {
-            void* mb = RtlPcToFileHeader((PVOID)sp[i], &dum);
-            if (!mb) continue;
-            ULONGLONG off = (ULONGLONG)sp[i] - (ULONGLONG)mb;
-            if (off < 0x1000 || off > 0x2000000) continue;
-            bool known = false;
-            for (int k = 0; k < nSeen; k++) if (seen[k] == mb) { known = true; break; }
-            if (!known && nSeen < 4) seen[nSeen++] = mb;
-            if (nSeen >= 3) ownerMb = seen[nSeen - 1];   // past raise plumbing
-        }
-        if (!ownerMb) { hookLog("throw: no owner module found"); return; }
+        // x64 MSVC ABI: ei[1] = image-relative offset of ThrowInfo,
+        // ei[3] = image base of the throwing module
+        void* ownerMb = (void*)ei[3];
+        char buf2[96];
+        wsprintfA(buf2, "throw module: %p (rva=0x%X)", ownerMb, (DWORD)ei[1]);
+        hookLog(buf2);
+        if (!ownerMb || (DWORD)ei[1] == 0) { hookLog("throw: no base/rva"); return; }
         const TiLite* ti = (const TiLite*)((const BYTE*)ownerMb + (DWORD)ei[1]);
         if (ti->ctaRva <= 0) { hookLog("throw: no catchable types"); return; }
         const CtaLite* cta = (const CtaLite*)((const BYTE*)ownerMb + ti->ctaRva);
@@ -480,35 +469,8 @@ static void logThrowType(PEXCEPTION_POINTERS ep) {
         char buf[112];
         wsprintfA(buf, "throw type: %.70s", td->name);
         hookLog(buf);
-        char buf2[112];
-        wsprintfA(buf2, "throw module: %p", ownerMb);
-        hookLog(buf2);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hookLog("throw type: parse fault");
-    }
-}
-
-static void logStackScan(PEXCEPTION_POINTERS ep) {
-    __try {
-        UINT64* sp = (UINT64*)ep->ContextRecord->Rsp;
-        char buf[80];
-        int n = 0;
-        void* seen[6] = {}; int nSeen = 0;
-        for (int i = 0; i < 96 && n < 6; i++) {
-            void* mb = RtlPcToFileHeader((PVOID)sp[i], nullptr);
-            if (!mb) continue;
-            ULONGLONG off = (ULONGLONG)sp[i] - (ULONGLONG)mb;
-            if (off < 0x1000 || off > 0x2000000) continue;
-            bool known = false;
-            for (int k = 0; k < nSeen; k++) if (seen[k] == mb) { known = true; break; }
-            if (known) continue;
-            if (nSeen < 6) seen[nSeen++] = mb;
-            wsprintfA(buf, "stack mod: %p off=0x%X", mb, (DWORD)off);
-            hookLog(buf);
-            n++;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        hookLog("stack scan fault");
     }
 }
 
@@ -533,7 +495,6 @@ static LONG WINAPI excFilter(PEXCEPTION_POINTERS ep) {
         wsprintfA(buf, "EXC code=0x%08X addr=%p mod=%p off=0x%X tid=%u",
                   code, pc, modBase, off, (unsigned)GetCurrentThreadId());
         hookLog(buf);
-        logStackScan(ep);
         if (code == 0xE06D7363) logThrowType(ep);
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -575,14 +536,16 @@ static DWORD WINAPI initThread(LPVOID) {
     // watchdog: re-apply the detour if something restored the original entry.
     // NOTE: no repeated live probe - calling Present from this thread races
     // the app's own Present on the same swapchain and crashes DXGI.
-    static bool wdLogged = false;
+    // First cycle logs every step - the mystery crash lands exactly here
+    // (2.0 s after the probe) and these lines pin the throwing statement.
+    static int wdCycle = 0;
     while (true) {
         Sleep(2000);
+        if (wdCycle == 0) hookLog("wd: awake");
         std::lock_guard<std::mutex> lk(g_vtMutex);
-        if (!wdLogged) {
-            wdLogged = true;
-            hookLog("watchdog cycle 1 enter");
-        }
+        if (wdCycle == 0) hookLog("wd: locked");
+        if (wdCycle == 0) hookLog("watchdog cycle 1 enter");
+        wdCycle++;
         for (int i = 0; i < g_vtCount; i++) {
             void** vt = g_vts[i].vt;
             // re-read the OBJECT's vptr: if dxgi swapped the vtable after
