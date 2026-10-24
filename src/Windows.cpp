@@ -1400,7 +1400,7 @@ void refreshStatusBar() {
         unsigned long long up = engineUptimeMs() / 1000;
         _snwprintf_s(l6, 128, _TRUNCATE,
                      L"Engine: %.1f fps   frame %.2f ms (cap %.2f + draw %.2f)   uptime %02u:%02u:%02u",
-                     engineFps(), engineFrameMs(), engineCapMs(), engineDrawMs(), fr,
+                     engineFps(), engineFrameMs(), engineCapMs(), engineDrawMs(),
                      (unsigned)(up / 3600), (unsigned)((up / 60) % 60), (unsigned)(up % 60));
     }
 
