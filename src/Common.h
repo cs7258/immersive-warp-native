@@ -237,6 +237,8 @@ bool hookIpcInit();
 void hookIpcSet(bool enabled, const float corner[4][2], int gridN);
 bool hookIpcEnabled();
 unsigned hookIpcPassCount();   // Present detour hit counter (written by the DLL)
+unsigned hookIpcExcCode();     // first-chance exception code seen by the hook VEH
+unsigned hookIpcExcTid();      // thread that raised it
 
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);
