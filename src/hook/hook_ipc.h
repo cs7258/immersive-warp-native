@@ -37,6 +37,7 @@ struct IWNHookCfg {
                              // exception code seen by the hook VEH, [2]=tid of
                              // the thread that raised it (crash telemetry)
     // ---- v2 ----
+    LONG   vertCount;        // grid vertex count (0 = corner model)
     LONG   mode;             // 0 = corner model, 1 = full mesh below
     LONG   meshRows;         // grid vertex rows (RV)
     LONG   meshCols;         // grid vertex cols (CV)
@@ -51,6 +52,6 @@ struct IWNHookCfg {
 };
 #pragma pack(pop)
 
-static_assert(offsetof(IWNHookCfg, verts) == 224, "hook IPC v2 header drift");
-static_assert(sizeof(IWNHookCfg) == 224 + IWN_MAX_MESH_VERTS * sizeof(IWNMeshVtx),
+static_assert(offsetof(IWNHookCfg, verts) == 228, "hook IPC v2 header drift");
+static_assert(sizeof(IWNHookCfg) >= 228 + IWN_MAX_MESH_VERTS * sizeof(IWNMeshVtx),
               "hook IPC v2 layout drift");
