@@ -262,7 +262,7 @@ static volatile LONG g_swapCount = 0;
 
 // Bitblt and flip-model swapchains are distinct implementation classes with
 // distinct vtables - patch each vtable once and remember its original Present.
-struct VtEntry { void** vt; PFN_Present orig; };
+struct VtEntry { void** vt; PFN_Present orig; IDXGISwapChain* probe; };
 static VtEntry g_vts[4];
 static int g_vtCount = 0;
 static std::mutex g_vtMutex;
@@ -276,19 +276,20 @@ static PFN_Present patchSwapchainVt(IDXGISwapChain* sw) {
     DWORD old{};
     if (!VirtualProtect(&vt[13], sizeof(void*), PAGE_READWRITE, &old)) return nullptr;
     PFN_Present orig = (PFN_Present)vt[13];
-    vt[13] = (void*)&HookPresent;
+    *(void* volatile*)&vt[13] = (void*)&HookPresent;
     VirtualProtect(&vt[13], sizeof(void*), old, &old);
-    // verify the patch actually stuck
-    if (*(void**)&vt[13] == (void*)&HookPresent) {
-        char buf[96];
-        wsprintfA(buf, "Present vtable patched (vt=%p)", (void*)vt);
-        hookLog(buf);
-    } else {
+    // volatile readback - the compiler must not fold this into the store
+    void* now = *(void* volatile*)&vt[13];
+    if (now != (void*)&HookPresent) {
         hookLog("Present patch VERIFY FAILED - readback differs");
         return orig;
     }
+    char buf[96];
+    wsprintfA(buf, "Present vtable patched (vt=%p)", (void*)vt);
+    hookLog(buf);
     g_vts[g_vtCount].vt = vt;
     g_vts[g_vtCount].orig = orig;
+    g_vts[g_vtCount].probe = sw;
     g_vtCount++;
     return orig;
 }
@@ -337,17 +338,12 @@ static HRESULT WINAPI HookCreateSwapChain(IUnknown* fac, IUnknown* dev,
                                           DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
     HRESULT hr = g_origCreate(fac, dev, desc, out);
     if (SUCCEEDED(hr) && out && *out) {
-        PFN_Present pv = patchSwapchainVt(*out);
+        patchSwapchainVt(*out);
         LONG c = InterlockedIncrement(&g_swapCount);
         char buf[96];
         wsprintfA(buf, "swapchain hooked via CreateSwapChain (#%d), vt=%p", (int)c,
                   (void*)*(void***)*out);
         hookLog(buf);
-        if (pv) {
-            // self-test: call the (now hooked) slot with PRESENT_TEST -
-            // proves the detour is live at this exact moment
-            pv(*out, 0, DXGI_PRESENT_TEST);
-        }
     }
     return hr;
 }
@@ -436,23 +432,26 @@ static DWORD WINAPI initThread(LPVOID) {
         Sleep(50);
     }
     installFactoryHooks();
-    // watchdog: if something restores the vtable pages (AV, integrity
-    // protection), re-apply the Present detours and say so
+    // watchdog: probe the hooked slot with PRESENT_TEST every 2 s (proves the
+    // detour is live), and re-apply if something restored the original
     while (true) {
         Sleep(2000);
         std::lock_guard<std::mutex> lk(g_vtMutex);
         for (int i = 0; i < g_vtCount; i++) {
             void** vt = g_vts[i].vt;
-            if (vt[13] != (void*)&HookPresent) {
+            if (*(void* volatile*)&vt[13] != (void*)&HookPresent) {
                 DWORD old{};
                 if (VirtualProtect(&vt[13], sizeof(void*), PAGE_READWRITE, &old)) {
-                    vt[13] = (void*)&HookPresent;
+                    *(void* volatile*)&vt[13] = (void*)&HookPresent;
                     VirtualProtect(&vt[13], sizeof(void*), old, &old);
                     char buf[96];
                     wsprintfA(buf, "vtable reverted (vt=%p) - repatched", (void*)vt);
                     hookLog(buf);
                 }
             }
+            // live probe: PRESENT_TEST never displays, just validates state
+            if (g_vts[i].probe)
+                ((PFN_Present)vt[13])(g_vts[i].probe, 0, DXGI_PRESENT_TEST);
         }
     }
     return 0;
