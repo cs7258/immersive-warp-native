@@ -25,20 +25,44 @@ namespace {
 
 // dwm.exe runs at System integrity: without SeDebugPrivilege OpenProcess
 // fails with ERROR_ACCESS_DENIED. Best effort - report clearly on failure.
-bool enableDebugPriv() {
+// Returns false + the reason so the caller can tell "not elevated" apart
+// from "elevated but privilege grant failed" (nearly never happens).
+bool enableDebugPriv(std::string& why) {
     HANDLE tok = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+        why = "OpenProcessToken gle=" + std::to_string(GetLastError());
         return false;
+    }
     TOKEN_PRIVILEGES tp{};
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
     if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid)) {
-        CloseHandle(tok); return false;
+        CloseHandle(tok);
+        why = "LookupPrivilegeValue gle=" + std::to_string(GetLastError());
+        return false;
     }
     AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-    BOOL ok = (GetLastError() == ERROR_SUCCESS);
+    DWORD gle = GetLastError();
     CloseHandle(tok);
-    return ok != FALSE;
+    if (gle != ERROR_SUCCESS) {
+        // ERROR_NOT_ALL_ASSIGNED (1300) = the token does not hold
+        // SeDebugPrivilege, which means the process is NOT elevated.
+        why = gle == 1300 ? "token lacks SeDebugPrivilege (not elevated)"
+                          : "AdjustTokenPrivileges gle=" + std::to_string(gle);
+        return false;
+    }
+    return true;
+}
+
+// TokenElevation query - zero extra headers, unlike IsUserAnAdmin.
+bool isElevated() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION el{};
+    DWORD cb = 0;
+    BOOL ok = GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &cb);
+    CloseHandle(tok);
+    return ok && el.TokenIsElevated;
 }
 
 bool injectInto(HANDLE proc, const wchar_t* dllPath, std::string& err) {
@@ -162,7 +186,16 @@ std::string injectPid(unsigned long pid, const std::wstring& dllIn) {
 // swapchain vtables are class-level shared, so WarpHook.dll's self-probe
 // patch covers swapchains that already existed before the injection.
 std::string injectDwm() {
-    enableDebugPriv();
+    std::string privWhy;
+    bool priv = enableDebugPriv(privWhy);
+    bool elev = isElevated();
+    dbgLogLine("inject: dwm elevated=" + std::to_string(elev) +
+               (priv ? " seDebug=ok" : " seDebug=fail(" + privWhy + ")"));
+    // Not elevated: OpenProcess on dwm.exe can only fail - tell the user
+    // exactly what to do instead of a generic "run as administrator?".
+    if (!elev)
+        return "ERR INJECT dwm (NOT ELEVATED: right-click ImmersiveWarpNative.exe > "
+               "Run as administrator, then press Enable Desktop warping again)\n";
     std::wstring dll = hookDllDefault();
     wchar_t full[MAX_PATH] = {};
     if (!GetFullPathNameW(dll.c_str(), MAX_PATH, full, nullptr) ||
@@ -207,6 +240,7 @@ std::string injectDwm() {
     dbgLogLine("inject: dwm found=" + std::to_string(found) + " ok=" + std::to_string(ok) +
                (errs.empty() ? std::string() : " errs=" + errs));
     if (!ok)
-        return "ERR INJECT dwm (" + errs + "run as administrator?)\n";
+        return "ERR INJECT dwm (elevated, seDebug=" + std::string(priv ? "ok" : "fail") +
+               "; " + errs + "dwm may be code-integrity protected - report this exact text)\n";
     return "OK INJECT dwm pids=" + pids + "\n";
 }
