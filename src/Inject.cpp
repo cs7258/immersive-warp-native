@@ -262,6 +262,7 @@ bool resolveImports(HANDLE proc, DWORD pid, std::vector<BYTE>& img, std::string&
         const char* modName = (const char*)(&img[0] + imp->Name);
         wchar_t wname[96];
         MultiByteToWideChar(CP_UTF8, 0, modName, -1, wname, 96);
+        dbgLogLine(std::string("mm: dep ") + modName);
         HMODULE local = GetModuleHandleW(wname);
         if (!local) local = LoadLibraryW(wname);
         if (!local) { err = std::string("local dep missing: ") + modName; return false; }
@@ -306,6 +307,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         err = "not a PE32+ image"; return false;
     }
     const SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
+    dbgLogLine("mm: parsed ok image=" + std::to_string(imageSize));
     std::vector<BYTE> img(imageSize, 0);
     memcpy(&img[0], &file[0], nt->OptionalHeader.SizeOfHeaders);
     auto sec = IMAGE_FIRST_SECTION(nt);
@@ -317,18 +319,23 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         memcpy(&img[dst], &file[src], n);
     }
 
+    dbgLogLine("mm: sections copied");
     BYTE* remote = (BYTE*)VirtualAllocEx(proc, nullptr, imageSize,
                                          MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!remote) { err = "VirtualAllocEx(image) gle=" + std::to_string(GetLastError()); return false; }
     ULONGLONG base = (ULONGLONG)(uintptr_t)remote;
+    dbgLogLine("mm: base=" + std::to_string(base));
     if (!applyRelocs(img, base, err)) { VirtualFreeEx(proc, remote, 0, MEM_RELEASE); return false; }
+    dbgLogLine("mm: relocs ok");
     if (!resolveImports(proc, pid, img, err)) { VirtualFreeEx(proc, remote, 0, MEM_RELEASE); return false; }
+    dbgLogLine("mm: imports ok");
 
     if (!WriteProcessMemory(proc, remote, &img[0], imageSize, nullptr)) {
         err = "WriteProcessMemory(image) gle=" + std::to_string(GetLastError());
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         return false;
     }
+    dbgLogLine("mm: image written, sc=" + std::to_string(sc.size()));
 
     // final shellcode: register the image's exception table (x64 unwinding
     // needs it for manual-mapped images), then run DllMain(base, ATTACH, 0)
@@ -418,6 +425,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     }
     WaitForSingleObject(th, 15000);
     CloseHandle(th);
+    dbgLogLine("mm: remote thread done");
     ULONGLONG result[2] = {};
     SIZE_T got = 0;
     BOOL rd = ReadProcessMemory(proc, resBlock, result, sizeof(result), &got) && got == sizeof(result);
