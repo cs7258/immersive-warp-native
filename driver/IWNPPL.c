@@ -33,6 +33,9 @@
 #include <ntddk.h>
 
 #define PROTECTION_QUERY_CLASS  ((PROCESSINFOCLASS)61)   // ProcessProtectionInformation
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+#endif
 #define SCAN_LO                 0x200
 #define SCAN_HI                 0x900
 #define FALLBACK_OFFSET         0x6CA                    // 18363 (1909) known offset
