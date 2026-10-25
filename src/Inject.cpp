@@ -373,26 +373,18 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     size_t resAt = SIZE_MAX;                         // &result slot (patched below)
     emit(sc, {0x48,0x83,0xEC,0x28});                 // sub rsp,0x28
     if (aft && table) {
-        emit(sc, {0x48,0xB9});                       // movabs rcx,&pdata
-        imm64(sc, ims, table);
-        emit(sc, {0x48,0xBA});                       // movabs rdx,count
-        imm64(sc, ims, count);
-        emit(sc, {0x49,0xB8});                       // movabs r8,base
-        imm64(sc, ims, base);
-        emit(sc, {0x48,0xB8});                       // movabs rax,RtlAddFunctionTable
-        imm64(sc, ims, (ULONGLONG)aft);
-        emit(sc, {0xFF,0xD0});                       // call rax
+        // NOTE: RtlAddFunctionTable moved INSIDE HookEntry (diag4) - calling
+        // it from this shellcode correlated with the remote-thread crash.
         emit(sc, {0x49,0xBF});                       // movabs r15,&result
         resAt = sc.size(); imm64(sc, ims, 0);
-        emit(sc, {0x49,0x89,0x07});                  // mov [r15],rax  (AFT ret)
         emit(sc, {0x48,0xB9});                       // movabs rcx,base
         imm64(sc, ims, base);
         emit(sc, {0x48,0xC7,0xC2,0x01,0x00,0x00,0x00});// mov rdx,1 (ATTACH)
         emit(sc, {0x45,0x33,0xC0});                  // xor r8d,r8d
-        emit(sc, {0x48,0xB8});                       // movabs rax,DllMain
+        emit(sc, {0x48,0xB8});                       // movabs rax,entry
         imm64(sc, ims, base + entryRva);
         emit(sc, {0xFF,0xD0});                       // call rax
-        emit(sc, {0x41,0x89,0x47,0x08});             // mov [r15+8],eax
+        emit(sc, {0x49,0x89,0x07});                  // mov [r15],rax
         emit(sc, {0x31,0xC0, 0x48,0x83,0xC4,0x28, 0xC3});
     } else {
         emit(sc, {0x48,0xB9});                       // movabs rcx,base
