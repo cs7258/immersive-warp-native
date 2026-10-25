@@ -22,6 +22,9 @@ if (-not $signtool) { throw "signtool.exe not found" }
 
 & $signtool.FullName sign /fd SHA256 /f "$root\build\IWNTestSigning.pfx" /p "IWNPPL-test" "$sys"
 if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+# self-signed root is not trusted on the CI machine - import it first,
+# then public-auth verification must pass.
+Import-Certificate -FilePath "$root\build\IWNTestSigning.cer" -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
 & $signtool.FullName verify /pa "$sys"
 if ($LASTEXITCODE -ne 0) { throw "signtool verify failed" }
 Write-Output "signed OK"

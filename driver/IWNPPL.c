@@ -30,7 +30,7 @@
 // Unload:
 //   sc stop IWNPPL && sc delete IWNPPL
 // ============================================================
-#include <ntddk.h>
+#include <ntifs.h>   // ZwQueryInformationProcess / PsLookupProcessByProcessId
 
 #define PROTECTION_QUERY_CLASS  ((PROCESSINFOCLASS)61)   // ProcessProtectionInformation
 #ifndef PROCESS_QUERY_LIMITED_INFORMATION
@@ -103,13 +103,14 @@ static VOID StripProtection(PEPROCESS proc, HANDLE pid)
     }
 }
 
-static VOID DwmNotifyCb(HANDLE parentId, HANDLE processId, BOOLEAN create,
+// EX callback: 3 params, info==NULL means the process is being destroyed.
+static VOID DwmNotifyCb(HANDLE parentId, HANDLE processId,
                         PPS_CREATE_NOTIFY_INFO info)
 {
     PEPROCESS proc = NULL;
 
     UNREFERENCED_PARAMETER(parentId);
-    if (!create || !info || !info->ImageFileName) return;
+    if (!info || !info->ImageFileName) return;   // destruction or no image
 
     // match image file name tail "dwm.exe", case-insensitive
     {
