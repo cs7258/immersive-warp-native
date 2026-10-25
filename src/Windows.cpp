@@ -1812,18 +1812,24 @@ void toggleWindowWarping() {
 
 // DWM hook live status line (Displays page). UI thread only.
 static HWND g_hookInfo = nullptr;
+// last INJECT DWM verdict, UI thread only (all inject callers are UI thread)
+static std::string g_lastDwmErr;
+
 void refreshHookInfo() {
     if (!g_hookInfo) return;
     if (!hookIpcEnabled()) {
         SetWindowTextW(g_hookInfo, L"DWM hook: off (Enable Desktop warping to start)");
         return;
     }
-    wchar_t b[180];
+    wchar_t b[300];
     _snwprintf_s(b, _TRUNCATE,
         L"DWM hook: ON   outs=%d verts=%d rev=%d pass=%u%s",
         hookIpcOutCount(), hookIpcMeshVerts(), hookIpcMeshRev(),
         hookIpcPassCount(),
-        hookIpcPassCount() ? L"" : L"   (no Present seen - run Inject DWM as admin)");
+        hookIpcPassCount() ? L""
+            : (g_lastDwmErr.empty()
+                ? L"   (no Present seen - run Inject DWM as admin)"
+                : L"   hook unavailable: see the red line - use Desktop Duplication engine instead"));
     SetWindowTextW(g_hookInfo, b);
 }
 
@@ -1851,6 +1857,7 @@ void toggleDwmWarping() {
     if (g_outWins.empty()) createOutputWindows();   // mesh publisher must be live
     std::string r = injectDwm();                    // best effort, needs admin
     bool injected = r.rfind("OK", 0) == 0;
+    if (!injected) g_lastDwmErr = r;
     dbgLogLine(std::string("ui: inject dwm -> ") + r);
     hookIpcSet(true, nullptr, 0);
     refreshHookInfo();
@@ -4460,6 +4467,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         } else if (id == IDC_INJDWM && HIWORD(wp) == BN_CLICKED) {
             std::string r = injectDwm();
             if (!r.empty() && r.back() == '\n') r.pop_back();
+            if (r.rfind("OK", 0) != 0) g_lastDwmErr = r;
             wchar_t m[160];
             if (!MultiByteToWideChar(CP_UTF8, 0, r.c_str(), -1, m, 160)) m[0] = L'\0';
             setStatus(m);

@@ -148,6 +148,7 @@ bool injectInto(HANDLE proc, const wchar_t* dllPath, std::string& err) {
     if (gle == 126) hint = " (ERROR_MOD_NOT_FOUND: a dependency is missing in the target)";
     else if (gle == 577) hint = " (ERROR_INVALID_IMAGE_HASH: signature policy - dwm only loads MS-signed DLLs)";
     else if (gle == 1114) hint = " (ERROR_DLL_INIT_FAILED: our DllMain failed in the target)";
+    else if (gle == 5) hint = " (ACCESS_DENIED: kernel code-integrity refuses unsigned DLLs in dwm.exe - injection path closed on this Windows build; use the Desktop Duplication engine path instead)";
     err = "LoadLibraryW in target failed gle=" + std::to_string(gle) + hint;
     return false;
 }
