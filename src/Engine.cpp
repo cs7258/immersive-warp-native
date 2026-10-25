@@ -967,12 +967,16 @@ static float pt(const OutputCfg& c, int r, int col, int axis) {
 
 struct MeshVtx { float sx, sy, dx, dy, nx, ny; };
 
-void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
+// CPU-side grid generation, shared by the DXGI render path (buildMesh) and
+// the engine-agnostic hook publication (publishHookMeshes below): MAG mode
+// has no render loop, yet its desktop-warp mesh must still reach the
+// injected WarpHook.dll. Pure math - no GPU objects.
+static void computeMeshVtxInto(const OutputCfg& cfg, std::vector<MeshVtx>& vtx,
+                               int& RVout, int& CVout) {
     int rows = cfg.rows, cols = cfg.cols, s = std::max(1, g_cfg.subdivide);
     int RV = (rows - 1) * s + 1, CV = (cols - 1) * s + 1;
-    std::vector<MeshVtx> vtx((size_t)RV * CV);
-    std::vector<uint32_t> idx;
-    idx.reserve((size_t)(RV - 1) * (CV - 1) * 6);
+    RVout = RV; CVout = CV;
+    vtx.assign((size_t)RV * CV, MeshVtx{});
     for (int i = 0; i < RV; i++) {
         float fr = (float)i / s;
         int ri = std::min((int)fr, std::max(rows - 2, 0));
@@ -1015,6 +1019,42 @@ void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
             v.ny = v.sy;
         }
     }
+}
+
+// publish every enabled output's mesh to the hook IPC without touching the
+// engine: driven by the 1s UI timer when engine==MAG (no render loop there).
+// DXGI mode keeps publishing inside buildMesh - do not double-publish.
+// Caller must NOT hold g_cfgMutex (this takes it, non-recursive).
+void publishHookMeshes() {
+    std::lock_guard<std::mutex> lk(g_cfgMutex);
+    int total = 0;
+    for (auto& o : g_cfg.outputs) if (o.enabled) total++;
+    if (!total) return;
+    int slot = 0;
+    for (auto& o : g_cfg.outputs) {
+        if (!o.enabled) continue;
+        std::vector<MeshVtx> vtx;
+        int RV = 0, CV = 0;
+        computeMeshVtxInto(o, vtx, RV, CV);
+        float bl[16];
+        for (int e = 0; e < 4; e++) {
+            bl[e * 4 + 0] = o.blend[e].fade;
+            bl[e * 4 + 1] = o.blend[e].gamma;
+            bl[e * 4 + 2] = o.blend[e].gain;
+            bl[e * 4 + 3] = o.blend[e].slope;
+        }
+        float ch[3] = { o.blend[0].chanR, o.blend[0].chanG, o.blend[0].chanB };
+        hookIpcPublishMesh(slot, total, &vtx[0].sx, 6, RV, CV, bl, ch, o.edges, o.deviceName.c_str());
+        slot++;
+    }
+}
+
+void Engine::buildMesh(OutputCtx& oc, const OutputCfg& cfg) {
+    std::vector<MeshVtx> vtx;
+    int RV = 0, CV = 0;
+    computeMeshVtxInto(cfg, vtx, RV, CV);
+    std::vector<uint32_t> idx;
+    idx.reserve((size_t)(RV - 1) * (CV - 1) * 6);
     for (int i = 0; i < RV - 1; i++)
         for (int j = 0; j < CV - 1; j++) {
             uint32_t a = (uint32_t)(i * CV + j), b = a + 1, c = a + CV, d = c + 1;

@@ -1679,26 +1679,31 @@ void setCalibrationMode(bool on) {
 }
 
 void toggleCalibration() {
+    bool mag = false;
     {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
-        if (g_cfg.engine == 1 && !g_calib.load()) {
-            // MAG mode has no mesh: warp/blend calibration is meaningless
-            setStatus(L"MAG engine has no drag points. For corner/mesh calibration pick "
-                      L"'Desktop Duplication' in the engine dropdown (then F3). "
-                      L"For desktop-level warping use Enable Desktop warping (Displays page).");
-            return;
-        }
+        mag = g_cfg.engine == 1;
     }
     if (g_calib.load()) {
         setCalibrationMode(false);
         setStatus(L"Calibration OFF.");
-    } else {
-        if (g_outWins.empty()) createOutputWindows();
-        setCalibrationMode(true);
-        setStatus(g_inplace.load()
-            ? L"Calibration ON: click-through bypassed, drag the points directly. Esc to exit."
-            : L"Calibration ON: drag green points (warp), F10 = blend mode, Esc = exit.");
+        return;
     }
+    if (mag) {
+        // MAG hosts are DWM-composited layered windows: drag points cannot be
+        // drawn onto them. But the correction grid is engine-level config, so
+        // the workflow is: calibrate once under Desktop Duplication, then
+        // switch back - the DWM hook applies the same mesh in MAG mode.
+        setStatus(L"Drag points need the Desktop Duplication engine. The correction grid "
+                  L"is shared: calibrate there once, switch back to MAG - the DWM hook "
+                  L"(Enable Desktop warping) applies the same mesh.");
+        return;
+    }
+    if (g_outWins.empty()) createOutputWindows();
+    setCalibrationMode(true);
+    setStatus(g_inplace.load()
+        ? L"Calibration ON: click-through bypassed, drag the points directly. Esc to exit."
+        : L"Calibration ON: drag green points (warp), F10 = blend mode, Esc = exit.");
 }
 
 void switchSubModeAll() {
@@ -4890,6 +4895,20 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (wp == 1 && g_statusInfo) {
             refreshStatusBar();
             refreshHookInfo();   // DWM hook line (pass counter is live)
+            // engine-agnostic hook mesh: MAG has no render loop, so the UI
+            // timer republishes whenever the config revision moved. DXGI mode
+            // publishes inside buildMesh (per frame) and is skipped here.
+            static int s_hookRev = -1;
+            bool magDirty = false;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                magDirty = (g_cfg.engine == 1) && s_hookRev != (int)g_rev.load();
+            }
+            if (magDirty) {
+                publishHookMeshes();   // takes g_cfgMutex itself
+                std::lock_guard<std::mutex> lk2(g_cfgMutex);
+                s_hookRev = (int)g_rev.load();
+            }
             // optional perf history: one snapshot line every 10 s so a real
             // machine run leaves a timing trail in debug.log
             static unsigned perfTick = 0;

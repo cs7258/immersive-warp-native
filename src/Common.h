@@ -272,6 +272,7 @@ int hookIpcMeshVerts();        // summed grid vertex count across active slots
 int hookIpcMeshRev();          // publish revision (bumps on every rebuild)
 void hookIpcSetOverlay(bool on);  // DLL-side mesh-line overlay (calibration)
 bool hookIpcOverlay();            // overlay flag as last set
+void publishHookMeshes();         // engine-agnostic mesh publish (MAG: 1s timer)
 
 // windows
 void registerAndCreateControlWindow(HINSTANCE hInst);
