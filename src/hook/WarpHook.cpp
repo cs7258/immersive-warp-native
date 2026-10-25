@@ -397,6 +397,7 @@ static bool ensureResources(HookCtx& c, ID3D11Texture2D* bb, const IWNHookCfg& c
 
 // ---------------------------------------------------------------- hooks
 typedef HRESULT(WINAPI* PFN_Present)(IDXGISwapChain*, UINT, UINT);
+typedef HRESULT(WINAPI* PFN_Present1)(IDXGISwapChain1*, UINT, UINT, DXGI_PRESENT_PARAMETERS*);
 typedef HRESULT(WINAPI* PFN_CreateSwapChain)(IUnknown*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
 typedef HRESULT(WINAPI* PFN_CreateSwapChainForHwnd)(IUnknown*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*,
@@ -415,7 +416,7 @@ static volatile LONG g_swapCount = 0;
 // process - including swapchains created BEFORE the DLL was injected (this
 // is exactly what makes the dwm.exe injection work: its per-monitor
 // swapchains are already alive at attach time).
-struct VtEntry { void** vt; PFN_Present orig; IDXGISwapChain* probe; bool hasP1; PFN_Present orig1; };
+struct VtEntry { void** vt; PFN_Present orig; IDXGISwapChain* probe; bool hasP1; PFN_Present1 orig1; };
 static VtEntry g_vts[8];
 static int g_vtCount = 0;
 static std::mutex g_vtMutex;
@@ -433,11 +434,11 @@ static void patchOneVt(void** vt, bool hasP1) {
     if (!VirtualProtect(&vt[8], sizeof(void*), PAGE_READWRITE, &old)) return;
     PFN_Present orig = (PFN_Present)vt[8];
     *(void* volatile*)&vt[8] = (void*)&HookPresent;
-    PFN_Present orig1 = nullptr;
+    PFN_Present1 orig1 = nullptr;
     if (hasP1) {
         DWORD old1{};
         if (VirtualProtect(&vt[9], sizeof(void*), PAGE_READWRITE, &old1)) {
-            orig1 = (PFN_Present)vt[9];
+            orig1 = (PFN_Present1)vt[9];
             *(void* volatile*)&vt[9] = (void*)&HookPresent1;
             VirtualProtect(&vt[9], sizeof(void*), old1, &old1);
         }
@@ -555,7 +556,7 @@ static PFN_Present origPresentFor(IDXGISwapChain* sw) {
     return e ? e->orig : nullptr;
 }
 
-static PFN_Present origPresent1For(IDXGISwapChain* sw) {
+static PFN_Present1 origPresent1For(IDXGISwapChain* sw) {
     void** vt = *(void***)sw;
     std::lock_guard<std::mutex> lk(g_vtMutex);
     VtEntry* e = findVt(vt);
@@ -767,7 +768,7 @@ static LONG WINAPI excFilter(PEXCEPTION_POINTERS ep) {
 // probes' vtables detours the existing instances as well. The probes stay
 // alive (8x8, never presented) so the watchdog can verify the object vptr.
 static void createSelfProbes() {
-    HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOOWNERZORDER,
+    HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                               L"STATIC", L"IWNprobe", WS_POPUP,
                               0, 0, 8, 8, nullptr, nullptr, nullptr, nullptr);
     if (!hw) { hookLog("selfprobe: window failed"); return; }
