@@ -22,9 +22,14 @@ cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE ^
 if errorlevel 1 goto FAIL
 
 REM ---- scanout pipeline Phase 1: hook DLL + injector ----
-REM /MT: WarpHook.dll must load inside dwm.exe (SYSTEM) - no VC redist deps,
-REM LoadLibraryW there fails if vcruntime140/msvcp140 cannot be resolved.
-cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /MT /DUNICODE /D_UNICODE /LD ^
+REM /MD (default CRT): manual-mapped into dwm.exe. The static CRT (/MT) baked
+REM a TLS directory into the DLL, and a manual-mapped image gets no loader TLS
+REM registration - CRT init died before DllMain (round 28, measured). With the
+REM dynamic CRT the TLS lives in vcruntime140.dll (MS-signed, injectInto
+REM remote-LoadLibrary's it fine) and the DLL itself has no TLS directory.
+REM dwm still rejects LoadLibraryW of the unsigned DLL itself (kernel CI);
+REM the injector falls back to manual mapping and resolves vcruntime140 there.
+cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE /LD ^
   src\hook\WarpHook.cpp ^
   /Fe:build\WarpHook.dll /Fo:build\ ^
   /link /SUBSYSTEM:WINDOWS d3d11.lib dxgi.lib d3dcompiler.lib kernel32.lib user32.lib
