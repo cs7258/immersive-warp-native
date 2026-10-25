@@ -356,6 +356,8 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
             }
         }
     }
+    dbgLogLine("mm: entry rva=" + std::to_string(entryRva) + " (pe entry " +
+               std::to_string(nt->OptionalHeader.AddressOfEntryPoint) + ")");
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     FARPROC aft = ntdll ? GetProcAddress(ntdll, "RtlAddFunctionTable") : nullptr;
     ULONGLONG table = 0, count = 0;
