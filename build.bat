@@ -29,7 +29,7 @@ REM dynamic CRT the TLS lives in vcruntime140.dll (MS-signed, injectInto
 REM remote-LoadLibrary's it fine) and the DLL itself has no TLS directory.
 REM dwm still rejects LoadLibraryW of the unsigned DLL itself (kernel CI);
 REM the injector falls back to manual mapping and resolves vcruntime140 there.
-cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /DUNICODE /D_UNICODE /LD ^
+cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W3 /MD /DUNICODE /D_UNICODE /LD ^
   src\hook\WarpHook.cpp ^
   /Fe:build\WarpHook.dll /Fo:build\ ^
   /link /SUBSYSTEM:WINDOWS d3d11.lib dxgi.lib d3dcompiler.lib kernel32.lib user32.lib
