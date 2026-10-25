@@ -65,28 +65,90 @@ bool isElevated() {
     return ok && el.TokenIsElevated;
 }
 
+// Remote thread body: LoadLibraryW(path) then store BOTH the returned module
+// and GetLastError() back to the result buffer. A plain CreateRemoteThread on
+// LoadLibraryW only reports "returned NULL" - the real rejection reason
+// (missing dep 126, signature policy 577, DllMain failure 1114 ...) dies with
+// the loader inside the target. Shellcode (x64, all absolutes encoded at
+// build time, nothing position-relative):
+//   sub rsp,0x28
+//   movabs rcx,&path ; movabs rax,LoadLibraryW ; call rax
+//   movabs r15,&result ; mov [r15],rax          ; module
+//   movabs rax,GetLastError ; call rax
+//   mov [r15+8],eax ; xor eax,eax ; add rsp,0x28 ; ret
 bool injectInto(HANDLE proc, const wchar_t* dllPath, std::string& err) {
-    const SIZE_T bytes = (lstrlenW(dllPath) + 1) * sizeof(wchar_t);
-    LPVOID remote = VirtualAllocEx(proc, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remote) { err = "VirtualAllocEx gle=" + std::to_string(GetLastError()); return false; }
-    if (!WriteProcessMemory(proc, remote, dllPath, bytes, nullptr)) {
-        err = "WriteProcessMemory gle=" + std::to_string(GetLastError()); return false;
-    }
+    const SIZE_T pathBytes = (lstrlenW(dllPath) + 1) * sizeof(wchar_t);
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     FARPROC loadlib = GetProcAddress(k32, "LoadLibraryW");
-    if (!loadlib) { err = "LoadLibraryW not found"; return false; }
+    FARPROC gleFn = GetProcAddress(k32, "GetLastError");
+    if (!loadlib || !gleFn) { err = "kernel32 lookup failed"; return false; }
+
+    // one remote block: [shellcode 64B pad][path][result 16B]
+    static const BYTE sc[] = {
+        0x48,0x83,0xEC,0x28,                                    // sub rsp,0x28
+        0x48,0xB9, 0,0,0,0,0,0,0,0,                             // movabs rcx,path
+        0x48,0xB8, 0,0,0,0,0,0,0,0,                             // movabs rax,loadlib
+        0xFF,0xD0,                                              // call rax
+        0x49,0xBF, 0,0,0,0,0,0,0,0,                             // movabs r15,result
+        0x49,0x89,0x07,                                         // mov [r15],rax
+        0x48,0xB8, 0,0,0,0,0,0,0,0,                             // movabs rax,gle
+        0xFF,0xD0,                                              // call rax
+        0x41,0x89,0x47,0x08,                                    // mov [r15+8],eax
+        0x31,0xC0,                                              // xor eax,eax
+        0x48,0x83,0xC4,0x28,                                    // add rsp,0x28
+        0xC3                                                    // ret
+    };
+    const SIZE_T scOff = 0;
+    const SIZE_T pathOff = 64;                      // past shellcode
+    const SIZE_T resOff = pathOff + pathBytes;      // 16-byte result
+    const SIZE_T total = resOff + 16;
+
+    BYTE* block = (BYTE*)VirtualAllocEx(proc, nullptr, total,
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!block) { err = "VirtualAllocEx gle=" + std::to_string(GetLastError()); return false; }
+    BYTE local[64 + 520 + 16] = {};
+    memcpy(local + scOff, sc, sizeof(sc));
+    memcpy(local + pathOff, dllPath, pathBytes);
+
+    // patch the three absolutes inside the shellcode
+    ULONGLONG pathR = (ULONGLONG)((uintptr_t)block + pathOff);
+    ULONGLONG resR  = (ULONGLONG)((uintptr_t)block + resOff);
+    memcpy(local + 6,  &pathR, 8);
+    memcpy(local + 16, &loadlib, 8);
+    memcpy(local + 30, &resR, 8);
+    memcpy(local + 40, &gleFn, 8);
+
+    if (!WriteProcessMemory(proc, block, local, total, nullptr)) {
+        err = "WriteProcessMemory gle=" + std::to_string(GetLastError());
+        VirtualFreeEx(proc, block, 0, MEM_RELEASE);
+        return false;
+    }
     HANDLE th = CreateRemoteThread(proc, nullptr, 0,
-                                   (LPTHREAD_START_ROUTINE)loadlib, remote, 0, nullptr);
-    if (!th) { err = "CreateRemoteThread gle=" + std::to_string(GetLastError()); return false; }
+                                   (LPTHREAD_START_ROUTINE)(block + scOff), nullptr, 0, nullptr);
+    if (!th) {
+        err = "CreateRemoteThread gle=" + std::to_string(GetLastError());
+        VirtualFreeEx(proc, block, 0, MEM_RELEASE);
+        return false;
+    }
     WaitForSingleObject(th, 10000);
-    DWORD code = 0;
-    GetExitCodeThread(th, &code);
     CloseHandle(th);
-    VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-    // x64 module handles have the low bits zeroed in the exit code; a zero
-    // result means LoadLibraryW failed (missing file / bad arch / blocked).
-    if (!code) { err = "LoadLibraryW returned NULL (dll not loaded)"; return false; }
-    return true;
+    ULONGLONG result[2] = {};
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(proc, block + resOff, result, sizeof(result), &got) || got != sizeof(result)) {
+        err = "ReadProcessMemory(result) gle=" + std::to_string(GetLastError());
+        VirtualFreeEx(proc, block, 0, MEM_RELEASE);
+        return false;
+    }
+    VirtualFreeEx(proc, block, 0, MEM_RELEASE);
+    if (result[0]) return true;   // HMODULE - loaded
+    DWORD gle = (DWORD)result[1];
+    // translate the loader's real verdict for fast diagnosis
+    const char* hint = "";
+    if (gle == 126) hint = " (ERROR_MOD_NOT_FOUND: a dependency is missing in the target)";
+    else if (gle == 577) hint = " (ERROR_INVALID_IMAGE_HASH: signature policy - dwm only loads MS-signed DLLs)";
+    else if (gle == 1114) hint = " (ERROR_DLL_INIT_FAILED: our DllMain failed in the target)";
+    err = "LoadLibraryW in target failed gle=" + std::to_string(gle) + hint;
+    return false;
 }
 
 std::wstring hookDllDefault() {
