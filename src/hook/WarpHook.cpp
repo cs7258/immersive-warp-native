@@ -23,6 +23,8 @@
 
 // forward decls (vtable patchers reference them)
 static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags);
+static HRESULT WINAPI HookPresent1(IDXGISwapChain1* sw, UINT sync, UINT flags,
+                                   DXGI_PRESENT_PARAMETERS* pp);
 static HRESULT WINAPI HookCreateSwapChain(IUnknown* fac, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out);
 static HRESULT WINAPI HookCreateSwapChainForHwnd(IUnknown* fac, IUnknown* dev, HWND hwnd,
                                                  const DXGI_SWAP_CHAIN_DESC1* d1,
@@ -406,36 +408,75 @@ static volatile LONG g_swapCount = 0;
 
 // Bitblt and flip-model swapchains are distinct implementation classes with
 // distinct vtables - patch each vtable once and remember its original Present.
-struct VtEntry { void** vt; PFN_Present orig; IDXGISwapChain* probe; };
-static VtEntry g_vts[4];
+// DWM (and any flip-model app) may call Present through IDXGISwapChain1+'s
+// vtable (Present1 lives in slot 9 there), so every swapchain object's
+// IDXGISwapChain1 subobject vtable is patched too. vtables are shared per
+// dxgi.dll implementation class, so one patch covers every instance in the
+// process - including swapchains created BEFORE the DLL was injected (this
+// is exactly what makes the dwm.exe injection work: its per-monitor
+// swapchains are already alive at attach time).
+struct VtEntry { void** vt; PFN_Present orig; IDXGISwapChain* probe; bool hasP1; PFN_Present orig1; };
+static VtEntry g_vts[8];
 static int g_vtCount = 0;
 static std::mutex g_vtMutex;
 
-static PFN_Present patchSwapchainVt(IDXGISwapChain* sw) {
-    void** vt = *(void***)sw;
-    std::lock_guard<std::mutex> lk(g_vtMutex);
+// caller holds g_vtMutex
+static VtEntry* findVt(void** vt) {
     for (int i = 0; i < g_vtCount; i++)
-        if (g_vts[i].vt == vt) return g_vts[i].orig;
-    if (g_vtCount >= 4) return nullptr;
+        if (g_vts[i].vt == vt) return &g_vts[i];
+    return nullptr;
+}
+
+static void patchOneVt(void** vt, bool hasP1) {
+    if (g_vtCount >= 8) return;
     DWORD old{};
-    if (!VirtualProtect(&vt[8], sizeof(void*), PAGE_READWRITE, &old)) return nullptr;
+    if (!VirtualProtect(&vt[8], sizeof(void*), PAGE_READWRITE, &old)) return;
     PFN_Present orig = (PFN_Present)vt[8];
     *(void* volatile*)&vt[8] = (void*)&HookPresent;
+    PFN_Present orig1 = nullptr;
+    if (hasP1) {
+        DWORD old1{};
+        if (VirtualProtect(&vt[9], sizeof(void*), PAGE_READWRITE, &old1)) {
+            orig1 = (PFN_Present)vt[9];
+            *(void* volatile*)&vt[9] = (void*)&HookPresent1;
+            VirtualProtect(&vt[9], sizeof(void*), old1, &old1);
+        }
+    }
     VirtualProtect(&vt[8], sizeof(void*), old, &old);
     // volatile readback - the compiler must not fold this into the store
     void* now = *(void* volatile*)&vt[8];
     if (now != (void*)&HookPresent) {
         hookLog("Present patch VERIFY FAILED - readback differs");
-        return orig;
+        return;
     }
     char buf[96];
-    wsprintfA(buf, "Present vtable patched (vt=%p)", (void*)vt);
+    wsprintfA(buf, "Present vtable patched (vt=%p p1=%d)", (void*)vt, hasP1 ? 1 : 0);
     hookLog(buf);
     g_vts[g_vtCount].vt = vt;
     g_vts[g_vtCount].orig = orig;
-    g_vts[g_vtCount].probe = sw;
+    g_vts[g_vtCount].probe = nullptr;
+    g_vts[g_vtCount].hasP1 = hasP1;
+    g_vts[g_vtCount].orig1 = orig1;
     g_vtCount++;
-    return orig;
+}
+
+static PFN_Present patchSwapchainVt(IDXGISwapChain* sw) {
+    void** vt = *(void***)sw;
+    std::lock_guard<std::mutex> lk(g_vtMutex);
+    VtEntry* e = findVt(vt);
+    if (e) return e->orig;
+    patchOneVt(vt, false);
+    e = findVt(vt);
+    if (!e) return nullptr;
+    e->probe = sw;
+    // the IDXGISwapChain1 subobject vtable (Present1 = slot 9)
+    IDXGISwapChain1* sw1 = nullptr;
+    if (SUCCEEDED(sw->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sw1)) && sw1) {
+        void** vt1 = *(void***)sw1;
+        if (!findVt(vt1)) patchOneVt(vt1, true);
+        sw1->Release();
+    }
+    return e->orig;
 }
 
 static void patchSlot(void** vt, int idx, void* detour, void** origSave, const char* tag) {
@@ -510,26 +551,19 @@ static HRESULT WINAPI HookCreateSwapChainForHwnd(IUnknown* fac, IUnknown* dev, H
 static PFN_Present origPresentFor(IDXGISwapChain* sw) {
     void** vt = *(void***)sw;
     std::lock_guard<std::mutex> lk(g_vtMutex);
-    for (int i = 0; i < g_vtCount; i++)
-        if (g_vts[i].vt == vt) return g_vts[i].orig;
-    return nullptr;
+    VtEntry* e = findVt(vt);
+    return e ? e->orig : nullptr;
 }
 
-static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
-    // telemetry: count every detour hit in the shared mapping (the log file
-    // proved unreliable from the app's render thread). Interlocked so a
-    // multi-swapchain app stays consistent.
-    IWNHookCfg* cfgT = ensureCfg();
-    if (cfgT) InterlockedIncrement((volatile LONG*)&cfgT->reserved[0]);
-    static bool firstCallLogged = false;
-    if (!firstCallLogged) {
-        firstCallLogged = true;
-        hookLog("HookPresent invoked (first call)");
-    }
-    // PRESENT_TEST calls (our own probe) stop here: forwarding them would
-    // race the app's real Present on the same swapchain and crash DXGI.
-    if (flags & DXGI_PRESENT_TEST) return S_OK;
-    PFN_Present orig = origPresentFor(sw);
+static PFN_Present origPresent1For(IDXGISwapChain* sw) {
+    void** vt = *(void***)sw;
+    std::lock_guard<std::mutex> lk(g_vtMutex);
+    VtEntry* e = findVt(vt);
+    return (e && e->hasP1) ? e->orig1 : nullptr;
+}
+
+// the whole warp-in-place body, shared by Present and Present1 detours
+static void doWarpPass(IDXGISwapChain* sw) {
     IWNHookCfg* cfg = ensureCfg();
     // per-output slot selection (v3 multi-mesh): match the swapchain's
     // containing monitor against the published slots; a slot with an empty
@@ -557,7 +591,7 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
         if (slotIdx >= 0) oslot = &cfg->outs[slotIdx];
         monitorOk = oslot != nullptr;   // unmatched monitor = clean passthrough
     }
-    if (cfg && cfg->enabled && orig && sw && monitorOk) {
+    if (cfg && cfg->enabled && sw && monitorOk) {
         static bool firstPassLogged = false;
         if (!firstPassLogged) {
             firstPassLogged = true;
@@ -610,8 +644,48 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
             bb->Release();
         }
     }
+}
+
+static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
+    // telemetry: count every detour hit in the shared mapping (the log file
+    // proved unreliable from the app's render thread). Interlocked so a
+    // multi-swapchain app stays consistent.
+    IWNHookCfg* cfgT = ensureCfg();
+    if (cfgT) InterlockedIncrement((volatile LONG*)&cfgT->reserved[0]);
+    static bool firstCallLogged = false;
+    if (!firstCallLogged) {
+        firstCallLogged = true;
+        hookLog("HookPresent invoked (first call)");
+    }
+    // PRESENT_TEST calls (our own probe) stop here: forwarding them would
+    // race the app's real Present on the same swapchain and crash DXGI.
+    if (flags & DXGI_PRESENT_TEST) return S_OK;
+    doWarpPass(sw);
+    PFN_Present orig = origPresentFor(sw);
     if (!orig) return S_OK;   // call must come from a patched vtable; never happens
     return orig(sw, sync, flags);
+}
+
+// flip-model apps and dwm.exe may present through IDXGISwapChain1::Present1
+// (slot 9 of the interface subobject vtable). Same warp body; the dirty-rect
+// parameters are ignored (we redraw the full backbuffer anyway) and the call
+// is forwarded to the original Present1.
+static HRESULT WINAPI HookPresent1(IDXGISwapChain1* sw1, UINT sync, UINT flags,
+                                   DXGI_PRESENT_PARAMETERS* pp) {
+    (void)pp;
+    IWNHookCfg* cfgT = ensureCfg();
+    if (cfgT) InterlockedIncrement((volatile LONG*)&cfgT->reserved[0]);
+    static bool firstCallLogged = false;
+    if (!firstCallLogged) {
+        firstCallLogged = true;
+        hookLog("HookPresent1 invoked (first call - flip-model path)");
+    }
+    if (flags & DXGI_PRESENT_TEST) return S_OK;
+    IDXGISwapChain* sw = sw1;   // same object, base interface
+    doWarpPass(sw);
+    PFN_Present orig1 = origPresent1For(sw);
+    if (!orig1) return S_OK;
+    return orig1(sw1, sync, flags, pp);
 }
 
 // ---------------------------------------------------------------- crash telemetry
@@ -685,6 +759,86 @@ static LONG WINAPI excFilter(PEXCEPTION_POINTERS ep) {
 }
 
 // ---------------------------------------------------------------- init thread
+// Self-probes: create tiny swapchains of BOTH implementation families
+// (legacy bitblt + flip-model) and patch their vtables. This is what makes
+// the dwm.exe path work: dwm.exe's per-monitor swapchains already exist at
+// injection time and will never be created again through the factory hooks.
+// dxgi.dll vtables are shared per implementation class, so patching our
+// probes' vtables detours the existing instances as well. The probes stay
+// alive (8x8, never presented) so the watchdog can verify the object vptr.
+static void createSelfProbes() {
+    HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOOWNERZORDER,
+                              L"STATIC", L"IWNprobe", WS_POPUP,
+                              0, 0, 8, 8, nullptr, nullptr, nullptr, nullptr);
+    if (!hw) { hookLog("selfprobe: window failed"); return; }
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    D3D_FEATURE_LEVEL fl{};
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                   nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx);
+    if (FAILED(hr) || !dev) {
+        char buf[96];
+        wsprintfA(buf, "selfprobe: D3D11CreateDevice failed hr=0x%08X", (unsigned)hr);
+        hookLog(buf);
+        return;
+    }
+    IDXGIDevice* dxdev = nullptr;
+    IDXGIFactory2* fac = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxdev)) && dxdev) {
+        IDXGIAdapter* ad = nullptr;
+        if (SUCCEEDED(dxdev->GetAdapter(&ad)) && ad) {
+            if (FAILED(ad->GetParent(__uuidof(IDXGIFactory2), (void**)&fac)) || !fac)
+                hookLog("selfprobe: factory not found");
+            ad->Release();
+        }
+        dxdev->Release();
+    }
+    if (fac) {
+        // legacy bitblt probe (IDXGISwapChain class)
+        DXGI_SWAP_CHAIN_DESC sd{};
+        sd.BufferDesc.Width = 8; sd.BufferDesc.Height = 8;
+        sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = 2;
+        sd.OutputWindow = hw;
+        sd.Windowed = TRUE;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        IDXGISwapChain* sc = nullptr;
+        if (SUCCEEDED(fac->CreateSwapChain(dev, &sd, &sc)) && sc) {
+            patchSwapchainVt(sc);
+            // keep alive for the watchdog; leak one static ref on purpose
+            static IDXGISwapChain* s_keep1 = sc;
+            (void)s_keep1;
+            hookLog("selfprobe: bitblt probe created");
+        } else {
+            hookLog("selfprobe: bitblt probe failed");
+        }
+        // flip-model probe (IDXGISwapChain1 class, the dwm.exe family)
+        DXGI_SWAP_CHAIN_DESC1 d1{};
+        d1.Width = 8; d1.Height = 8;
+        d1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d1.SampleDesc.Count = 1;
+        d1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        d1.BufferCount = 2;
+        d1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        IDXGISwapChain1* sc1 = nullptr;
+        if (SUCCEEDED(fac->CreateSwapChainForHwnd(dev, hw, &d1, nullptr, nullptr, &sc1)) && sc1) {
+            patchSwapchainVt(sc1);
+            static IDXGISwapChain1* s_keep2 = sc1;
+            (void)s_keep2;
+            hookLog("selfprobe: flip probe created");
+        } else {
+            hookLog("selfprobe: flip probe failed");
+        }
+        fac->Release();
+    }
+    if (ctx) ctx->Release();
+    dev->Release();
+    // window stays around (tiny, hidden); DestroyWindow from this thread is
+    // fine but the swapchains reference it - keep it alive instead
+}
+
 static DWORD WINAPI initThread(LPVOID) {
     // wait for dxgi to be loaded by the host process (poll 50 ms)
     for (int i = 0; i < 600; i++) {
@@ -697,6 +851,7 @@ static DWORD WINAPI initThread(LPVOID) {
         hookLog(buf);
     }
     installFactoryHooks();
+    createSelfProbes();
     // open the host mapping eagerly - not lazily inside Present - so a
     // mapping failure is visible in the log with a real error code
     if (ensureCfg()) {
@@ -740,9 +895,10 @@ static DWORD WINAPI initThread(LPVOID) {
             void** vt = g_vts[i].vt;
             // re-read the OBJECT's vptr: if dxgi swapped the vtable after
             // creation, the object no longer dispatches through our patch
+            // (only entries with a live probe can be checked)
             void* objVptr = g_vts[i].probe ? *(void* volatile*)g_vts[i].probe : nullptr;
             static bool objVptrLogged = false;
-            if (objVptr != vt) {
+            if (g_vts[i].probe && objVptr != vt) {
                 char buf[128];
                 wsprintfA(buf, "OBJECT VPTR CHANGED: obj=%p now=%p patched=%p",
                           (void*)g_vts[i].probe, objVptr, (void*)vt);
@@ -762,6 +918,16 @@ static DWORD WINAPI initThread(LPVOID) {
                     char buf[96];
                     wsprintfA(buf, "vtable reverted (vt=%p) - repatched", (void*)vt);
                     hookLog(buf);
+                }
+            }
+            // Present1 slot (flip-model family)
+            if (g_vts[i].hasP1 && g_vts[i].orig1 &&
+                *(void* volatile*)&vt[9] != (void*)&HookPresent1) {
+                DWORD old{};
+                if (VirtualProtect(&vt[9], sizeof(void*), PAGE_READWRITE, &old)) {
+                    *(void* volatile*)&vt[9] = (void*)&HookPresent1;
+                    VirtualProtect(&vt[9], sizeof(void*), old, &old);
+                    hookLog("Present1 slot reverted - repatched");
                 }
             }
         }

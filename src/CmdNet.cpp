@@ -812,7 +812,8 @@ static std::string dispatch(std::string line) {
             unsigned long pid = strtoul(pidTok.c_str(), nullptr, 10);
             return injectPid(pid, dllTok.empty() ? std::wstring() : toWide(dllTok));
         }
-        return "ERR INJECT (mode: LAUNCH|PID)\n";
+        if (mode == "DWM") return injectDwm();
+        return "ERR INJECT (mode: LAUNCH|PID|DWM)\n";
     }
 
     // Profiles (original Profiles-page parity): watcher auto-injects
@@ -1032,6 +1033,13 @@ static std::string dispatch(std::string line) {
             if (val == "1" || val == "ON" || val == "TRUE") on = true;
             else if (val == "0" || val == "OFF" || val == "FALSE") on = false;
             else return "ERR SET hook (on|off)\n";
+            if (on) {
+                // desktop warp needs the hook inside dwm.exe; best effort on
+                // the socket thread - failure just logs (manual INJECT DWM
+                // gives the full error text)
+                std::string r = injectDwm();
+                dbgLogLine("cmdnet: auto inject dwm -> " + r);
+            }
             hookIpcSet(on, nullptr, 0);
             return std::string("OK hook=") + (on ? "on" : "off") + "\n";
         }

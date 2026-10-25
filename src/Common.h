@@ -340,6 +340,9 @@ std::string cmdnetExecute(const std::string& line); // run a CMDNET line program
 std::string injectLaunch(const std::wstring& exe, const std::wstring& args,
                          const std::wstring& dllIn);
 std::string injectPid(unsigned long pid, const std::wstring& dllIn);
+// INJECT DWM: attach WarpHook.dll to dwm.exe (real desktop-level warping).
+// Needs elevation (SeDebugPrivilege); reports ERR otherwise.
+std::string injectDwm();
 // Profile watcher: auto-inject into processes matching g_cfg.profExe rules
 void profilerStart();
 void profilerStop();

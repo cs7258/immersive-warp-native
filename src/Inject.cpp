@@ -17,9 +17,29 @@
 
 #include "Common.h"
 #include <windows.h>
+#include <tlhelp32.h>
 #include <string>
+#include <set>
 
 namespace {
+
+// dwm.exe runs at System integrity: without SeDebugPrivilege OpenProcess
+// fails with ERROR_ACCESS_DENIED. Best effort - report clearly on failure.
+bool enableDebugPriv() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
+        return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid)) {
+        CloseHandle(tok); return false;
+    }
+    AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    BOOL ok = (GetLastError() == ERROR_SUCCESS);
+    CloseHandle(tok);
+    return ok != FALSE;
+}
 
 bool injectInto(HANDLE proc, const wchar_t* dllPath, std::string& err) {
     const SIZE_T bytes = (lstrlenW(dllPath) + 1) * sizeof(wchar_t);
@@ -134,4 +154,59 @@ std::string injectPid(unsigned long pid, const std::wstring& dllIn) {
     }
     dbgLogLine("inject: pid ok pid=" + std::to_string(pid) + " dll=" + toNarrow(dll));
     return "OK INJECT pid=" + std::to_string(pid) + "\n";
+}
+
+// INJECT DWM: attach to every dwm.exe in this session (or all sessions).
+// This is the real desktop-warping path: the desktop is composed by dwm.exe,
+// so its existing per-monitor swapchains must carry the hook. dxgi.dll
+// swapchain vtables are class-level shared, so WarpHook.dll's self-probe
+// patch covers swapchains that already existed before the injection.
+std::string injectDwm() {
+    enableDebugPriv();
+    std::wstring dll = hookDllDefault();
+    wchar_t full[MAX_PATH] = {};
+    if (!GetFullPathNameW(dll.c_str(), MAX_PATH, full, nullptr) ||
+        GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES)
+        return "ERR INJECT dwm (WarpHook.dll not found next to exe)\n";
+
+    static std::set<DWORD> g_done;   // LoadLibraryW twice = refcount only
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return "ERR INJECT dwm (snapshot failed)\n";
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    int found = 0, ok = 0;
+    std::string pids, errs;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (lstrcmpiW(pe.szExeFile, L"dwm.exe") != 0) continue;
+            found++;
+            DWORD pid = pe.th32ProcessID;
+            if (g_done.count(pid)) { pids += std::to_string(pid) + "(cached) "; ok++; continue; }
+            HANDLE proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                                      PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+                                      FALSE, pid);
+            if (!proc) {
+                errs += "pid=" + std::to_string(pid) + " gle=" +
+                        std::to_string(GetLastError()) + "; ";
+                continue;
+            }
+            std::string err;
+            if (injectInto(proc, full, err)) {
+                g_done.insert(pid);
+                pids += std::to_string(pid) + " ";
+                ok++;
+            } else {
+                errs += "pid=" + std::to_string(pid) + " (" + err + "); ";
+            }
+            CloseHandle(proc);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    if (!found) return "ERR INJECT dwm (no dwm.exe process found)\n";
+    dbgLogLine("inject: dwm found=" + std::to_string(found) + " ok=" + std::to_string(ok) +
+               (errs.empty() ? std::string() : " errs=" + errs));
+    if (!ok)
+        return "ERR INJECT dwm (" + errs + "run as administrator?)\n";
+    return "OK INJECT dwm pids=" + pids + "\n";
 }
