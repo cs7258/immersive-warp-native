@@ -42,3 +42,49 @@ jobs:
           gh release create latest build/ImmersiveWarpNative.exe build/WarpHook.dll build/IWNInject.exe build/IWND3DProbe.exe \
             --title "latest" \
             --notes "commit ${{ github.sha }} · $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # P2b kernel helper (IWNPPL.sys): strips PPL protection from dwm.exe.
+  # Built with WDK NuGet headers/libs + runner MSVC, test-signed with a
+  # self-signed cert (target machine runs testsigning mode).
+  driver:
+    runs-on: windows-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install WDK NuGet package
+        shell: cmd
+        run: |
+          where nuget >nul 2>&1 || curl -L -o nuget.exe https://dist.nuget.org/win-x86-commandline/latest/nuget.exe
+          nuget install Microsoft.Windows.WDK.x64 -Version 10.0.26100.6584 -OutputDirectory wdkpkg -ExcludeVersion -NonInteractive
+
+      - name: Build IWNPPL.sys
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\Common7\Tools\VsDevCmd.bat" -arch=x64 -no_logo
+          powershell -NoProfile -ExecutionPolicy Bypass -File driver\build-driver.ps1
+
+      - name: Test-sign driver
+        shell: powershell
+        run: driver\sign-driver.ps1
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IWNPPL-driver
+          path: |
+            driver/build/IWNPPL.sys
+            driver/build/IWNTestSigning.cer
+          if-no-files-found: error
+
+      - name: Publish driver to Release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload latest driver/build/IWNPPL.sys driver/build/IWNTestSigning.cer --clobber
