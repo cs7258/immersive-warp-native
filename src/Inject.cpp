@@ -335,7 +335,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         return false;
     }
-    dbgLogLine("mm: image written, sc=" + std::to_string(sc.size()));
+    dbgLogLine("mm: image written");
 
     // final shellcode: register the image's exception table (x64 unwinding
     // needs it for manual-mapped images), then run DllMain(base, ATTACH, 0)
@@ -392,6 +392,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     const SIZE_T total = resOff + 16;
     // reuse the tail of the image allocation for the result buffer: simpler
     // to allocate a small exec block for the shellcode + a separate RW result
+    dbgLogLine("mm: shellcode built size=" + std::to_string(scSize));
     BYTE* scblock = (BYTE*)VirtualAllocEx(proc, nullptr, total + 64,
                                           MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!scblock) {
