@@ -110,13 +110,14 @@ bool injectInto(HANDLE proc, const wchar_t* dllPath, std::string& err) {
     memcpy(local + scOff, sc, sizeof(sc));
     memcpy(local + pathOff, dllPath, pathBytes);
 
-    // patch the three absolutes inside the shellcode
+    // patch the three absolutes inside the shellcode (offsets must match the
+    // byte table above: imm64 follows its 2-byte movabs prefix)
     ULONGLONG pathR = (ULONGLONG)((uintptr_t)block + pathOff);
     ULONGLONG resR  = (ULONGLONG)((uintptr_t)block + resOff);
     memcpy(local + 6,  &pathR, 8);
     memcpy(local + 16, &loadlib, 8);
-    memcpy(local + 30, &resR, 8);
-    memcpy(local + 40, &gleFn, 8);
+    memcpy(local + 28, &resR, 8);
+    memcpy(local + 41, &gleFn, 8);
 
     if (!WriteProcessMemory(proc, block, local, total, nullptr)) {
         err = "WriteProcessMemory gle=" + std::to_string(GetLastError());
