@@ -1683,7 +1683,9 @@ void toggleCalibration() {
         std::lock_guard<std::mutex> lk(g_cfgMutex);
         if (g_cfg.engine == 1 && !g_calib.load()) {
             // MAG mode has no mesh: warp/blend calibration is meaningless
-            setStatus(L"Calibration needs the Desktop Duplication engine (pick it in the engine dropdown).");
+            setStatus(L"MAG engine has no drag points. For corner/mesh calibration pick "
+                      L"'Desktop Duplication' in the engine dropdown (then F3). "
+                      L"For desktop-level warping use Enable Desktop warping (Displays page).");
             return;
         }
     }
@@ -1803,6 +1805,59 @@ void toggleWindowWarping() {
     refreshStatusBar();
 }
 
+// DWM hook live status line (Displays page). UI thread only.
+static HWND g_hookInfo = nullptr;
+void refreshHookInfo() {
+    if (!g_hookInfo) return;
+    if (!hookIpcEnabled()) {
+        SetWindowTextW(g_hookInfo, L"DWM hook: off (Enable Desktop warping to start)");
+        return;
+    }
+    wchar_t b[180];
+    _snwprintf_s(b, _TRUNCATE,
+        L"DWM hook: ON   outs=%d verts=%d rev=%d pass=%u%s",
+        hookIpcOutCount(), hookIpcMeshVerts(), hookIpcMeshRev(),
+        hookIpcPassCount(),
+        hookIpcPassCount() ? L"" : L"   (no Present seen - run Inject DWM as admin)");
+    SetWindowTextW(g_hookInfo, b);
+}
+
+// "Enable Desktop warping (DWM hook)" - the true desktop-level pipeline:
+// publish the enabled outputs' meshes to the hook IPC and flip the enable
+// flag; WarpHook.dll inside dwm.exe then rewrites every desktop frame.
+// The dwm.exe injection itself is best effort here (needs admin); the
+// Inject DWM button surfaces the full error text.
+void toggleDwmWarping() {
+    if (hookIpcEnabled()) {
+        hookIpcSet(false, nullptr, 0);
+        setStatus(L"DWM desktop warping OFF.");
+        refreshHookInfo();
+        return;
+    }
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        for (auto& o : g_cfg.outputs) if (o.enabled) { any = true; break; }
+    }
+    if (!any) {
+        setStatus(L"Enable at least one projector first (Displays page) - its mesh feeds the hook.");
+        return;
+    }
+    if (g_outWins.empty()) createOutputWindows();   // mesh publisher must be live
+    std::string r = injectDwm();                    // best effort, needs admin
+    bool injected = r.rfind("OK", 0) == 0;
+    dbgLogLine(std::string("ui: inject dwm -> ") + r);
+    hookIpcSet(true, nullptr, 0);
+    refreshHookInfo();
+    std::string line = r;
+    if (!line.empty() && line.back() == '\n') line.pop_back();
+    wchar_t m[160];
+    if (!MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, m, 160)) m[0] = L'\0';
+    std::wstring s = injected ? std::wstring(L"Desktop warping ON: ") + m
+                              : std::wstring(L"Hook ON, but DWM injection failed: ") + m;
+    setStatus(s.c_str());
+}
+
 // keep every in-place affordance in step: checkbox, View menu check mark
 // (the tray menu is rebuilt on every right-click, so it reads g_inplace live)
 static void invalidateToolbarToggles();     // fwd: syncInplaceUI calls it
@@ -1890,6 +1945,9 @@ void notifyOutputRaised() {
 #define IDC_PRESETLOAD 1029
 #define IDC_PRESETDEL  1030
 #define IDC_CBFPS     1053   // Settings page: output max-fps dropdown
+#define IDC_INJDWM    1054   // Displays page: inject WarpHook.dll into dwm.exe
+#define IDC_DWMWARP   1055   // Displays page: Enable Desktop warping (DWM hook)
+#define IDC_HOOKINFO  1056   // Displays page: DWM hook live status line
 #define IDC_CBTARGET   1031   // per-output command target dropdown (SET out=)
 #define IDC_TABS       1032   // main-console tab strip
 #define IDC_CKINPLACE  1033   // in-place overlay (fullscreen click-through)
@@ -3893,6 +3951,18 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             L"In-place overlay (fullscreen, click-through)",
             WS_CHILD | BS_AUTOCHECKBOX, 16, 386, 340, 24,
             hwnd, (HMENU)IDC_CKINPLACE, nullptr, nullptr));
+        // DWM desktop warping group: the true desktop-level pipeline. The
+        // button toggles the hook enable flag + best-effort dwm.exe
+        // injection; the status line repaints from the hook IPC every second.
+        add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Inject DWM (admin)",
+            WS_CHILD | BS_PUSHBUTTON, 16, 420, 200, 26,
+            hwnd, (HMENU)IDC_INJDWM, nullptr, nullptr));
+        add(PAGE_DISPLAYS, CreateWindowW(L"BUTTON", L"Enable Desktop warping (DWM hook)",
+            WS_CHILD | BS_PUSHBUTTON, 224, 420, 340, 26,
+            hwnd, (HMENU)IDC_DWMWARP, nullptr, nullptr));
+        add(PAGE_DISPLAYS, g_hookInfo = CreateWindowW(L"STATIC", L"DWM hook: off",
+            WS_CHILD | SS_LEFT, 16, 452, 660, 16,
+            hwnd, (HMENU)IDC_HOOKINFO, nullptr, nullptr));
         // output schematic: one dashed box per display at its real relative
         // position, orange for enabled projectors (owner-draw via WM_DRAWITEM)
         add(PAGE_DISPLAYS, g_schematic = CreateWindowW(L"STATIC", L"outputs",
@@ -4382,6 +4452,15 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         } else if (id == IDC_STOP && HIWORD(wp) == BN_CLICKED) {
             destroyOutputWindows();
             setStatus(L"Output stopped.");
+        } else if (id == IDC_INJDWM && HIWORD(wp) == BN_CLICKED) {
+            std::string r = injectDwm();
+            if (!r.empty() && r.back() == '\n') r.pop_back();
+            wchar_t m[160];
+            if (!MultiByteToWideChar(CP_UTF8, 0, r.c_str(), -1, m, 160)) m[0] = L'\0';
+            setStatus(m);
+            refreshHookInfo();
+        } else if (id == IDC_DWMWARP && HIWORD(wp) == BN_CLICKED) {
+            toggleDwmWarping();
         } else if (id == IDC_CALIB && HIWORD(wp) == BN_CLICKED) {
             if (g_outWins.empty()) createOutputWindows();
             toggleCalibration();
@@ -4810,6 +4889,7 @@ static LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         }
         if (wp == 1 && g_statusInfo) {
             refreshStatusBar();
+            refreshHookInfo();   // DWM hook line (pass counter is live)
             // optional perf history: one snapshot line every 10 s so a real
             // machine run leaves a timing trail in debug.log
             static unsigned perfTick = 0;

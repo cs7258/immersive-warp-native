@@ -299,7 +299,9 @@ void toggleCalibration();      // global hotkey F3: enter/exit calibration
 void switchSubModeAll();       // global hotkey F10: warp <-> blend mode, all outputs
 void cycleBlendEdges();        // global hotkey F12: cycle blended edges
 void toggleSnapshot();         // global hotkey Ctrl+F3: freeze / resume capture
-void toggleInplaceOverlay();   // global hotkey Ctrl+F9: in-place overlay safety switch
+void toggleInplaceOverlay();      // Ctrl+F9 / View menu / tray: click-through on/off
+void toggleDwmWarping();          // Enable Desktop warping: DWM hook on/off (UI)
+void refreshHookInfo();           // DWM hook status line repaint (UI thread)   // global hotkey Ctrl+F9: in-place overlay safety switch
 void toggleWindowWarping();    // global hotkey F4: start/stop outputs (Enabled flip)
 void loadPresetByIndex(int i); // global hotkey Ctrl+Shift+1..8: Nth preset by name (0-based)
 std::wstring enabledOutputsSignature(); // pipe-joined names of enabled outputs (Sets hot switching)
