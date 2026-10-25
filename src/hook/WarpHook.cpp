@@ -406,6 +406,10 @@ typedef HRESULT(WINAPI* PFN_CreateSwapChainForHwnd)(IUnknown*, IUnknown*, HWND, 
 static PFN_CreateSwapChain         g_origCreate = nullptr;
 static PFN_CreateSwapChainForHwnd  g_origCreateHwnd = nullptr;
 static volatile LONG g_swapCount = 0;
+// set while createSelfProbes is creating its own swapchains: those must NOT
+// log "swapchain hooked" or bump the counter - test scripts key on that line
+// meaning a real application swapchain was captured
+static volatile LONG g_inSelfProbe = 0;
 
 // Bitblt and flip-model swapchains are distinct implementation classes with
 // distinct vtables - patch each vtable once and remember its original Present.
@@ -523,7 +527,7 @@ static void installFactoryHooks() {
 static HRESULT WINAPI HookCreateSwapChain(IUnknown* fac, IUnknown* dev,
                                           DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
     HRESULT hr = g_origCreate(fac, dev, desc, out);
-    if (SUCCEEDED(hr) && out && *out) {
+    if (SUCCEEDED(hr) && out && *out && !g_inSelfProbe) {
         patchSwapchainVt(*out);
         LONG c = InterlockedIncrement(&g_swapCount);
         char buf[128];
@@ -539,7 +543,7 @@ static HRESULT WINAPI HookCreateSwapChainForHwnd(IUnknown* fac, IUnknown* dev, H
                                                  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fd,
                                                  IDXGIOutput* ign, IDXGISwapChain1** out) {
     HRESULT hr = g_origCreateHwnd(fac, dev, hwnd, d1, fd, ign, out);
-    if (SUCCEEDED(hr) && out && *out) {
+    if (SUCCEEDED(hr) && out && *out && !g_inSelfProbe) {
         patchSwapchainVt(*out);
         LONG c = InterlockedIncrement(&g_swapCount);
         char buf[96];
@@ -795,6 +799,7 @@ static void createSelfProbes() {
         dxdev->Release();
     }
     if (fac) {
+        InterlockedExchange(&g_inSelfProbe, 1);
         // legacy bitblt probe (IDXGISwapChain class)
         DXGI_SWAP_CHAIN_DESC sd{};
         sd.BufferDesc.Width = 8; sd.BufferDesc.Height = 8;
@@ -832,6 +837,7 @@ static void createSelfProbes() {
         } else {
             hookLog("selfprobe: flip probe failed");
         }
+        InterlockedExchange(&g_inSelfProbe, 0);
         fac->Release();
     }
     if (ctx) ctx->Release();
