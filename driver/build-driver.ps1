@@ -30,7 +30,7 @@ if ($LASTEXITCODE -ne 0) { throw "cl failed" }
 
 & link /nologo /OUT:"$root\build\IWNPPL.sys" /MACHINE:X64 `
     /SUBSYSTEM:NATIVE,10.00 /DRIVER /ENTRY:DriverEntry /NODEFAULTLIB `
-    /INCREMENTAL:NO /PDB:"$root\build\IWNPPL.pdb" `
+    /INCREMENTAL:NO /INTEGRITYCHECK /PDB:"$root\build\IWNPPL.pdb" `
     "$root\build\IWNPPL.obj" `
     (Join-Path $libPath "ntoskrnl.lib") `
     (Join-Path $libPath "hal.lib")
