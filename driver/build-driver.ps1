@@ -17,7 +17,8 @@ Write-Output ("km include : " + $kmInc)
 $libDir = Get-ChildItem -Path $pkg -Recurse -Filter ntoskrnl.lib |
     Where-Object { $_.FullName -match '\\km\\x64' } | Select-Object -First 1
 if (-not $libDir) { throw "ntoskrnl.lib (km/x64) not found" }
-Write-Output ("km lib     : " + $libDir.FullName)
+$libPath = $libDir.DirectoryName
+Write-Output ("km lib     : " + $libPath)
 
 New-Item -ItemType Directory -Force -Path (Join-Path $root "build") | Out-Null
 
@@ -31,8 +32,8 @@ if ($LASTEXITCODE -ne 0) { throw "cl failed" }
     /SUBSYSTEM:NATIVE,10.00 /DRIVER /ENTRY:DriverEntry /NODEFAULTLIB `
     /INCREMENTAL:NO /PDB:"$root\build\IWNPPL.pdb" `
     "$root\build\IWNPPL.obj" `
-    (Join-Path $libDir.FullName "ntoskrnl.lib") `
-    (Join-Path $libDir.FullName "hal.lib")
+    (Join-Path $libPath "ntoskrnl.lib") `
+    (Join-Path $libPath "hal.lib")
 if ($LASTEXITCODE -ne 0) { throw "link failed" }
 
 Write-Output ("built: " + (Get-Item (Join-Path $root "build\IWNPPL.sys")).Length + " bytes")
