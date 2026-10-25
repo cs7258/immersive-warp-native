@@ -684,7 +684,7 @@ static HRESULT WINAPI HookPresent1(IDXGISwapChain1* sw1, UINT sync, UINT flags,
     if (flags & DXGI_PRESENT_TEST) return S_OK;
     IDXGISwapChain* sw = sw1;   // same object, base interface
     doWarpPass(sw);
-    PFN_Present orig1 = origPresent1For(sw);
+    PFN_Present1 orig1 = origPresent1For(sw);
     if (!orig1) return S_OK;
     return orig1(sw1, sync, flags, pp);
 }
