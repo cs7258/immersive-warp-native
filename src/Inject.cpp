@@ -338,8 +338,24 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     dbgLogLine("mm: image written");
 
     // final shellcode: register the image's exception table (x64 unwinding
-    // needs it for manual-mapped images), then run DllMain(base, ATTACH, 0)
-    // and report both return values.
+    // needs it for manual-mapped images), then run the entry and report both
+    // return values. Entry preference: the exported HookEntry (raw Win32-only
+    // init) - the CRT startup stub touches the image's TLS directory, and a
+    // manual-mapped image has no loader TLS registration (round 28).
+    ULONGLONG entryRva = nt->OptionalHeader.AddressOfEntryPoint;
+    {
+        auto& exp = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (exp.Size) {
+            auto edt = (PIMAGE_EXPORT_DIRECTORY)(&img[0] + exp.VirtualAddress);
+            auto names = (DWORD*)(&img[0] + edt->AddressOfNames);
+            auto ords = (WORD*)(&img[0] + edt->AddressOfNameOrdinals);
+            auto funcs = (DWORD*)(&img[0] + edt->AddressOfFunctions);
+            for (DWORD i = 0; i < edt->NumberOfNames; i++) {
+                const char* n = (const char*)(&img[0] + names[i]);
+                if (lstrcmpA(n, "HookEntry") == 0) { entryRva = funcs[ords[i]]; break; }
+            }
+        }
+    }
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     FARPROC aft = ntdll ? GetProcAddress(ntdll, "RtlAddFunctionTable") : nullptr;
     ULONGLONG table = 0, count = 0;
@@ -372,7 +388,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         emit(sc, {0x48,0xC7,0xC2,0x01,0x00,0x00,0x00});// mov rdx,1 (ATTACH)
         emit(sc, {0x45,0x33,0xC0});                  // xor r8d,r8d
         emit(sc, {0x48,0xB8});                       // movabs rax,DllMain
-        imm64(sc, ims, base + nt->OptionalHeader.AddressOfEntryPoint);
+        imm64(sc, ims, base + entryRva);
         emit(sc, {0xFF,0xD0});                       // call rax
         emit(sc, {0x41,0x89,0x47,0x08});             // mov [r15+8],eax
         emit(sc, {0x31,0xC0, 0x48,0x83,0xC4,0x28, 0xC3});
@@ -382,7 +398,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         emit(sc, {0x48,0xC7,0xC2,0x01,0x00,0x00,0x00});// mov rdx,1
         emit(sc, {0x45,0x33,0xC0});                  // xor r8d,r8d
         emit(sc, {0x48,0xB8});                       // movabs rax,DllMain
-        imm64(sc, ims, base + nt->OptionalHeader.AddressOfEntryPoint);
+        imm64(sc, ims, base + entryRva);
         emit(sc, {0xFF,0xD0});                       // call rax
         emit(sc, {0x48,0x83,0xC4,0x28, 0xC3});
     }

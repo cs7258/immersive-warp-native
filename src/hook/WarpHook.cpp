@@ -944,7 +944,13 @@ static DWORD WINAPI initThread(LPVOID) {
 
 static DWORD g_initTid = 0;
 
-BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
+// exported raw entry: the manual-map injector calls this directly, skipping
+// the CRT startup stub (_DllMainCRTStartup) - a manual-mapped image has no
+// loader TLS registration, and the stub touches it, which killed the target
+// (round 28). Everything below uses plain Win32 only; with the dynamic CRT
+// the runtime state was initialized when vcruntime140.dll itself was loaded,
+// and our globals are all constexpr (no dynamic initializers).
+extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(mod);
         AddVectoredExceptionHandler(1, &excFilter);
@@ -959,4 +965,8 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         hookLog("WarpHook.dll detached");
     }
     return TRUE;
+}
+
+BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID r) {
+    return HookEntry(mod, reason, r);
 }
