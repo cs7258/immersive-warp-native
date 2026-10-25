@@ -138,6 +138,72 @@ VOID DriverUnload(PDRIVER_OBJECT drv)
     DbgPrint("IWNPPL: unloaded\n");
 }
 
+// ---- running-dwm sweep -------------------------------------------------
+// x64 SYSTEM_PROCESS_INFORMATION header layout (stable across Win10).
+#pragma pack(push, 8)
+typedef struct _IWN_SPI {
+    ULONG       NextEntryOffset;        // 0x00
+    ULONG       NumberOfThreads;        // 0x04
+    LARGE_INTEGER WorkingSetPrivateSize; // 0x08
+    ULONG       HardFaultCount;         // 0x10
+    ULONG       NumberOfThreadsHighWatermark; // 0x14
+    ULONGLONG   CycleTime;              // 0x18
+    LARGE_INTEGER CreateTime;           // 0x20
+    LARGE_INTEGER UserTime;             // 0x28
+    LARGE_INTEGER KernelTime;           // 0x30
+    UNICODE_STRING ImageName;           // 0x38
+    KPRIORITY   BasePriority;           // 0x48
+    HANDLE      UniqueProcessId;        // 0x50
+} IWN_SPI, *PIWN_SPI;
+#pragma pack(pop)
+
+static VOID SweepRunningDwm(VOID)
+{
+    ULONG len = 1 << 20;
+    PVOID buf = NULL;
+    NTSTATUS st = STATUS_INFO_LENGTH_MISMATCH;
+
+    for (int tries = 0; tries < 6 && st == STATUS_INFO_LENGTH_MISMATCH; tries++) {
+        if (buf) ExFreePoolWithTag(buf, TAG);
+        buf = ExAllocatePoolWithTag(NonPagedPool, len, TAG);
+        if (!buf) return;
+        st = ZwQuerySystemInformation(SystemProcessInformation, buf, len, &len);
+        if (!NT_SUCCESS(st) && st != STATUS_INFO_LENGTH_MISMATCH) {
+            ExFreePoolWithTag(buf, TAG);
+            return;
+        }
+    }
+    if (st != STATUS_SUCCESS || !buf) {
+        if (buf) ExFreePoolWithTag(buf, TAG);
+        return;
+    }
+
+    ULONG cleared = 0;
+    PUCHAR cur = (PUCHAR)buf;
+    UNICODE_STRING dwm = RTL_CONSTANT_STRING(L"dwm.exe");
+    for (;;) {
+        PIWN_SPI p = (PIWN_SPI)cur;
+        if (p->ImageName.Length >= dwm.Length) {
+            UNICODE_STRING tail;
+            tail.Buffer = p->ImageName.Buffer +
+                          (p->ImageName.Length - dwm.Length) / sizeof(WCHAR);
+            tail.Length = tail.MaximumLength = dwm.Length;
+            if (RtlEqualUnicodeString(&tail, &dwm, TRUE) && p->UniqueProcessId) {
+                PEPROCESS proc;
+                if (NT_SUCCESS(PsLookupProcessByProcessId(p->UniqueProcessId, &proc))) {
+                    StripProtection(proc, p->UniqueProcessId);
+                    ObDereferenceObject(proc);
+                    cleared++;
+                }
+            }
+        }
+        if (!p->NextEntryOffset) break;
+        cur += p->NextEntryOffset;
+    }
+    ExFreePoolWithTag(buf, TAG);
+    DbgPrint("IWNPPL: sweep done, %lu dwm instance(s) processed\n", cleared);
+}
+
 NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
 {
     NTSTATUS st;
@@ -152,10 +218,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
     }
     g_NotifyHandle = (PVOID)(ULONG_PTR)1;
 
-    // No enumeration here: if a dwm.exe is already running when the
-    // driver loads, just kill and restart the console later - dwm
-    // restarts on session changes and the callback catches every new
-    // instance at birth.
+    // Also strip any dwm.exe that is already running (driver started
+    // after logon) so no logoff/reboot is needed just to refresh dwm.
+    SweepRunningDwm();
+
     DbgPrint("IWNPPL: loaded, watching dwm.exe\n");
     return STATUS_SUCCESS;
 }
