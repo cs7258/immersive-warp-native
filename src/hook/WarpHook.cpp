@@ -950,16 +950,37 @@ static DWORD g_initTid = 0;
 // (round 28). Everything below uses plain Win32 only; with the dynamic CRT
 // the runtime state was initialized when vcruntime140.dll itself was loaded,
 // and our globals are all constexpr (no dynamic initializers).
+typedef LONG (WINAPI *PFN_RtlAddFunctionTable)(void*, ULONG, ULONG_PTR);
+
 extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        hookLog("he: enter");
+        // register the exception table ourselves: manual-mapped images get no
+        // loader unwind registration, and std::mutex paths below can unwind
+        {
+            auto dos = (IMAGE_DOS_HEADER*)mod;
+            auto nt = (IMAGE_NT_HEADERS*)((BYTE*)mod + dos->e_lfanew);
+            auto& edir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            if (edir.Size) {
+                PFN_RtlAddFunctionTable aft = (PFN_RtlAddFunctionTable)
+                    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlAddFunctionTable");
+                if (aft)
+                    aft((void*)((BYTE*)mod + edir.VirtualAddress),
+                        edir.Size / sizeof(RUNTIME_FUNCTION), (ULONG_PTR)mod);
+            }
+        }
+        hookLog("he: unwound registered");
         DisableThreadLibraryCalls(mod);
+        hookLog("he: dtl ok");
         AddVectoredExceptionHandler(1, &excFilter);
+        hookLog("he: veh ok");
         char buf[300];
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         wsprintfA(buf, "WarpHook.dll attached pid=%u exe=%ls", (unsigned)GetCurrentProcessId(), exe);
         hookLog(buf);
         HANDLE t = CreateThread(nullptr, 0, initThread, nullptr, 0, &g_initTid);
+        hookLog("he: thread spawned");
         if (t) CloseHandle(t);
     } else if (reason == DLL_PROCESS_DETACH) {
         hookLog("WarpHook.dll detached");
