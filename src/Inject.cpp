@@ -20,6 +20,7 @@
 // Self-injection is rejected: the engine already warps its own outputs.
 
 #include "Common.h"
+#include "hook/hook_ipc.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <string>
@@ -701,6 +702,16 @@ std::string injectDwm() {
         return "ERR INJECT dwm (WarpHook.dll not found next to exe)\n";
 
     static std::set<DWORD> g_done;   // attached pids: DLL already running there
+    // belt-and-braces duplicate guard: the DLL itself holds a named mutex once
+    // attached; if it is already there, skip before mapping a fighting copy.
+    // (g_done only covers this host process; SET hook=on's auto-inject and an
+    // explicit INJECT DWM in the same run must not map twice either.)
+    HANDLE already = OpenMutexW(SYNCHRONIZE, FALSE, IWN_HOOK_INSTANCE_MUTEX);
+    if (already) {
+        CloseHandle(already);
+        dbgLogLine("inject: dwm already carries WarpHook (instance mutex found) - skip");
+        return "OK INJECT dwm (already injected - skipped)\n";
+    }
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE)
         return "ERR INJECT dwm (snapshot failed)\n";

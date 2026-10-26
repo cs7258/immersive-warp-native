@@ -43,6 +43,7 @@ extern "C" {
 __declspec(dllexport) volatile LONG g_entryHits = 0;
 __declspec(dllexport) volatile LONG g_stage = 0;
 }
+static HANDLE g_instMutex = nullptr;   // single-instance guard (leaked on purpose)
 
 // ---------------------------------------------------------------- logging
 // No CRT, no std::mutex here: manual-mapped images never run the CRT init, so
@@ -910,6 +911,31 @@ static void createSelfProbes() {
     // fine but the swapchains reference it - keep it alive instead
 }
 
+// Probe present loop: the probes were previously "8x8, never presented", which
+// meant the detour chain was never exercised in-process. Presenting them at
+// 4 Hz gives pass a KNOWN baseline (probe traffic only). If pass grows beyond
+// the probe cadence, real host-process swapchains are flowing through the
+// hook; if pass == probe traffic only, the host bypasses dxgi entirely.
+// Probes are private objects, so no race with the app's own presents.
+static DWORD WINAPI probePresentThread(LPVOID) {
+    static bool logged = false;
+    for (;;) {
+        Sleep(250);
+        // Present() on IDXGISwapChain1 goes through the base-class slot 8
+        HRESULT hr1 = g_keep1 ? g_keep1->Present(0, 0) : E_FAIL;
+        HRESULT hr2 = g_keep2 ? g_keep2->Present(0, 0) : E_FAIL;
+        HRESULT hr3 = g_keep3 ? g_keep3->Present(0, 0) : E_FAIL;
+        if (!logged) {
+            logged = true;
+            char buf[96];
+            wsprintfA(buf, "probe present loop: hr1=0x%08X hr2=0x%08X hr3=0x%08X",
+                      (unsigned)hr1, (unsigned)hr2, (unsigned)hr3);
+            hookLog(buf);
+        }
+    }
+    return 0;
+}
+
 static DWORD WINAPI initThread(LPVOID) {
     // wait for dxgi to be loaded by the host process (poll 50 ms)
     for (int i = 0; i < 600; i++) {
@@ -923,6 +949,9 @@ static DWORD WINAPI initThread(LPVOID) {
     }
     installFactoryHooks();
     createSelfProbes();
+    // start the probe present loop - see probePresentThread for why
+    HANDLE ppt = CreateThread(nullptr, 0, probePresentThread, nullptr, 0, nullptr);
+    if (ppt) CloseHandle(ppt);
     // open the host mapping eagerly - not lazily inside Present - so a
     // mapping failure is visible in the log with a real error code
     if (ensureCfg()) {
@@ -1023,6 +1052,17 @@ extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason
         InterlockedIncrement((volatile LONG*)&g_entryHits);
         g_stage = 1;                                 // entered
         hookLog("he: enter");
+        // single-instance guard: the host may map this DLL into the same
+        // process more than once (SET hook=on auto-inject + explicit INJECT
+        // DWM). Two mapped copies fight over the same dxgi vtables forever -
+        // each copy's watchdog sees the other's trampoline in slot 8, treats
+        // it as a revert and repatches, 0.5s forever. First copy wins.
+        g_instMutex = CreateMutexW(nullptr, TRUE, IWN_HOOK_INSTANCE_MUTEX);
+        if (g_instMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+            g_stage = 7;                             // duplicate copy, no-op
+            hookLog("he: another instance already active in this process - no-op");
+            return TRUE;
+        }
         // register the exception table ourselves: manual-mapped images get no
         // loader unwind registration, and std::mutex paths below can unwind
         {

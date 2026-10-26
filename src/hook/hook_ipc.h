@@ -19,6 +19,9 @@
 
 #define IWN_HOOK_MAPPING_NAME L"IWN_WarpHook_v3"
 #define IWN_HOOK_MAGIC        0x33485749u   // 'IWH3'
+// single-instance guard: the DLL creates it on attach; the host opens it
+// before injecting to skip duplicate mappings (two copies fight over vtables)
+#define IWN_HOOK_INSTANCE_MUTEX L"Local\\IWNWarpHookSingleInstance"
 
 // mesh capacity per output: rows/cols up to 12 with subdivide 8 fits
 // (73*89 = 6497); the host skips publishing larger grids for that slot
