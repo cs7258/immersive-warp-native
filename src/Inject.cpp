@@ -384,6 +384,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         // it from this shellcode correlated with the remote-thread crash.
         emit(sc, {0x49,0xBF});                       // movabs r15,&result
         resAt = sc.size(); imm64(sc, ims, 0);
+        emit(sc, {0x49,0xC7,0x47,0x08,0x11,0x11,0x00,0x00}); // probe: started
         emit(sc, {0x48,0xB9});                       // movabs rcx,base
         imm64(sc, ims, base);
         emit(sc, {0x48,0xC7,0xC2,0x01,0x00,0x00,0x00});// mov rdx,1 (ATTACH)
@@ -397,6 +398,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     } else {
         emit(sc, {0x49,0xBF});                       // movabs r15,&result
         resAt = sc.size(); imm64(sc, ims, 0);
+        emit(sc, {0x49,0xC7,0x47,0x08,0x11,0x11,0x00,0x00}); // probe: started
         emit(sc, {0x48,0xB9});                       // movabs rcx,base
         imm64(sc, ims, base);
         emit(sc, {0x48,0xC7,0xC2,0x01,0x00,0x00,0x00});// mov rdx,1
@@ -414,7 +416,15 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     const SIZE_T total = resOff + 16;
     // reuse the tail of the image allocation for the result buffer: simpler
     // to allocate a small exec block for the shellcode + a separate RW result
-    dbgLogLine("mm: shellcode built size=" + std::to_string(scSize));
+    {
+        std::string hex;
+        char one[4];
+        for (size_t i = 0; i < scSize && i < 40; i++) {
+            sprintf_s(one, "%02X ", (unsigned)sc[i]);
+            hex += one;
+        }
+        dbgLogLine("mm: shellcode built size=" + std::to_string(scSize) + " [" + hex + "]");
+    }
     BYTE* scblock = (BYTE*)VirtualAllocEx(proc, nullptr, total + 64,
                                           MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!scblock) {
@@ -459,7 +469,9 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     if (!result[1]) {
         // the shellcode never reached its final store: the entry AV'd and the
         // target process died under us
-        err = "manual-map entry crashed in target (thread did not complete)";
+        err = "manual-map entry crashed in target (thread did not complete; result=" +
+              std::to_string((unsigned long long)result[0]) + "/" +
+              std::to_string((unsigned long long)result[1]) + ")";
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         return false;
     }
