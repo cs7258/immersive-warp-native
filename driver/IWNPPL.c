@@ -39,16 +39,19 @@
 // PowerShell: Get-ItemProperty HKLM:\SOFTWARE\IWNPPL
 static HANDLE g_StatusKey = NULL;
 
-static VOID Note(PCSTR msg)
+static VOID SetVal(PCWSTR name, PCSTR msg)
 {
     if (!g_StatusKey) return;
-    WCHAR w[220];
+    WCHAR w[240];
     ULONG n = 0;
-    while (msg[n] && n < 200) { w[n] = (WCHAR)(UCHAR)msg[n]; n++; }
+    while (msg[n] && n < 210) { w[n] = (WCHAR)(UCHAR)msg[n]; n++; }
     w[n] = 0;
-    UNICODE_STRING vn = RTL_CONSTANT_STRING(L"Status");
+    UNICODE_STRING vn;
+    RtlInitUnicodeString(&vn, name);
     ZwSetValueKey(g_StatusKey, &vn, 0, REG_SZ, w, (ULONG)((n + 1) * sizeof(WCHAR)));
 }
+
+static VOID Note(PCSTR msg) { SetVal(L"Status", msg); }
 
 #define PROTECTION_QUERY_CLASS  ((PROCESSINFOCLASS)61)   // ProcessProtectionInformation
 #ifndef PROCESS_QUERY_LIMITED_INFORMATION
@@ -71,21 +74,26 @@ NTKERNELAPI NTSTATUS ZwQuerySystemInformation(
     ULONG SystemInformationLength,
     PULONG ReturnLength);
 #define IWN_SYSTEM_PROCESS_INFORMATION 5
-#define SCAN_LO                 0x200
-#define SCAN_HI                 0x900
-#define FALLBACK_OFFSET         0x6CA                    // 18363 (1909) known offset
+#define SCAN_LO                 0x100
+#define SCAN_HI                 0xA00                    // 1909 EPROCESS ~0xA80
 #define TAG                     'PNWI'
 
 static PVOID g_NotifyHandle = NULL;
 
 // Locate and zero the PS_PROTECTION byte inside EPROCESS.
+// SELF-VALIDATING: every candidate byte we zero is immediately verified by
+// re-querying the protection level; only a candidate that actually flips it
+// to 0 counts as a hit. Wrong candidates are restored. No offset guessing.
 static VOID StripProtection(PEPROCESS proc, HANDLE pid)
 {
     HANDLE h = NULL;
     ULONG prot4 = 0;            // class 61 may require a 4-byte buffer
     ULONG retLen = 0;
     NTSTATUS st;
-    CHAR msg[160];
+    CHAR msg[192];
+    UCHAR level;
+    SIZE_T patchedAt = (SIZE_T)-1;
+    LONG tried = 0;
 
     st = ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, NULL,
                                PROCESS_QUERY_LIMITED_INFORMATION,
@@ -94,56 +102,60 @@ static VOID StripProtection(PEPROCESS proc, HANDLE pid)
         RtlStringCbPrintfA(msg, sizeof(msg),
             "pid %llu: ObOpenObjectByPointer failed %08x",
             (ULONG64)(ULONG_PTR)pid, st);
-        DbgPrint("IWNPPL: %s\n", msg); Note(msg);
+        DbgPrint("IWNPPL: %s\n", msg); SetVal(L"Strip", msg);
         return;
     }
     st = ZwQueryInformationProcess(h, PROTECTION_QUERY_CLASS,
                                    &prot4, sizeof(prot4), &retLen);
-    ZwClose(h);
     if (!NT_SUCCESS(st)) {
+        ZwClose(h);
         RtlStringCbPrintfA(msg, sizeof(msg),
             "pid %llu: query protection failed %08x",
             (ULONG64)(ULONG_PTR)pid, st);
-        DbgPrint("IWNPPL: %s\n", msg); Note(msg);
+        DbgPrint("IWNPPL: %s\n", msg); SetVal(L"Strip", msg);
         return;
     }
-    {
-        UCHAR level = (UCHAR)(prot4 & 0xFF);
-        if (level == 0) return;          // already unprotected
+    level = (UCHAR)(prot4 & 0xFF);
+    if (level == 0) {
+        ZwClose(h);
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "pid %llu: already unprotected", (ULONG64)(ULONG_PTR)pid);
+        SetVal(L"Strip", msg);
+        return;
+    }
 
-        __try {
-            PUCHAR base = (PUCHAR)proc;
-            LONG matches = 0;
-            SIZE_T hit = 0;
-            BOOLEAN patched = FALSE;
-            SIZE_T patchedAt = 0;
+    __try {
+        PUCHAR base = (PUCHAR)proc;
+        for (SIZE_T i = SCAN_LO; i < SCAN_HI; i++) {
+            UCHAR save;
+            ULONG v2 = 0xFFFFFFFF, rl2 = 0;
 
-            for (SIZE_T i = SCAN_LO; i < SCAN_HI; i++) {
-                if (base[i] == level) {
-                    matches++;
-                    hit = i;
-                    if (matches > 1) break;
-                }
+            if (base[i] != level) continue;
+            tried++;
+            save = base[i];
+            base[i] = 0;
+            if (NT_SUCCESS(ZwQueryInformationProcess(h, PROTECTION_QUERY_CLASS,
+                                                     &v2, sizeof(v2), &rl2)) &&
+                (v2 & 0xFF) == 0) {
+                patchedAt = i;          // verified hit
+                break;
             }
-            if (matches == 1) {
-                base[hit] = 0;
-                patched = TRUE;
-                patchedAt = hit;
-            } else if (base[FALLBACK_OFFSET] == level) {
-                base[FALLBACK_OFFSET] = 0;
-                patched = TRUE;
-                patchedAt = FALLBACK_OFFSET;
-            }
-            RtlStringCbPrintfA(msg, sizeof(msg),
-                "pid %llu: lvl=%02x matches=%ld patched=%u at=%llx",
-                (ULONG64)(ULONG_PTR)pid, level, matches,
-                patched ? 1u : 0u, (ULONG64)patchedAt);
-            DbgPrint("IWNPPL: %s\n", msg); Note(msg);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            Note("pid ?: exception while scanning EPROCESS");
+            base[i] = save;             // wrong byte - put it back
         }
     }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "pid %llu: exception while scanning EPROCESS", (ULONG64)(ULONG_PTR)pid);
+        SetVal(L"Strip", msg);
+    }
+    ZwClose(h);
+
+    RtlStringCbPrintfA(msg, sizeof(msg),
+        "pid %llu: lvl=%02x candidates=%ld patched=%lld at=0x%llx",
+        (ULONG64)(ULONG_PTR)pid, level, tried,
+        patchedAt == (SIZE_T)-1 ? -1LL : 1LL, (ULONG64)patchedAt);
+    DbgPrint("IWNPPL: %s\n", msg);
+    SetVal(L"Strip", msg);
 }
 
 // EX callback: 3 params, info==NULL means the process is being destroyed.
@@ -249,8 +261,8 @@ static VOID SweepRunningDwm(VOID)
     {
         CHAR msg[96];
         RtlStringCbPrintfA(msg, sizeof(msg),
-            "sweep done: dwm seen=%lu cleared=%lu", seen, cleared);
-        DbgPrint("IWNPPL: %s\n", msg); Note(msg);
+            "sweep done: dwm seen=%lu processed=%lu", seen, cleared);
+        DbgPrint("IWNPPL: %s\n", msg); SetVal(L"Sweep", msg);
     }
 }
 
