@@ -223,7 +223,9 @@ ULONGLONG remoteAddrForFn(DWORD pid, FARPROC fn) {
     if (!GetModuleFileNameW(owner, path, MAX_PATH)) return 0;
     const wchar_t* base = wcsrchr(path, L'\\');
     base = base ? base + 1 : path;
-    ULONGLONG rb = remoteModuleBase(pid, base, owner);
+    // no local fallback here: if the owning module is absent in the target the
+    // caller must load it there first, not fabricate an address
+    ULONGLONG rb = remoteModuleBase(pid, base, nullptr);
     if (!rb) return 0;
     return rb + ((ULONGLONG)(uintptr_t)fn - (ULONGLONG)(uintptr_t)owner);
 }
@@ -296,7 +298,11 @@ bool resolveImports(HANDLE proc, DWORD pid, std::vector<BYTE>& img, std::string&
         HMODULE local = GetModuleHandleW(wname);
         if (!local) local = LoadLibraryW(wname);
         if (!local) { err = std::string("local dep missing: ") + modName; return false; }
-        ULONGLONG rbase = remoteModuleBase(pid, wname, local);
+        // nullptr fallback => 0 when the module is not in the target, which is
+        // the signal to load it there. Passing `local` here made the fallback
+        // unconditional, so a target without the VC runtime (notepad, dwm) got
+        // our own process's addresses written into its IAT.
+        ULONGLONG rbase = remoteModuleBase(pid, wname, nullptr);
         if (!rbase) {
             // not loaded in the target (e.g. D3DCOMPILER_47 in dwm.exe):
             // load it there - MS-signed system DLLs pass the CI policy.
@@ -469,17 +475,6 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     // epilogue (xor eax/add rsp/ret) and the thread executed zeros -> AV.
     const SIZE_T resOff = (scSize + 15) & ~SIZE_T(15);
     const SIZE_T total = resOff + 16;
-    // reuse the tail of the image allocation for the result buffer: simpler
-    // to allocate a small exec block for the shellcode + a separate RW result
-    {
-        std::string hex;
-        char one[4];
-        for (size_t i = 0; i < scSize && i < 40; i++) {
-            sprintf_s(one, "%02X ", (unsigned)sc[i]);
-            hex += one;
-        }
-        dbgLogLine("mm: shellcode built size=" + std::to_string(scSize) + " [" + hex + "]");
-    }
     BYTE* scblock = (BYTE*)VirtualAllocEx(proc, nullptr, total + 64,
                                           MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!scblock) {
@@ -491,12 +486,27 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     std::vector<BYTE> local(total + 64, 0);
     memcpy(&local[0], &sc[0], scSize);
     ULONGLONG resR = (ULONGLONG)(uintptr_t)resBlock;
-    for (auto& im : ims)
-        if (im.at == resAt) {                        // the recorded &result slot
-            ULONGLONG v = resR;
-            memcpy(&local[im.at], &v, 8);
-            break;
+    // Patch EVERY imm64 slot. This loop used to stop at the &result slot
+    // (`break`), so `movabs rcx,base` and `movabs rax,entry` stayed 0 and the
+    // remote thread executed `mov rax,0; call rax` - i.e. it jumped to address
+    // zero and died before HookEntry's first instruction ever ran. That was the
+    // "HookEntry returned FALSE / DllMain failed in target" mystery.
+    for (auto& im : ims) {
+        ULONGLONG v = (im.at == resAt) ? resR : im.v;
+        memcpy(&local[im.at], &v, 8);
+    }
+    {   // log the PATCHED bytes: the old dump printed the pre-patch buffer,
+        // which is why the zeroed address slots went unnoticed for so long
+        std::string hex;
+        char one[4];
+        for (size_t i = 0; i < scSize && i < 48; i++) {
+            sprintf_s(one, "%02X ", (unsigned)local[i]);
+            hex += one;
         }
+        dbgLogLine("mm: shellcode size=" + std::to_string(scSize) + " base=0x" +
+                   Hex(base).substr(2) + " entry=0x" + Hex(base + entryRva).substr(2) +
+                   " res=0x" + Hex(resR).substr(2) + " [" + hex + "]");
+    }
     if (!WriteProcessMemory(proc, scblock, &local[0], local.size(), nullptr)) {
         err = "WriteProcessMemory(sc) gle=" + std::to_string(GetLastError());
         VirtualFreeEx(proc, scblock, 0, MEM_RELEASE);
