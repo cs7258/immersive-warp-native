@@ -83,6 +83,10 @@ static void hookLog(const char* line) {
 static IWNHookCfg* g_cfg = nullptr;          // mapped view, may stay null
 static DWORD g_cfgLastTry = 0;               // GetTickCount pacing
 static int g_cfgTries = 0;
+// false when we could only attach the mapping read-only: the write-backs
+// (pass counter + exception telemetry) must be skipped or they AV on a
+// PAGE_READONLY view. Warp config itself is read-only for us either way.
+static bool g_cfgWrite = false;
 
 static IWNHookCfg* ensureCfg() {
     if (g_cfg) return g_cfg;
@@ -90,13 +94,26 @@ static IWNHookCfg* ensureCfg() {
     if (now - g_cfgLastTry < 1000) return nullptr;   // retry at 1 Hz
     g_cfgLastTry = now;
     g_cfgTries++;
-    HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, IWN_HOOK_MAPPING_NAME);
+    DWORD access = FILE_MAP_ALL_ACCESS;
+    HANDLE h = OpenFileMappingW(access, FALSE, IWN_HOOK_MAPPING_NAME);
     if (!h) {
-        if (g_cfgTries == 10)
-            hookLog("cfg: mapping not found after 10 tries (host not running or name mismatch)");
-        return nullptr;
+        DWORD gle = GetLastError();
+        h = OpenFileMappingW(FILE_MAP_READ, FALSE, IWN_HOOK_MAPPING_NAME);
+        if (h) {
+            access = FILE_MAP_READ;
+            if (g_cfgTries % 10 == 1)
+                hookLog("cfg: ALL_ACCESS open denied, read-only attach (write-backs disabled)");
+        } else {
+            if (g_cfgTries % 10 == 1) {
+                char b[64];
+                wsprintfA(b, "cfg: open failed gle=%u", gle);
+                hookLog(b);
+            }
+            return nullptr;
+        }
     }
-    g_cfg = (IWNHookCfg*)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(IWNHookCfg));
+    g_cfgWrite = (access == FILE_MAP_ALL_ACCESS);
+    g_cfg = (IWNHookCfg*)MapViewOfFile(h, access, 0, 0, sizeof(IWNHookCfg));
     if (g_cfg && (g_cfg->magic != IWN_HOOK_MAGIC || g_cfg->size != sizeof(IWNHookCfg))) {
         hookLog("cfg: magic/size mismatch, ignoring host mapping");
         UnmapViewOfFile(g_cfg); g_cfg = nullptr;
@@ -688,7 +705,7 @@ static HRESULT WINAPI HookPresent(IDXGISwapChain* sw, UINT sync, UINT flags) {
     // proved unreliable from the app's render thread). Interlocked so a
     // multi-swapchain app stays consistent.
     IWNHookCfg* cfgT = ensureCfg();
-    if (cfgT) InterlockedIncrement((volatile LONG*)&cfgT->reserved[0]);
+    if (cfgT && g_cfgWrite) InterlockedIncrement((volatile LONG*)&cfgT->reserved[0]);
     static bool firstCallLogged = false;
     if (!firstCallLogged) {
         firstCallLogged = true;
@@ -711,7 +728,7 @@ static HRESULT WINAPI HookPresent1(IDXGISwapChain1* sw1, UINT sync, UINT flags,
                                    DXGI_PRESENT_PARAMETERS* pp) {
     (void)pp;
     IWNHookCfg* cfgT = ensureCfg();
-    if (cfgT) InterlockedIncrement((volatile LONG*)&cfgT->reserved[0]);
+    if (cfgT && g_cfgWrite) InterlockedIncrement((volatile LONG*)&cfgT->reserved[0]);
     static bool firstCallLogged = false;
     if (!firstCallLogged) {
         firstCallLogged = true;
@@ -773,7 +790,7 @@ static LONG WINAPI excFilter(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != 0xE06D7363 && code != 0xC0000005) return EXCEPTION_CONTINUE_SEARCH;
     IWNHookCfg* c = ensureCfg();
-    if (c) {
+    if (c && g_cfgWrite) {
         // InterlockedCompareExchange keeps the FIRST occurrence - later
         // first-chance repeats (same throw unwinding) must not overwrite it
         InterlockedCompareExchange((volatile LONG*)&c->reserved[1], (LONG)code, 0);

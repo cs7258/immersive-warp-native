@@ -10,16 +10,35 @@
 #include "hook/hook_ipc.h"
 #include <mutex>
 #include <cstring>
+#include <sddl.h>
 
 static HANDLE g_hookMap = nullptr;
 static IWNHookCfg* g_hookView = nullptr;
 static std::mutex g_hookMutex;
 
+// The mapping must be openable by dwm.exe (SYSTEM). A default DACL proved to
+// deny access there (gle=5), so hand out an explicit Everyone-full DACL -
+// pagefile-backed sections are invisible in Explorer and the config contains
+// no secrets, so a world-readable/writable warp grid is acceptable.
+static HANDLE createWorldMapping() {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    SECURITY_ATTRIBUTES sa{};
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GA;;;WD)", SDDL_REVISION_1, &sd, nullptr) && sd) {
+        sa.nLength = sizeof(sa);
+        sa.lpSecurityDescriptor = sd;
+    }
+    HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, sa.nLength ? &sa : nullptr,
+                                  PAGE_READWRITE, 0, sizeof(IWNHookCfg),
+                                  IWN_HOOK_MAPPING_NAME);
+    if (sd) LocalFree(sd);
+    return h;
+}
+
 bool hookIpcInit() {
     std::lock_guard<std::mutex> lk(g_hookMutex);
     if (g_hookView) return true;
-    g_hookMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                   0, sizeof(IWNHookCfg), IWN_HOOK_MAPPING_NAME);
+    g_hookMap = createWorldMapping();
     if (!g_hookMap) return false;
     g_hookView = (IWNHookCfg*)MapViewOfFile(g_hookMap, FILE_MAP_WRITE, 0, 0, sizeof(IWNHookCfg));
     if (!g_hookView) return false;
