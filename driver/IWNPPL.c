@@ -30,7 +30,25 @@
 // Unload:
 //   sc stop IWNPPL && sc delete IWNPPL
 // ============================================================
-#include <ntifs.h>   // ZwQueryInformationProcess / PsLookupProcessByProcessId
+#include <ntifs.h>   // PsLookupProcessByProcessId / ObOpenObjectByPointer
+#include <ntstrsafe.h>
+
+// ---- registry breadcrumbs (visibility without DbgView) -----------------
+// Every interesting step writes a one-line status to
+// HKLM\SOFTWARE\IWNPPL\Status (REG_SZ). User mode can read it with
+// PowerShell: Get-ItemProperty HKLM:\SOFTWARE\IWNPPL
+static HANDLE g_StatusKey = NULL;
+
+static VOID Note(PCSTR msg)
+{
+    if (!g_StatusKey) return;
+    WCHAR w[220];
+    ULONG n = 0;
+    while (msg[n] && n < 200) { w[n] = (WCHAR)(UCHAR)msg[n]; n++; }
+    w[n] = 0;
+    UNICODE_STRING vn = RTL_CONSTANT_STRING(L"Status");
+    ZwSetValueKey(g_StatusKey, &vn, 0, REG_SZ, w, (ULONG)((n + 1) * sizeof(WCHAR)));
+}
 
 #define PROTECTION_QUERY_CLASS  ((PROCESSINFOCLASS)61)   // ProcessProtectionInformation
 #ifndef PROCESS_QUERY_LIMITED_INFORMATION
@@ -64,59 +82,67 @@ static PVOID g_NotifyHandle = NULL;
 static VOID StripProtection(PEPROCESS proc, HANDLE pid)
 {
     HANDLE h = NULL;
-    UCHAR level = 0;
+    ULONG prot4 = 0;            // class 61 may require a 4-byte buffer
     ULONG retLen = 0;
     NTSTATUS st;
+    CHAR msg[160];
 
     st = ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, NULL,
                                PROCESS_QUERY_LIMITED_INFORMATION,
                                *PsProcessType, KernelMode, &h);
     if (!NT_SUCCESS(st)) {
-        DbgPrint("IWNPPL: pid %p ObOpenObjectByPointer failed %08x\n",
-                 (PVOID)(ULONG_PTR)pid, st);
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "pid %llu: ObOpenObjectByPointer failed %08x",
+            (ULONG64)(ULONG_PTR)pid, st);
+        DbgPrint("IWNPPL: %s\n", msg); Note(msg);
         return;
     }
     st = ZwQueryInformationProcess(h, PROTECTION_QUERY_CLASS,
-                                   &level, sizeof(level), &retLen);
+                                   &prot4, sizeof(prot4), &retLen);
     ZwClose(h);
     if (!NT_SUCCESS(st)) {
-        DbgPrint("IWNPPL: pid %p query protection failed %08x\n",
-                 (PVOID)(ULONG_PTR)pid, st);
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "pid %llu: query protection failed %08x",
+            (ULONG64)(ULONG_PTR)pid, st);
+        DbgPrint("IWNPPL: %s\n", msg); Note(msg);
         return;
     }
-    if (level == 0) return;              // already unprotected
+    {
+        UCHAR level = (UCHAR)(prot4 & 0xFF);
+        if (level == 0) return;          // already unprotected
 
-    __try {
-        PUCHAR base = (PUCHAR)proc;
-        LONG matches = 0;
-        SIZE_T hit = 0;
+        __try {
+            PUCHAR base = (PUCHAR)proc;
+            LONG matches = 0;
+            SIZE_T hit = 0;
+            BOOLEAN patched = FALSE;
+            SIZE_T patchedAt = 0;
 
-        for (SIZE_T i = SCAN_LO; i < SCAN_HI; i++) {
-            if (base[i] == level) {
-                matches++;
-                hit = i;
-                if (matches > 1) break;
+            for (SIZE_T i = SCAN_LO; i < SCAN_HI; i++) {
+                if (base[i] == level) {
+                    matches++;
+                    hit = i;
+                    if (matches > 1) break;
+                }
             }
+            if (matches == 1) {
+                base[hit] = 0;
+                patched = TRUE;
+                patchedAt = hit;
+            } else if (base[FALLBACK_OFFSET] == level) {
+                base[FALLBACK_OFFSET] = 0;
+                patched = TRUE;
+                patchedAt = FALLBACK_OFFSET;
+            }
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "pid %llu: lvl=%02x matches=%ld patched=%u at=%llx",
+                (ULONG64)(ULONG_PTR)pid, level, matches,
+                patched ? 1u : 0u, (ULONG64)patchedAt);
+            DbgPrint("IWNPPL: %s\n", msg); Note(msg);
         }
-        if (matches == 1) {
-            base[hit] = 0;
-            DbgPrint("IWNPPL: pid %p protection 0x%02x cleared at EPROCESS+0x%llx\n",
-                     (PVOID)(ULONG_PTR)pid, level, (ULONG64)hit);
-            return;
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            Note("pid ?: exception while scanning EPROCESS");
         }
-        // ambiguous scan - try the 1909 known offset
-        if (base[FALLBACK_OFFSET] == level) {
-            base[FALLBACK_OFFSET] = 0;
-            DbgPrint("IWNPPL: pid %p protection 0x%02x cleared via fallback +0x%x (scan hits=%ld)\n",
-                     (PVOID)(ULONG_PTR)pid, level, FALLBACK_OFFSET, matches);
-            return;
-        }
-        DbgPrint("IWNPPL: pid %p protection 0x%02x NOT cleared (scan hits=%ld)\n",
-                 (PVOID)(ULONG_PTR)pid, level, matches);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrint("IWNPPL: pid %p exception while scanning EPROCESS\n",
-                 (PVOID)(ULONG_PTR)pid);
     }
 }
 
@@ -152,6 +178,7 @@ VOID DriverUnload(PDRIVER_OBJECT drv)
         PsSetCreateProcessNotifyRoutineEx(DwmNotifyCb, TRUE);
         g_NotifyHandle = NULL;
     }
+    if (g_StatusKey) { ZwClose(g_StatusKey); g_StatusKey = NULL; }
     DbgPrint("IWNPPL: unloaded\n");
 }
 
@@ -195,7 +222,7 @@ static VOID SweepRunningDwm(VOID)
         return;
     }
 
-    ULONG cleared = 0;
+    ULONG cleared = 0, seen = 0;
     PUCHAR cur = (PUCHAR)buf;
     UNICODE_STRING dwm = RTL_CONSTANT_STRING(L"dwm.exe");
     for (;;) {
@@ -206,6 +233,7 @@ static VOID SweepRunningDwm(VOID)
                           (p->ImageName.Length - dwm.Length) / sizeof(WCHAR);
             tail.Length = tail.MaximumLength = dwm.Length;
             if (RtlEqualUnicodeString(&tail, &dwm, TRUE) && p->UniqueProcessId) {
+                seen++;
                 PEPROCESS proc;
                 if (NT_SUCCESS(PsLookupProcessByProcessId(p->UniqueProcessId, &proc))) {
                     StripProtection(proc, p->UniqueProcessId);
@@ -218,7 +246,12 @@ static VOID SweepRunningDwm(VOID)
         cur += p->NextEntryOffset;
     }
     ExFreePoolWithTag(buf, TAG);
-    DbgPrint("IWNPPL: sweep done, %lu dwm instance(s) processed\n", cleared);
+    {
+        CHAR msg[96];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "sweep done: dwm seen=%lu cleared=%lu", seen, cleared);
+        DbgPrint("IWNPPL: %s\n", msg); Note(msg);
+    }
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
@@ -234,6 +267,23 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
         return st;
     }
     g_NotifyHandle = (PVOID)(ULONG_PTR)1;
+
+    // registry breadcrumbs: HKLM\SOFTWARE\IWNPPL\Status
+    {
+        UNICODE_STRING path =
+            RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\IWNPPL");
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &path,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        st = ZwCreateKey(&g_StatusKey, KEY_SET_VALUE, &oa, 0, NULL,
+                         REG_OPTION_NON_VOLATILE, NULL);
+    }
+    if (NT_SUCCESS(st)) {
+        Note("loaded ver=sweep3 (reg breadcrumbs on)");
+    } else {
+        g_StatusKey = NULL;
+        DbgPrint("IWNPPL: status key create failed %08x\n", st);
+    }
 
     // Also strip any dwm.exe that is already running (driver started
     // after logon) so no logoff/reboot is needed just to refresh dwm.
