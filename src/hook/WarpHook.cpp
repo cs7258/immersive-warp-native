@@ -32,26 +32,38 @@ static HRESULT WINAPI HookCreateSwapChainForHwnd(IUnknown* fac, IUnknown* dev, H
                                                  IDXGIOutput* ign, IDXGISwapChain1** out);
 
 // ---------------------------------------------------------------- logging
-static void hookLog(const char* line) {
-    static std::mutex m;
-    char path[MAX_PATH];
-    DWORD n = GetEnvironmentVariableA("APPDATA", path, MAX_PATH);
-    if (!n) return;
-    lstrcatA(path, "\\ImmersiveWarpNative");
-    CreateDirectoryA(path, nullptr);
-    lstrcatA(path, "\\hook.log");
-    SYSTEMTIME st; GetLocalTime(&st);
-    char buf[512];
-    int len = wsprintfA(buf, "[%02d:%02d:%02d.%03d] %s\r\n",
-                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
-    std::lock_guard<std::mutex> lk(m);
+// No CRT, no std::mutex here: manual-mapped images never run the CRT init, so
+// keep the logger to raw Win32 + Interlocked. Falls back to C://Windows//Temp
+// when APPDATA is unavailable/unwritable (that is the SYSTEM/dwm case).
+static BOOL appendFileA(const char* path, const char* buf, int len) {
     HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f != INVALID_HANDLE_VALUE) {
-        SetFilePointer(f, 0, nullptr, FILE_END);
-        DWORD w; WriteFile(f, buf, (DWORD)len, &w, nullptr);
-        CloseHandle(f);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    SetFilePointer(f, 0, nullptr, FILE_END);
+    DWORD w = 0;
+    WriteFile(f, buf, (DWORD)len, &w, nullptr);
+    CloseHandle(f);
+    return TRUE;
+}
+
+static void hookLog(const char* line) {
+    static volatile LONG lock = 0;
+    char path[MAX_PATH];
+    char buf[512];
+    SYSTEMTIME st; GetLocalTime(&st);
+    int len = wsprintfA(buf, "[%02d:%02d:%02d.%03d] %s\r\n",
+                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
+    while (InterlockedCompareExchange((volatile LONG*)&lock, 1, 0) != 0) Sleep(0);
+    DWORD n = GetEnvironmentVariableA("APPDATA", path, MAX_PATH);
+    BOOL wrote = FALSE;
+    if (n && n + 40 < MAX_PATH) {
+        lstrcatA(path, "\\ImmersiveWarpNative");
+        CreateDirectoryA(path, nullptr);
+        lstrcatA(path, "\\hook.log");
+        wrote = appendFileA(path, buf, len);
     }
+    if (!wrote) appendFileA("C:\\Windows\\Temp\\iwndashook.log", buf, len);
+    InterlockedExchange((volatile LONG*)&lock, 0);
 }
 
 // ---------------------------------------------------------------- config

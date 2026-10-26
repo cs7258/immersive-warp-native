@@ -92,7 +92,9 @@ bool loadLibInTarget(HANDLE proc, DWORD pid, const wchar_t* dllPath,
 
     std::vector<BYTE> sc;
     std::vector<Imm> ims;
-    emit(sc, {0x48,0x83,0xEC,0x20});                 // sub rsp,0x20 (keeps Rsp 16-aligned before the call - Win64 ABI;
+    emit(sc, {0x48,0x83,0xEC,0x28});                 // sub rsp,0x28: thread entry Rsp is 8 mod 16, so 8-40 = 0 mod 16 BEFORE the call
+    // (callee then sees 8 mod 16 as the ABI requires). 0x20 here leaves it 8 mod 16
+    // and every movaps in the callee prologue AVs - that was the dwm crash.
     emit(sc, {0x48,0xB9});                           // movabs rcx,&path
     size_t pathAt = sc.size(); imm64(sc, ims, 0);
     emit(sc, {0x48,0xB8});                           // movabs rax,LoadLibraryW
@@ -105,7 +107,7 @@ bool loadLibInTarget(HANDLE proc, DWORD pid, const wchar_t* dllPath,
     imm64(sc, ims, (ULONGLONG)gleFn);
     emit(sc, {0xFF,0xD0});                           // call rax
     emit(sc, {0x41,0x89,0x47,0x08});                 // mov [r15+8],eax
-    emit(sc, {0x31,0xC0, 0x48,0x83,0xC4,0x20, 0xC3});// eax=0; leave; ret
+    emit(sc, {0x31,0xC0, 0x48,0x83,0xC4,0x28, 0xC3});// eax=0; leave; ret
 
     const SIZE_T pathBytes = (lstrlenW(dllPath) + 1) * sizeof(wchar_t);
     const SIZE_T scSize = sc.size();
@@ -371,7 +373,9 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     std::vector<BYTE> sc;
     std::vector<Imm> ims;
     size_t resAt = SIZE_MAX;                         // &result slot (patched below)
-    emit(sc, {0x48,0x83,0xEC,0x20});                 // sub rsp,0x20 (keeps Rsp 16-aligned before the call - Win64 ABI;
+    emit(sc, {0x48,0x83,0xEC,0x28});                 // sub rsp,0x28: thread entry Rsp is 8 mod 16, so 8-40 = 0 mod 16 BEFORE the call
+    // (callee then sees 8 mod 16 as the ABI requires). 0x20 here leaves it 8 mod 16
+    // and every movaps in the callee prologue AVs - that was the dwm crash.
     if (aft && table) {
         // NOTE: RtlAddFunctionTable moved INSIDE HookEntry (diag4) - calling
         // it from this shellcode correlated with the remote-thread crash.
@@ -385,7 +389,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         imm64(sc, ims, base + entryRva);
         emit(sc, {0xFF,0xD0});                       // call rax
         emit(sc, {0x49,0x89,0x07});                  // mov [r15],rax
-        emit(sc, {0x31,0xC0, 0x48,0x83,0xC4,0x20, 0xC3});
+        emit(sc, {0x31,0xC0, 0x48,0x83,0xC4,0x28, 0xC3});
     } else {
         emit(sc, {0x48,0xB9});                       // movabs rcx,base
         imm64(sc, ims, base);
@@ -394,7 +398,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         emit(sc, {0x48,0xB8});                       // movabs rax,DllMain
         imm64(sc, ims, base + entryRva);
         emit(sc, {0xFF,0xD0});                       // call rax
-        emit(sc, {0x48,0x83,0xC4,0x20, 0xC3});
+        emit(sc, {0x48,0x83,0xC4,0x28, 0xC3});
     }
 
     const SIZE_T scSize = sc.size();
