@@ -24,6 +24,7 @@
 #include <tlhelp32.h>
 #include <string>
 #include <set>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -327,8 +328,10 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     if (!remote) { err = "VirtualAllocEx(image) gle=" + std::to_string(GetLastError()); return false; }
     ULONGLONG base = (ULONGLONG)(uintptr_t)remote;
     dbgLogLine("mm: base=" + std::to_string(base));
+    dbgLogLine("mm: relocs start");
     if (!applyRelocs(img, base, err)) { VirtualFreeEx(proc, remote, 0, MEM_RELEASE); return false; }
     dbgLogLine("mm: relocs ok");
+    dbgLogLine("mm: imports start");
     if (!resolveImports(proc, pid, img, err)) { VirtualFreeEx(proc, remote, 0, MEM_RELEASE); return false; }
     dbgLogLine("mm: imports ok");
 
@@ -389,8 +392,11 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         imm64(sc, ims, base + entryRva);
         emit(sc, {0xFF,0xD0});                       // call rax
         emit(sc, {0x49,0x89,0x07});                  // mov [r15],rax
+        emit(sc, {0x49,0xC7,0x47,0x08,0x01,0x00,0x00,0x00}); // mov qword [r15+8],1 (reached = ok)
         emit(sc, {0x31,0xC0, 0x48,0x83,0xC4,0x28, 0xC3});
     } else {
+        emit(sc, {0x49,0xBF});                       // movabs r15,&result
+        resAt = sc.size(); imm64(sc, ims, 0);
         emit(sc, {0x48,0xB9});                       // movabs rcx,base
         imm64(sc, ims, base);
         emit(sc, {0x48,0xC7,0xC2,0x01,0x00,0x00,0x00});// mov rdx,1
@@ -398,6 +404,8 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         emit(sc, {0x48,0xB8});                       // movabs rax,DllMain
         imm64(sc, ims, base + entryRva);
         emit(sc, {0xFF,0xD0});                       // call rax
+        emit(sc, {0x49,0x89,0x07});                  // mov [r15],rax
+        emit(sc, {0x49,0xC7,0x47,0x08,0x01,0x00,0x00,0x00}); // mov qword [r15+8],1
         emit(sc, {0x48,0x83,0xC4,0x28, 0xC3});
     }
 
@@ -449,7 +457,14 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     // the hook, so remote is intentionally leaked into the target's lifetime.
     if (!rd) { err = "ReadProcessMemory(manual) gle=" + std::to_string(GetLastError()); return false; }
     if (!result[1]) {
-        err = "DllMain failed in target (manual map)";
+        // the shellcode never reached its final store: the entry AV'd and the
+        // target process died under us
+        err = "manual-map entry crashed in target (thread did not complete)";
+        VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+        return false;
+    }
+    if (!result[0]) {
+        err = "HookEntry returned FALSE in target";
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         return false;
     }
@@ -569,6 +584,10 @@ std::string injectPid(unsigned long pid, const std::wstring& dllIn) {
 // is two-stage: dwm.exe rejects LoadLibraryW of unsigned DLLs (kernel CI),
 // so the loader falls back to manual mapping (round 28).
 std::string injectDwm() {
+    // socket thread (CMDNET) and UI thread (toggleDwmWarping) can both land
+    // here; two concurrent manual maps corrupted each other in round 33.
+    static std::mutex g_injectMutex;
+    std::lock_guard<std::mutex> injectLock(g_injectMutex);
     std::string privWhy;
     bool priv = enableDebugPriv(privWhy);
     bool elev = isElevated();
