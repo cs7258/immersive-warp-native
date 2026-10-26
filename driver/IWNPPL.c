@@ -36,6 +36,23 @@
 #ifndef PROCESS_QUERY_LIMITED_INFORMATION
 #define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
 #endif
+
+// The WDK NuGet public headers do not declare these Zw* info-class APIs -
+// declare them manually (C4013 confirmed there is no prior declaration).
+NTKERNELAPI NTSTATUS ZwQueryInformationProcess(
+    HANDLE ProcessHandle,
+    PROCESSINFOCLASS ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength);
+
+typedef ULONG SYSTEM_INFORMATION_CLASS;
+NTKERNELAPI NTSTATUS ZwQuerySystemInformation(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength);
+#define IWN_SYSTEM_PROCESS_INFORMATION 5
 #define SCAN_LO                 0x200
 #define SCAN_HI                 0x900
 #define FALLBACK_OFFSET         0x6CA                    // 18363 (1909) known offset
@@ -167,7 +184,7 @@ static VOID SweepRunningDwm(VOID)
         if (buf) ExFreePoolWithTag(buf, TAG);
         buf = ExAllocatePoolWithTag(NonPagedPool, len, TAG);
         if (!buf) return;
-        st = ZwQuerySystemInformation(SystemProcessInformation, buf, len, &len);
+        st = ZwQuerySystemInformation(IWN_SYSTEM_PROCESS_INFORMATION, buf, len, &len);
         if (!NT_SUCCESS(st) && st != STATUS_INFO_LENGTH_MISMATCH) {
             ExFreePoolWithTag(buf, TAG);
             return;
