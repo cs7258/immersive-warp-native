@@ -459,6 +459,7 @@ static volatile LONG g_inSelfProbe = 0;
 // takes the init thread down (this was the DLL's only TLS consumer).
 static IDXGISwapChain* g_keep1 = nullptr;
 static IDXGISwapChain1* g_keep2 = nullptr;
+static IDXGISwapChain1* g_keep3 = nullptr;   // composition-family probe
 
 // Bitblt and flip-model swapchains are distinct implementation classes with
 // distinct vtables - patch each vtable once and remember its original Present.
@@ -885,6 +886,20 @@ static void createSelfProbes() {
             hookLog("selfprobe: flip probe created");
         } else {
             hookLog("selfprobe: flip probe failed");
+        }
+        // composition-model probe (a third implementation family; the dwm
+        // desktop swapchains are not hwnd-bound, so this is the likeliest
+        // class they use - and the one whose vtable was never seen before)
+        DXGI_SWAP_CHAIN_DESC1 d2 = d1;
+        d2.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        IDXGISwapChain1* sc2 = nullptr;
+        if (SUCCEEDED(fac->CreateSwapChainForComposition(dev, &d2, nullptr, &sc2)) && sc2) {
+            patchSwapchainVt(sc2);
+            g_keep3 = sc2;
+            (void)g_keep3;
+            hookLog("selfprobe: composition probe created");
+        } else {
+            hookLog("selfprobe: composition probe failed");
         }
         InterlockedExchange(&g_inSelfProbe, 0);
         fac->Release();

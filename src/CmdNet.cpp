@@ -813,7 +813,8 @@ static std::string dispatch(std::string line) {
             return injectPid(pid, dllTok.empty() ? std::wstring() : toWide(dllTok));
         }
         if (mode == "DWM") return injectDwm();
-        return "ERR INJECT (mode: LAUNCH|PID|DWM)\n";
+        if (mode == "DWMR") return dwmDisplayRefresh();
+        return "ERR INJECT (mode: LAUNCH|PID|DWM|DWMR)\n";
     }
 
     // Profiles (original Profiles-page parity): watcher auto-injects

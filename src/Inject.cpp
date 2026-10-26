@@ -742,3 +742,38 @@ std::string injectDwm() {
                "; " + errs + "report this exact text)\n";
     return "OK INJECT dwm pids=" + pids + "\n";
 }
+
+// Force dwm to rebuild its composition surfaces: a display-mode round trip
+// tears down and recreates the desktop swapchains, and whatever class they
+// belong to gets caught live by the factory/vtable hooks already installed
+// inside dwm by the earlier INJECT DWM. Requires the hook to be injected.
+std::string dwmDisplayRefresh() {
+    bool elev = isElevated();
+    dbgLogLine("dwmr: begin elevated=" + std::to_string(elev));
+    // first active display device
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    wchar_t dev[32] = L"";
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); i++) {
+        if (!(dd.StateFlags & DISPLAY_DEVICE_ACTIVE) || !(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
+            continue;
+        lstrcpynW(dev, dd.DeviceName, 32);
+        break;
+    }
+    if (!dev[0]) return "ERR DWMR (no active display)\n";
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(dev, ENUM_CURRENT_SETTINGS, &dm))
+        return "ERR DWMR (EnumDisplaySettings failed)\n";
+    const DWORD w = dm.dmPelsWidth, h = dm.dmPelsHeight;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    dm.dmPelsWidth = w - 8;
+    LONG r1 = ChangeDisplaySettingsExW(dev, &dm, nullptr, 0, nullptr);
+    Sleep(2500);
+    dm.dmPelsWidth = w;
+    LONG r2 = ChangeDisplaySettingsExW(dev, &dm, nullptr, 0, nullptr);
+    dbgLogLine("dwmr: down=" + std::to_string(r1) + " restore=" + std::to_string(r2));
+    if (r1 != DISP_CHANGE_SUCCESSFUL || r2 != DISP_CHANGE_SUCCESSFUL)
+        return "ERR DWMR (mode change r1=" + std::to_string(r1) + " r2=" + std::to_string(r2) + ")\n";
+    return "OK DWMR (desktop surfaces rebuilt; re-run INJECT DWM and check pass=)\n";
+}

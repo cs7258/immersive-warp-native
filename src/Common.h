@@ -346,6 +346,7 @@ std::string injectPid(unsigned long pid, const std::wstring& dllIn);
 // INJECT DWM: attach WarpHook.dll to dwm.exe (real desktop-level warping).
 // Needs elevation (SeDebugPrivilege); reports ERR otherwise.
 std::string injectDwm();
+std::string dwmDisplayRefresh();
 // Profile watcher: auto-inject into processes matching g_cfg.profExe rules
 void profilerStart();
 void profilerStop();
