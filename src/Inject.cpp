@@ -266,6 +266,7 @@ bool applyRelocs(std::vector<BYTE>& img, ULONGLONG newBase, std::string& err) {
     if (!dir.Size) return true;
     ULONGLONG delta = newBase - nt->OptionalHeader.ImageBase;
     if (!delta) return true;
+    const SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
     BYTE* p = &img[dir.VirtualAddress];
     BYTE* end = p + dir.Size;
     while (p + sizeof(IMAGE_BASE_RELOCATION) <= end) {
@@ -275,8 +276,12 @@ bool applyRelocs(std::vector<BYTE>& img, ULONGLONG newBase, std::string& err) {
         size_t n = (r->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
         for (size_t i = 0; i < n; i++) {
             WORD type = e[i] >> 12, off = e[i] & 0xFFF;
-            if (type == IMAGE_REL_BASED_DIR64)
-                *(ULONGLONG*)(p + r->VirtualAddress + off) += delta;
+            if (type == IMAGE_REL_BASED_DIR64) {
+                SIZE_T tgt = (SIZE_T)r->VirtualAddress + off;   // RVA inside the image
+                if (tgt + sizeof(ULONGLONG) > imageSize) continue;  // defensive: corrupt entry
+                // fixups are relative to the IMAGE start, not to the reloc dir
+                *(ULONGLONG*)(&img[0] + tgt) += delta;
+            }
         }
         p += r->SizeOfBlock;
     }
