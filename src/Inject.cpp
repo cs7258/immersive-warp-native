@@ -29,6 +29,13 @@
 
 namespace {
 
+// short hex for diagnostics ("0x1111")
+static std::string Hex(unsigned long long v) {
+    char b[32];
+    sprintf_s(b, "0x%llX", v);
+    return std::string(b);
+}
+
 // dwm.exe runs at System integrity: without SeDebugPrivilege OpenProcess
 // fails with ERROR_ACCESS_DENIED. Reports the reason so callers can tell
 // "not elevated" apart from "elevated but privilege grant failed".
@@ -201,6 +208,26 @@ ULONGLONG remoteModuleBase(DWORD pid, const wchar_t* name, HMODULE localFallback
     return (ULONGLONG)(uintptr_t)localFallback;   // 0 if not loaded locally
 }
 
+// Address of a locally-resolved function inside the target, correct even when
+// the export was forwarded into another DLL: the owning module is discovered
+// from the address itself, so kernel32!CreateFileA (forwarded to kernelbase)
+// maps to kernelbase's target base + offset, not kernel32's.
+ULONGLONG remoteAddrForFn(DWORD pid, FARPROC fn) {
+    if (!fn) return 0;
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)(uintptr_t)fn, &owner) || !owner)
+        return 0;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(owner, path, MAX_PATH)) return 0;
+    const wchar_t* base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    ULONGLONG rb = remoteModuleBase(pid, base, owner);
+    if (!rb) return 0;
+    return rb + ((ULONGLONG)(uintptr_t)fn - (ULONGLONG)(uintptr_t)owner);
+}
+
 // GetProcAddress results may be forwarder strings (kernel32 -> kernelbase).
 // Detect via the export directory range and follow the "dll.func" text.
 FARPROC resolveNoForwarder(HMODULE local, const char* name) {
@@ -282,16 +309,38 @@ bool resolveImports(HANDLE proc, DWORD pid, std::vector<BYTE>& img, std::string&
         auto thunk = (PIMAGE_THUNK_DATA)(&img[0] + imp->FirstThunk);
         auto orig = imp->OriginalFirstThunk
                         ? (PIMAGE_THUNK_DATA)(&img[0] + imp->OriginalFirstThunk) : thunk;
+        int badSlots = 0;
         for (; orig->u1.AddressOfData; orig++, thunk++) {
+            const char* fnName = nullptr;
             FARPROC fn;
-            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) {
                 fn = resolveNoForwarder(local, (LPCSTR)(orig->u1.Ordinal & 0xFFFF));
-            else {
+            } else {
                 auto byName = (PIMAGE_IMPORT_BY_NAME)(&img[0] + orig->u1.AddressOfData);
+                fnName = (const char*)byName->Name;
                 fn = resolveNoForwarder(local, (LPCSTR)byName->Name);
             }
             if (!fn) { err = std::string("export missing: ") + modName; return false; }
-            thunk->u1.Function = (ULONGLONG)rbase + ((ULONGLONG)fn - (ULONGLONG)local);
+            ULONGLONG addr = remoteAddrForFn(pid, fn);
+            if (!addr) {                       // owner not in the target
+                addr = (ULONGLONG)rbase + ((ULONGLONG)(uintptr_t)fn - (ULONGLONG)(uintptr_t)local);
+            }
+            thunk->u1.Function = addr;
+            // audit: a forwarded export resolves into another module, so the
+            // "same relative offset" relocation above produces an unmapped
+            // address. Verify in the target and report the offender - a bogus
+            // IAT slot is exactly how an entry point AVs on its first API call.
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (badSlots < 6 &&
+                (!VirtualQueryEx(proc, (LPCVOID)(uintptr_t)addr, &mbi, sizeof(mbi)) ||
+                 mbi.State != MEM_COMMIT ||
+                 !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                  PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))) {
+                badSlots++;
+                dbgLogLine(std::string("mm: BAD IAT ") + modName + "!" +
+                           (fnName ? fnName : "#ordinal") + " -> 0x" + Hex(addr).substr(2) +
+                           " local=0x" + Hex((ULONGLONG)(uintptr_t)fn).substr(2));
+            }
         }
     }
     return true;
@@ -348,6 +397,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     // init) - the CRT startup stub touches the image's TLS directory, and a
     // manual-mapped image has no loader TLS registration (round 28).
     ULONGLONG entryRva = nt->OptionalHeader.AddressOfEntryPoint;
+    ULONGLONG hitsRva = 0, stageRva = 0;             // exported progress counters
     {
         auto& exp = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
         if (exp.Size) {
@@ -357,7 +407,9 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
             auto funcs = (DWORD*)(&img[0] + edt->AddressOfFunctions);
             for (DWORD i = 0; i < edt->NumberOfNames; i++) {
                 const char* n = (const char*)(&img[0] + names[i]);
-                if (lstrcmpA(n, "HookEntry") == 0) { entryRva = funcs[ords[i]]; break; }
+                if (lstrcmpA(n, "HookEntry") == 0) entryRva = funcs[ords[i]];
+                else if (lstrcmpA(n, "g_entryHits") == 0) hitsRva = funcs[ords[i]];
+                else if (lstrcmpA(n, "g_stage") == 0) stageRva = funcs[ords[i]];
             }
         }
     }
@@ -412,7 +464,10 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     }
 
     const SIZE_T scSize = sc.size();
-    const SIZE_T resOff = (scSize + 7) & ~SIZE_T(7);
+    // The result block must start AT OR AFTER the end of the shellcode: the old
+    // round-up-to-64 rounded DOWN for size 72, so the block landed on top of the
+    // epilogue (xor eax/add rsp/ret) and the thread executed zeros -> AV.
+    const SIZE_T resOff = (scSize + 15) & ~SIZE_T(15);
     const SIZE_T total = resOff + 16;
     // reuse the tail of the image allocation for the result buffer: simpler
     // to allocate a small exec block for the shellcode + a separate RW result
@@ -432,7 +487,7 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         return false;
     }
-    BYTE* resBlock = scblock + ((scSize + 63) & ~SIZE_T(63));
+    BYTE* resBlock = scblock + resOff;
     std::vector<BYTE> local(total + 64, 0);
     memcpy(&local[0], &sc[0], scSize);
     ULONGLONG resR = (ULONGLONG)(uintptr_t)resBlock;
@@ -462,6 +517,20 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
     ULONGLONG result[2] = {};
     SIZE_T got = 0;
     BOOL rd = ReadProcessMemory(proc, resBlock, result, sizeof(result), &got) && got == sizeof(result);
+    // read the DLL's own counters back out of the target image: this tells us
+    // whether HookEntry ran at all, independently of the file logger
+    LONG hits = -1, stage = -1;
+    if (hitsRva) {
+        LONG v = -1; SIZE_T g2 = 0;
+        if (ReadProcessMemory(proc, remote + hitsRva, &v, sizeof(v), &g2) && g2 == sizeof(v)) hits = v;
+    }
+    if (stageRva) {
+        LONG v = -1; SIZE_T g2 = 0;
+        if (ReadProcessMemory(proc, remote + stageRva, &v, sizeof(v), &g2) && g2 == sizeof(v)) stage = v;
+    }
+    dbgLogLine("mm: probe result=" + std::to_string((unsigned long long)result[0]) + "/" +
+               std::to_string((unsigned long long)result[1]) + " entryHits=" +
+               std::to_string(hits) + " stage=" + std::to_string(stage));
     VirtualFreeEx(proc, scblock, 0, MEM_RELEASE);
     // the image stays mapped (the DLL keeps running); freeing it would kill
     // the hook, so remote is intentionally leaked into the target's lifetime.
@@ -470,13 +539,15 @@ bool manualMap(HANDLE proc, DWORD pid, const wchar_t* dllPath, std::string& err)
         // the shellcode never reached its final store: the entry AV'd and the
         // target process died under us
         err = "manual-map entry crashed in target (thread did not complete; result=" +
-              std::to_string((unsigned long long)result[0]) + "/" +
-              std::to_string((unsigned long long)result[1]) + ")";
+              Hex(result[0]) + "/" + Hex(result[1]) + " entryHits=" +
+              std::to_string(hits) + " stage=" + std::to_string(stage) + ")";
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         return false;
     }
     if (!result[0]) {
-        err = "HookEntry returned FALSE in target";
+        err = "HookEntry returned FALSE in target (result=" + Hex(result[0]) + "/" +
+              Hex(result[1]) + " entryHits=" + std::to_string(hits) +
+              " stage=" + std::to_string(stage) + ")";
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         return false;
     }

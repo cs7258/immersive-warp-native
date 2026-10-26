@@ -31,6 +31,19 @@ static HRESULT WINAPI HookCreateSwapChainForHwnd(IUnknown* fac, IUnknown* dev, H
                                                  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fd,
                                                  IDXGIOutput* ign, IDXGISwapChain1** out);
 
+// ------------------------------------------------------- exported progress
+// File logging can fail silently in a manual-mapped image (no CRT, possibly no
+// writable APPDATA under SYSTEM), so the injector reads these two counters back
+// out of the target image instead:
+//   g_entryHits - incremented as the first instruction of HookEntry
+//   g_stage     - how far HookEntry got: 1 enter, 2 unwind ok, 3 DTL ok,
+//                 4 VEH ok, 5 thread spawned, 6 returned
+// Both are exported data so the host can find their RVA in the export table.
+extern "C" {
+__declspec(dllexport) volatile LONG g_entryHits = 0;
+__declspec(dllexport) volatile LONG g_stage = 0;
+}
+
 // ---------------------------------------------------------------- logging
 // No CRT, no std::mutex here: manual-mapped images never run the CRT init, so
 // keep the logger to raw Win32 + Interlocked. Falls back to C://Windows//Temp
@@ -422,6 +435,13 @@ static volatile LONG g_swapCount = 0;
 // log "swapchain hooked" or bump the counter - test scripts key on that line
 // meaning a real application swapchain was captured
 static volatile LONG g_inSelfProbe = 0;
+// self-probe swapchains kept alive for the watchdog. File scope on purpose: a
+// function-local static initialised from a variable needs the CRT's
+// thread-safe-static guard, which lives in TLS - and a manual-mapped image has
+// no loader TLS registration, so that guard dereferences a foreign slot and
+// takes the init thread down (this was the DLL's only TLS consumer).
+static IDXGISwapChain* g_keep1 = nullptr;
+static IDXGISwapChain1* g_keep2 = nullptr;
 
 // Bitblt and flip-model swapchains are distinct implementation classes with
 // distinct vtables - patch each vtable once and remember its original Present.
@@ -826,8 +846,8 @@ static void createSelfProbes() {
         if (SUCCEEDED(fac->CreateSwapChain(dev, &sd, &sc)) && sc) {
             patchSwapchainVt(sc);
             // keep alive for the watchdog; leak one static ref on purpose
-            static IDXGISwapChain* s_keep1 = sc;
-            (void)s_keep1;
+            g_keep1 = sc;
+            (void)g_keep1;
             hookLog("selfprobe: bitblt probe created");
         } else {
             hookLog("selfprobe: bitblt probe failed");
@@ -843,8 +863,8 @@ static void createSelfProbes() {
         IDXGISwapChain1* sc1 = nullptr;
         if (SUCCEEDED(fac->CreateSwapChainForHwnd(dev, hw, &d1, nullptr, nullptr, &sc1)) && sc1) {
             patchSwapchainVt(sc1);
-            static IDXGISwapChain1* s_keep2 = sc1;
-            (void)s_keep2;
+            g_keep2 = sc1;
+            (void)g_keep2;
             hookLog("selfprobe: flip probe created");
         } else {
             hookLog("selfprobe: flip probe failed");
@@ -966,6 +986,10 @@ typedef LONG (WINAPI *PFN_RtlAddFunctionTable)(void*, ULONG, ULONG_PTR);
 
 extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        // counters first: they are the only channel that works when the file
+        // logger cannot open anything in this process
+        InterlockedIncrement((volatile LONG*)&g_entryHits);
+        g_stage = 1;                                 // entered
         hookLog("he: enter");
         // register the exception table ourselves: manual-mapped images get no
         // loader unwind registration, and std::mutex paths below can unwind
@@ -981,10 +1005,13 @@ extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason
                         edir.Size / sizeof(RUNTIME_FUNCTION), (ULONG_PTR)mod);
             }
         }
+        g_stage = 2;                                 // unwind table registered
         hookLog("he: unwound registered");
         DisableThreadLibraryCalls(mod);
+        g_stage = 3;
         hookLog("he: dtl ok");
         AddVectoredExceptionHandler(1, &excFilter);
+        g_stage = 4;
         hookLog("he: veh ok");
         char buf[300];
         wchar_t exe[MAX_PATH];
@@ -992,11 +1019,13 @@ extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason
         wsprintfA(buf, "WarpHook.dll attached pid=%u exe=%ls", (unsigned)GetCurrentProcessId(), exe);
         hookLog(buf);
         HANDLE t = CreateThread(nullptr, 0, initThread, nullptr, 0, &g_initTid);
+        g_stage = 5;                                 // init thread spawned
         hookLog("he: thread spawned");
         if (t) CloseHandle(t);
     } else if (reason == DLL_PROCESS_DETACH) {
         hookLog("WarpHook.dll detached");
     }
+    g_stage = 6;                                     // HookEntry finished
     return TRUE;
 }
 
