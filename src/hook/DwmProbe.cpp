@@ -302,6 +302,108 @@ static LONG WINAPI HookRetireFrame(void* a1, void* a2, void* a3, void* a4) {
     return g_origRetire ? ((PF)g_origRetire)(a1, a2, a3, a4) : 0;
 }
 
+// ------------------------------------------------- 晚注入：从内存里找回 dwm 的 D3D11 设备
+// 本 DLL 通常是在 dwm 已经建好 D3D11 设备之后才注入的，D3D11CreateDevice 不会再来
+// 第二次 —— 于是拿不到设备、也就拿不到合成 RT（实测 rtset=0 / rt=0x0 / fl=0）。
+// 但 dwm 进程里必然存在活的 ID3D11Device / ID3D11DeviceContext 对象：
+// 在 dwmcore 的可写段里扫描 "指针 -> 对象 -> vtable 三者都落在 d3d11.dll 映像内" 的
+// 候选，再用 QueryInterface 验证（失败的候选被 __except 吞掉，不会崩 dwm）。
+static HMODULE g_coreMod = nullptr;
+static ID3D11Device* g_dev = nullptr;
+static volatile LONG g_scanRounds = 0;
+
+static bool ptrInImage(const BYTE* p, const BYTE* base, ULONG_PTR size) {
+    return p >= base && p < base + size;
+}
+
+static ULONG_PTR imageSizeOf(HMODULE m) {
+    if (!m) return 0;
+    auto dos = (IMAGE_DOS_HEADER*)m;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto nt = (IMAGE_NT_HEADERS*)((BYTE*)m + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+// 返回 true 表示已经拿到设备（并已给 context vtable 打点）
+static bool recoverDeviceByScan() {
+    if (g_dev) return true;
+    HMODULE d3d = GetModuleHandleW(L"d3d11.dll");
+    if (!d3d || !g_coreMod) return false;
+    BYTE* dbase = (BYTE*)d3d;
+    ULONG_PTR dsize = imageSizeOf(d3d);
+    if (!dsize) return false;
+
+    auto dos = (IMAGE_DOS_HEADER*)g_coreMod;
+    auto nt = (IMAGE_NT_HEADERS*)((BYTE*)g_coreMod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+
+    InterlockedIncrement(&g_scanRounds);
+    int scanned = 0, cand = 0;
+    ID3D11Device* found = nullptr;
+
+    for (int s = 0; s < nt->FileHeader.NumberOfSections && !found; ++s) {
+        if (!(sec[s].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        BYTE* start = (BYTE*)g_coreMod + sec[s].VirtualAddress;
+        SIZE_T len = sec[s].Misc.VirtualSize;
+        if (!len) continue;
+        for (SIZE_T off = 0; off + sizeof(void*) <= len; off += sizeof(void*)) {
+            BYTE* p = start + off;
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) continue;
+            if (mbi.State != MEM_COMMIT) continue;
+            DWORD prot = mbi.Protect & 0xFF;
+            if (prot & PAGE_NOACCESS) continue;
+            scanned++;
+            void* q = *(void**)p;
+            if (!q || !ptrInImage((BYTE*)q, dbase, dsize)) continue;
+            void* vt = *(void**)q;
+            if (!ptrInImage((BYTE*)vt, dbase, dsize)) continue;
+            cand++;
+
+            ID3D11Device* dev = nullptr;
+            ID3D11DeviceContext* ctx = nullptr;
+            bool ok = false;
+            __try {
+                IUnknown* u = (IUnknown*)q;
+                if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11Device), (void**)&dev)) && dev) {
+                    ok = true;
+                } else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11DeviceContext), (void**)&ctx)) && ctx) {
+                    ctx->GetDevice(&dev);
+                    ctx->Release();
+                    ctx = nullptr;
+                    ok = (dev != nullptr);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                ok = false;
+                dev = nullptr;
+            }
+            if (ok && dev) { found = dev; break; }
+        }
+    }
+
+    char b[240];
+    wsprintfA(b, "dwm: scan round %ld: qwords=%d cand=%d -> device=%s",
+              g_scanRounds, scanned, cand, found ? "FOUND" : "no");
+    iwnHookLog(b);
+    if (!found) return false;
+
+    g_dev = found;                       // 自己持有，不释放
+    D3D_FEATURE_LEVEL fl = (D3D_FEATURE_LEVEL)0;
+    __try { fl = g_dev->GetFeatureLevel(); } __except (EXCEPTION_EXECUTE_HANDLER) { fl = (D3D_FEATURE_LEVEL)0; }
+    g_devFeature = (LONG)fl;
+    wsprintfA(b, "dwm: device recovered by scan feature=0x%X", (unsigned)fl);
+    iwnHookLog(b);
+
+    ID3D11DeviceContext* ic = nullptr;
+    if (SUCCEEDED(g_dev->GetImmediateContext(&ic)) && ic) {
+        patchContextVtable(ic);
+        ic->Release();
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------- 安装
 static HMODULE waitModule(const wchar_t* name, int ms) {
     for (int i = 0; i < ms / 100; i++) {
@@ -317,6 +419,10 @@ static DWORD WINAPI reporter(LPVOID) {
     LONG lastC = -1;
     for (;;) {
         Sleep(1000);
+        // 晚注入路径：设备早就建好了，D3D11CreateDevice 不会再来 —— 主动去内存里找
+        if (!g_origOMSetRT && g_coreMod && g_scanRounds < 30) {
+            recoverDeviceByScan();
+        }
         LONG c = g_cntConfirm;
         iwnHookCounters(g_cntConfirm, g_cntRtset, g_cntCreate);
         if (c != lastC) {
@@ -336,6 +442,7 @@ extern "C" void DwmProbeInstall(HMODULE self) {
     iwnHookLog("dwm: probe install begin");
 
     HMODULE core = waitModule(L"dwmcore.dll", 30000);
+    g_coreMod = core;
     HMODULE exe = GetModuleHandleW(nullptr);
     if (!core) {
         iwnHookLog("dwm: dwmcore.dll not loaded after 30s -> injection too early?");

@@ -754,6 +754,101 @@ std::string injectDwm() {
     return "OK INJECT dwm pids=" + pids + "\n";
 }
 
+// INJECT DWMRF: restart dwm.exe, then inject the hook the moment the NEW process
+// has d3d11.dll loaded. Late injection can never observe D3D11CreateDevice (dwm
+// built its composition device hours ago), so the probe cannot identify the
+// composed render target. A fresh dwm replays that call in front of our IAT hook.
+static bool modulePresentIn(DWORD pid, const wchar_t* name) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    bool hit = false;
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (lstrcmpiW(me.szModule, name) == 0) { hit = true; break; }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return hit;
+}
+
+static DWORD findDwmPid(DWORD exclude) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    DWORD pid = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (lstrcmpiW(pe.szExeFile, L"dwm.exe") != 0) continue;
+            if (pe.th32ProcessID == exclude) continue;
+            pid = pe.th32ProcessID;
+            break;
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return pid;
+}
+
+std::string injectDwmFresh() {
+    static std::mutex freshMutex;
+    std::lock_guard<std::mutex> freshLock(freshMutex);
+    if (!isElevated())
+        return "ERR DWMRF (not elevated: run the console as administrator)\n";
+    std::wstring dll = hookDllDefault();
+    wchar_t full[MAX_PATH] = {};
+    if (!GetFullPathNameW(dll.c_str(), MAX_PATH, full, nullptr) ||
+        GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES)
+        return "ERR DWMRF (WarpHook.dll not found next to exe)\n";
+
+    DWORD oldPid = findDwmPid(0);
+    if (!oldPid) return "ERR DWMRF (no dwm.exe running)\n";
+    ULONGLONG t0 = GetTickCount64();
+    HANDLE op = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, oldPid);
+    if (!op) return "ERR DWMRF (open dwm gle=" + std::to_string(GetLastError()) + ")\n";
+    TerminateProcess(op, 0);
+    WaitForSingleObject(op, 5000);
+    CloseHandle(op);
+    dbgLogLine("dwmrfree: terminated dwm " + std::to_string(oldPid));
+
+    DWORD newPid = 0;
+    while (GetTickCount64() - t0 < 15000) {
+        DWORD cand = findDwmPid(oldPid);
+        if (cand) {
+            newPid = cand;
+            if (modulePresentIn(cand, L"d3d11.dll")) break;
+        }
+        Sleep(5);
+    }
+    if (!newPid) return "ERR DWMRF (new dwm did not appear within 15s)\n";
+    ULONGLONG tMod = GetTickCount64();
+
+    bool ok = false;
+    std::string err;
+    for (int i = 0; i < 40 && !ok; ++i) {
+        HANDLE proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                                  PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+                                  FALSE, newPid);
+        if (proc) {
+            if (injectInto(proc, newPid, full, false, err)) ok = true;
+            CloseHandle(proc);
+        }
+        if (!ok) Sleep(25);
+    }
+    ULONGLONG tEnd = GetTickCount64();
+    if (!ok) {
+        std::string s = "ERR DWMRF new=" + std::to_string(newPid) + " inject failed: " + err;
+        dbgLogLine("dwmrfree: " + s);
+        return s + "\n";
+    }
+    std::string s = "OK DWMRF old=" + std::to_string(oldPid) + " new=" + std::to_string(newPid) +
+                    " d3d11_loaded_at=" + std::to_string((long long)(tMod - t0)) +
+                    "ms inject_took=" + std::to_string((long long)(tEnd - tMod)) + "ms";
+    dbgLogLine("dwmrfree: " + s);
+    return s + "\n";
+}
+
 // Force dwm to rebuild its composition surfaces: a display-mode round trip
 // tears down and recreates the desktop swapchains, and whatever class they
 // belong to gets caught live by the factory/vtable hooks already installed

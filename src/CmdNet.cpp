@@ -814,7 +814,9 @@ static std::string dispatch(std::string line) {
         }
         if (mode == "DWM") return injectDwm();
         if (mode == "DWMR") return dwmDisplayRefresh();
-        return "ERR INJECT (mode: LAUNCH|PID|DWM|DWMR)\n";
+        // DWMRF: kill dwm, then inject into the replacement at d3d11.dll load
+        if (mode == "DWMRF") return injectDwmFresh();
+        return "ERR INJECT (mode: LAUNCH|PID|DWM|DWMR|DWMRF)\n";
     }
 
     // Profiles (original Profiles-page parity): watcher auto-injects
