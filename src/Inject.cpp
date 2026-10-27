@@ -702,16 +702,9 @@ std::string injectDwm() {
         return "ERR INJECT dwm (WarpHook.dll not found next to exe)\n";
 
     static std::set<DWORD> g_done;   // attached pids: DLL already running there
-    // belt-and-braces duplicate guard: the DLL itself holds a named mutex once
-    // attached; if it is already there, skip before mapping a fighting copy.
-    // (g_done only covers this host process; SET hook=on's auto-inject and an
-    // explicit INJECT DWM in the same run must not map twice either.)
-    HANDLE already = OpenMutexW(SYNCHRONIZE, FALSE, IWN_HOOK_INSTANCE_MUTEX);
-    if (already) {
-        CloseHandle(already);
-        dbgLogLine("inject: dwm already carries WarpHook (instance mutex found) - skip");
-        return "OK INJECT dwm (already injected - skipped)\n";
-    }
+    // duplicate guard is per-target-process: the instance mutex name carries the
+    // pid (see hook_ipc.h). A fixed name lives in the *session* namespace and
+    // would make the first hooked process block every later injection.
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE)
         return "ERR INJECT dwm (snapshot failed)\n";
@@ -725,6 +718,20 @@ std::string injectDwm() {
             found++;
             DWORD pid = pe.th32ProcessID;
             if (g_done.count(pid)) { pids += std::to_string(pid) + "(attached) "; ok++; continue; }
+            {
+                wchar_t mn[64];
+                iwnHookInstanceMutexName(pid, mn, 64);
+                HANDLE already = OpenMutexW(SYNCHRONIZE, FALSE, mn);
+                if (already) {
+                    CloseHandle(already);
+                    g_done.insert(pid);
+                    dbgLogLine("inject: pid=" + std::to_string(pid) +
+                               " already carries WarpHook - skip");
+                    pids += std::to_string(pid) + "(attached) ";
+                    ok++;
+                    continue;
+                }
+            }
             HANDLE proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
                                       PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
                                       FALSE, pid);

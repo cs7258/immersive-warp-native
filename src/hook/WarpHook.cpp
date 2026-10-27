@@ -1079,7 +1079,9 @@ extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason
         // DWM). Two mapped copies fight over the same dxgi vtables forever -
         // each copy's watchdog sees the other's trampoline in slot 8, treats
         // it as a revert and repatches, 0.5s forever. First copy wins.
-        g_instMutex = CreateMutexW(nullptr, TRUE, IWN_HOOK_INSTANCE_MUTEX);
+        wchar_t instName[64];
+        iwnHookInstanceMutexName(GetCurrentProcessId(), instName, 64);
+        g_instMutex = CreateMutexW(nullptr, TRUE, instName);
         if (g_instMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
             g_stage = 7;                             // duplicate copy, no-op
             hookLog("he: another instance already active in this process - no-op");

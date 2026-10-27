@@ -20,8 +20,26 @@
 #define IWN_HOOK_MAPPING_NAME L"IWN_WarpHook_v3"
 #define IWN_HOOK_MAGIC        0x33485749u   // 'IWH3'
 // single-instance guard: the DLL creates it on attach; the host opens it
-// before injecting to skip duplicate mappings (two copies fight over vtables)
-#define IWN_HOOK_INSTANCE_MUTEX L"Local\\IWNWarpHookSingleInstance"
+// before injecting to skip duplicate mappings (two copies fight over vtables).
+// IMPORTANT: the name must include the *target process id*. "Local\" is the
+// session namespace, so a fixed name is created by whichever process we hook
+// first and then blocks every later injection in that session - the host would
+// silently skip real targets ("already injected") and the DLL would return
+// stage=7 without doing anything.
+#define IWN_HOOK_INSTANCE_PREFIX L"Local\\IWNWarpHook_"
+static __inline void iwnHookInstanceMutexName(DWORD pid, wchar_t* out, int cap) {
+    if (!out || cap <= 0) return;
+    wchar_t num[16];
+    int n = 0;
+    unsigned v = (unsigned)pid;
+    if (!v) { num[n++] = L'0'; }
+    while (v && n < 15) { num[n++] = (wchar_t)(L'0' + (v % 10)); v /= 10; }
+    int i = 0;
+    const wchar_t* p = IWN_HOOK_INSTANCE_PREFIX;
+    for (; *p && i < cap - 1; ++p) out[i++] = *p;
+    while (n > 0 && i < cap - 1) out[i++] = num[--n];
+    out[i] = 0;
+}
 
 // mesh capacity per output: rows/cols up to 12 with subdivide 8 fits
 // (73*89 = 6497); the host skips publishing larger grids for that slot
