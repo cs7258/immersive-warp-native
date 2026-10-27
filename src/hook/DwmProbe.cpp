@@ -103,6 +103,30 @@ static void** findIatSlot(HMODULE mod, const char* dll, const char* fn) {
     return nullptr;
 }
 
+// 判断地址落在哪个已加载模块里 —— 用于识别 IAT 槽是否已被"别人"（原版载荷）替换
+static void ownerModuleOf(void* addr, char* out, int cap) {
+    if (cap < 4) return;
+    out[0] = 0;
+    if (!addr) { lstrcpynA(out, "null", cap); return; }
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)addr, &m) || !m) {
+        lstrcpynA(out, "unmapped", cap);
+        return;
+    }
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(m, path, MAX_PATH);
+    const wchar_t* base = path;
+    for (const wchar_t* p = path; *p; ++p) if (*p == L'\\' || *p == L'/') base = p + 1;
+    int i = 0;
+    for (; base[i] && i < cap - 1; ++i) {
+        wchar_t c = base[i];
+        out[i] = (c < 128) ? (char)c : '?';
+    }
+    out[i] = 0;
+}
+
 static bool iatSwap(void** slot, void* newFn, void** oldFn) {
     if (!slot) return false;
     DWORD old = 0;
@@ -329,7 +353,11 @@ extern "C" void DwmProbeInstall(HMODULE self) {
     if (iatSwap(findIatSlot(core, "d3d11.dll", "D3D11CreateDevice"),
                 (void*)&HookD3D11CreateDevice, &old)) {
         g_origCreate = (PFN_CreateDevice)old;
-        iwnHookLog("dwm: IAT hooked d3d11!D3D11CreateDevice (dwmcore)");
+        char om[64];
+        ownerModuleOf(old, om, sizeof(om));
+        wsprintfA(b, "dwm: IAT hooked d3d11!D3D11CreateDevice (dwmcore) prev=%s %08X",
+                  om, (unsigned)(ULONG_PTR)old);
+        iwnHookLog(b);
     } else if (iatSwap(findIatSlot(exe, "d3d11.dll", "D3D11CreateDevice"),
                        (void*)&HookD3D11CreateDevice, &old)) {
         g_origCreate = (PFN_CreateDevice)old;
@@ -343,7 +371,11 @@ extern "C" void DwmProbeInstall(HMODULE self) {
     if (iatSwap(findIatSlot(core, "win32u.dll", "NtDCompositionConfirmFrame"),
                 (void*)&HookConfirmFrame, &o2)) {
         g_origConfirm = o2;
-        iwnHookLog("dwm: IAT hooked win32u!NtDCompositionConfirmFrame");
+        char om[64];
+        ownerModuleOf(o2, om, sizeof(om));
+        wsprintfA(b, "dwm: IAT hooked win32u!NtDCompositionConfirmFrame prev=%s %08X",
+                  om, (unsigned)(ULONG_PTR)o2);
+        iwnHookLog(b);
     } else {
         iwnHookLog("dwm: ConfirmFrame IAT slot not found");
     }
@@ -351,7 +383,11 @@ extern "C" void DwmProbeInstall(HMODULE self) {
     if (iatSwap(findIatSlot(core, "win32u.dll", "NtDCompositionRetireFrame"),
                 (void*)&HookRetireFrame, &o3)) {
         g_origRetire = o3;
-        iwnHookLog("dwm: IAT hooked win32u!NtDCompositionRetireFrame");
+        char om[64];
+        ownerModuleOf(o3, om, sizeof(om));
+        wsprintfA(b, "dwm: IAT hooked win32u!NtDCompositionRetireFrame prev=%s %08X",
+                  om, (unsigned)(ULONG_PTR)o3);
+        iwnHookLog(b);
     } else {
         iwnHookLog("dwm: RetireFrame IAT slot not found");
     }
