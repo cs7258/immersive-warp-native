@@ -53,22 +53,39 @@ typedef BOOL(WINAPI* PFN_SPVCT)(HANDLE, PVOID, SIZE_T, ULONG, CfgTargetInfo*);
 static HMODULE g_selfBase = nullptr;   // 由 HookEntry 传入（manual map 不在加载器链表里）
 
 static void registerCfg(void* fn, const char* tag) {
-    HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
-    auto fnSet = kb ? (PFN_SPVCT)GetProcAddress(kb, "SetProcessValidCallTargets") : nullptr;
-    char b[180];
-    if (!fnSet || !g_selfBase) {
-        wsprintfA(b, "dwm: CFG register %s skipped (api=%d base=%d)", tag, fnSet != nullptr,
-                  g_selfBase != nullptr);
+    // SetProcessValidCallTargets only accepts pages backed by an image section;
+    // our manual-mapped .text is MEM_PRIVATE, so it always fails with
+    // ERROR_INVALID_PARAMETER (87) - that is what the old log showed. It is also
+    // unnecessary: CFG's bitmap covers image pages, and executable pages that
+    // belong to no image are treated as VALID targets by default (which is why
+    // the IAT detours were called every frame for 28s without dwm dying).
+    // So: classify the page instead of calling an API that cannot succeed.
+    ULONG_PTR page = (ULONG_PTR)fn & ~(ULONG_PTR)0xFFF;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    char b[200];
+    if (!VirtualQuery((void*)page, &mbi, sizeof(mbi))) {
+        wsprintfA(b, "dwm: CFG %s VirtualQuery failed gle=%u", tag, (unsigned)GetLastError());
         iwnHookLog(b);
         return;
     }
-    ULONG_PTR page = (ULONG_PTR)fn & ~(ULONG_PTR)0xFFF;
+    if (mbi.Type != MEM_IMAGE) {
+        wsprintfA(b, "dwm: CFG %s -> non-image page (MEM_PRIVATE), valid target by default", tag);
+        iwnHookLog(b);
+        return;
+    }
+    HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+    auto fnSet = kb ? (PFN_SPVCT)GetProcAddress(kb, "SetProcessValidCallTargets") : nullptr;
+    if (!fnSet) {
+        wsprintfA(b, "dwm: CFG %s image page but API missing", tag);
+        iwnHookLog(b);
+        return;
+    }
     CfgTargetInfo ti = {};
     ti.Offset = (ULONG_PTR)fn - page;
     ti.Flags = 1;                       // CFG_CALL_TARGET_VALID
     SetLastError(0);
     BOOL ok = fnSet(GetCurrentProcess(), (PVOID)page, 0x1000, 1, &ti);
-    wsprintfA(b, "dwm: CFG register %s ok=%d gle=%u", tag, ok, (unsigned)GetLastError());
+    wsprintfA(b, "dwm: CFG %s image page register ok=%d gle=%u", tag, ok, (unsigned)GetLastError());
     iwnHookLog(b);
 }
 

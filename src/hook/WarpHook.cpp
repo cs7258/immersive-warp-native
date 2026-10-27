@@ -1120,10 +1120,22 @@ extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason
         // and HookEntry must return promptly for the manual-map handshake.
         const wchar_t* base = wcsrchr(exe, L'\\');
         if (base && _wcsicmp(base + 1, L"dwm.exe") == 0) {
-            hookLog("he: dwm.exe detected -> arming desktop probe");
+            // PROBE-ONLY mode. The generic warp engine must never run inside dwm:
+            // installFactoryHooks() patches the dxgi Present vtable,
+            // createSelfProbes() builds 8x8 swapchains and probePresentThread
+            // pushes them through the warp pass, which dereferences surfaces dwm
+            // owns. Measured 2026-10-27 20:36: three injections -> three dwm
+            // crashes ~1.0s later (0xC0000005 in d3d11.dll+0x7DCB0, then twice
+            // through heap addresses) = three black screens per run.
+            // dwm has no DXGI swapchain to hook anyway (it imports only
+            // DXGIDeclareAdapterRemovalSupport), so the engine is pure risk here.
+            // Only the submit-boundary probe is wanted.
+            hookLog("he: dwm.exe detected -> PROBE ONLY (engine skipped)");
             g_selfMod = mod;
             HANDLE tp = CreateThread(nullptr, 0, probeThread, nullptr, 0, nullptr);
             if (tp) CloseHandle(tp);
+            g_stage = 6;                             // done (probe path only)
+            return TRUE;
         }
         HANDLE t = CreateThread(nullptr, 0, initThread, nullptr, 0, &g_initTid);
         g_stage = 5;                                 // init thread spawned
