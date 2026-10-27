@@ -47,8 +47,9 @@ __declspec(dllexport) volatile LONG g_stage = 0;
 static HANDLE g_instMutex = nullptr;   // single-instance guard (leaked on purpose)
 
 // desktop warp stage 0 probe (DwmProbe.cpp): only armed inside dwm.exe
-extern "C" void DwmProbeInstall();
-static DWORD WINAPI probeThread(LPVOID) { DwmProbeInstall(); return 0; }
+extern "C" void DwmProbeInstall(HMODULE self);
+static HMODULE g_selfMod = nullptr;
+static DWORD WINAPI probeThread(LPVOID) { DwmProbeInstall(g_selfMod); return 0; }
 
 // ---------------------------------------------------------------- logging
 // No CRT, no std::mutex here: manual-mapped images never run the CRT init, so
@@ -1118,6 +1119,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason
         const wchar_t* base = wcsrchr(exe, L'\\');
         if (base && _wcsicmp(base + 1, L"dwm.exe") == 0) {
             hookLog("he: dwm.exe detected -> arming desktop probe");
+            g_selfMod = mod;
             HANDLE tp = CreateThread(nullptr, 0, probeThread, nullptr, 0, nullptr);
             if (tp) CloseHandle(tp);
         }

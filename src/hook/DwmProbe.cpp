@@ -36,6 +36,36 @@ static volatile LONG g_rtW = 0, g_rtH = 0, g_rtFmt = 0;
 static volatile LONG g_devFeature = 0;
 static volatile LONG g_installed = 0;
 
+// ---------------------------------------------------------------- CFG 注册
+// dwm.exe 全程开启 Control Flow Guard。IAT 槽里的间接 call 会被 CFG 校验，
+// 而 manual-mapped 的 DLL 不在进程 CFG 位图里 —— 不注册的话第一次调用
+// detour 就是 fail-fast（dwm 直接重启）。SetProcessValidCallTargets 允许
+// 进程内把自己代码页标为合法调用目标。
+struct CfgTargetInfo { ULONG_PTR Offset; ULONG_PTR Flags; };
+typedef BOOL(WINAPI* PFN_SPVCT)(HANDLE, PVOID, SIZE_T, ULONG, CfgTargetInfo*);
+
+static HMODULE g_selfBase = nullptr;   // 由 HookEntry 传入（manual map 不在加载器链表里）
+
+static void registerCfg(void* fn, const char* tag) {
+    HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+    auto fnSet = kb ? (PFN_SPVCT)GetProcAddress(kb, "SetProcessValidCallTargets") : nullptr;
+    char b[180];
+    if (!fnSet || !g_selfBase) {
+        wsprintfA(b, "dwm: CFG register %s skipped (api=%d base=%d)", tag, fnSet != nullptr,
+                  g_selfBase != nullptr);
+        iwnHookLog(b);
+        return;
+    }
+    ULONG_PTR page = (ULONG_PTR)fn & ~(ULONG_PTR)0xFFF;
+    CfgTargetInfo ti = {};
+    ti.Offset = (ULONG_PTR)fn - page;
+    ti.Flags = 1;                       // CFG_CALL_TARGET_VALID
+    SetLastError(0);
+    BOOL ok = fnSet(GetCurrentProcess(), (PVOID)page, 0x1000, 1, &ti);
+    wsprintfA(b, "dwm: CFG register %s ok=%d gle=%u", tag, ok, (unsigned)GetLastError());
+    iwnHookLog(b);
+}
+
 // ---------------------------------------------------------------- IAT 替换
 // 在模块的导入表里找 (dll, func) 的 IAT 槽地址；找不到返回 nullptr。
 static void** findIatSlot(HMODULE mod, const char* dll, const char* fn) {
@@ -222,8 +252,9 @@ static DWORD WINAPI reporter(LPVOID) {
     return 0;
 }
 
-extern "C" void DwmProbeInstall() {
+extern "C" void DwmProbeInstall(HMODULE self) {
     if (InterlockedCompareExchange((volatile LONG*)&g_installed, 1, 0) != 0) return;
+    g_selfBase = self;
     iwnHookLog("dwm: probe install begin");
 
     HMODULE core = waitModule(L"dwmcore.dll", 30000);
@@ -232,6 +263,12 @@ extern "C" void DwmProbeInstall() {
         iwnHookLog("dwm: dwmcore.dll not loaded after 30s -> injection too early?");
     }
     char b[220];
+
+    // 先把自己标成合法 CFG 调用目标，否则第一次间接调用就 fail-fast
+    registerCfg((void*)&HookD3D11CreateDevice, "D3D11CreateDevice");
+    registerCfg((void*)&HookOMSetRenderTargets, "OMSetRenderTargets");
+    registerCfg((void*)&HookConfirmFrame, "ConfirmFrame");
+    registerCfg((void*)&HookRetireFrame, "RetireFrame");
 
     // 1) D3D11CreateDevice（dwm.exe / dwmcore.dll 任一处）
     void* old = nullptr;
