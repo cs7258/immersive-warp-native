@@ -254,7 +254,11 @@ static void noteRenderTarget(ID3D11RenderTargetView* rtv) {
 #define VT_OMSETRT_UAV 34
 static void patchContextVtable(ID3D11DeviceContext* ctx) {
     if (!ctx) return;
-    g_ctx = ctx;                       // 交给我们"提交边界反查 RT"使用
+    if (g_ctx != ctx) {                // 交给我们"提交边界反查 RT"使用，自己持引用
+        if (g_ctx) g_ctx->Release();
+        g_ctx = ctx;
+        ctx->AddRef();
+    }
     void** vt = *(void***)ctx;
     if (!vt) return;
     void* cur = vt[VT_OMSETRT];
@@ -390,83 +394,115 @@ static ULONG_PTR imageSizeOf(HMODULE m) {
     return nt->OptionalHeader.SizeOfImage;
 }
 
-// 返回 true 表示已经拿到设备（并已给 context vtable 打点）
+// 返回 true 表示已经拿到设备（并已给 context vtable 打点）。
+//
+// 旧实现只在 dwmcore 的可写段里找，并且要求"对象指针本身也落在 d3d11.dll 映像内"——
+// 这个条件对真实 COM 对象永远不成立：ID3D11Device / Context / Texture 的实例都分配在
+// **堆**上（MEM_PRIVATE），只有它的 vtable 落在 d3d11.dll 映像里。实测 30 轮全是 cand=0。
+// 正解：遍历所有私有可读内存，把"被扫位置本身"当成对象首地址，要求
+//   ① 第一个 qword（vtable）落在 d3d11 映像内
+//   ② vtable 的第一个槽（QueryInterface 实现）也落在 d3d11 映像内
+// 只有真 COM 对象同时满足；再用 QueryInterface 验证（失败候选被 __except 吞掉）。
+static bool ctxHasRT(ID3D11Device* dev) {
+    ID3D11DeviceContext* c = nullptr;
+    __try { dev->GetImmediateContext(&c); } __except (EXCEPTION_EXECUTE_HANDLER) { c = nullptr; }
+    if (!c) return false;
+    ID3D11RenderTargetView* rtv = nullptr;
+    __try { c->OMGetRenderTargets(1, &rtv, nullptr); } __except (EXCEPTION_EXECUTE_HANDLER) { rtv = nullptr; }
+    c->Release();
+    if (!rtv) return false;
+    rtv->Release();
+    return true;
+}
+
+static bool looksLikeD3DObject(BYTE* p, const BYTE* dbase, ULONG_PTR dsize) {
+    void* vt = *(void**)p;
+    if (!ptrInImage((BYTE*)vt, dbase, dsize)) return false;
+    void* vt0 = *(void**)vt;               // vtable[0] = QueryInterface
+    return ptrInImage((BYTE*)vt0, dbase, dsize);
+}
+
 static bool recoverDeviceByScan() {
     if (g_dev) return true;
     HMODULE d3d = GetModuleHandleW(L"d3d11.dll");
-    if (!d3d || !g_coreMod) return false;
+    if (!d3d) return false;
     BYTE* dbase = (BYTE*)d3d;
     ULONG_PTR dsize = imageSizeOf(d3d);
     if (!dsize) return false;
 
-    auto dos = (IMAGE_DOS_HEADER*)g_coreMod;
-    auto nt = (IMAGE_NT_HEADERS*)((BYTE*)g_coreMod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    auto sec = IMAGE_FIRST_SECTION(nt);
-
     InterlockedIncrement(&g_scanRounds);
-    int scanned = 0, cand = 0;
-    ID3D11Device* found = nullptr;
+    int qwords = 0, cand = 0, qi = 0;
+    ID3D11Device* best = nullptr;      // 有绑定 RT 的（合成用的那个）
+    ID3D11Device* any = nullptr;       // 任一个，作后备
 
-    for (int s = 0; s < nt->FileHeader.NumberOfSections && !found; ++s) {
-        if (!(sec[s].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
-        BYTE* start = (BYTE*)g_coreMod + sec[s].VirtualAddress;
-        SIZE_T len = sec[s].Misc.VirtualSize;
-        if (!len) continue;
-        for (SIZE_T off = 0; off + sizeof(void*) <= len; off += sizeof(void*)) {
-            BYTE* p = start + off;
-            MEMORY_BASIC_INFORMATION mbi;
-            if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) continue;
-            if (mbi.State != MEM_COMMIT) continue;
-            DWORD prot = mbi.Protect & 0xFF;
-            if (prot & PAGE_NOACCESS) continue;
-            scanned++;
-            void* q = *(void**)p;
-            if (!q || !ptrInImage((BYTE*)q, dbase, dsize)) continue;
-            void* vt = *(void**)q;
-            if (!ptrInImage((BYTE*)vt, dbase, dsize)) continue;
-            cand++;
-
-            ID3D11Device* dev = nullptr;
-            ID3D11DeviceContext* ctx = nullptr;
-            bool ok = false;
-            __try {
-                IUnknown* u = (IUnknown*)q;
-                if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11Device), (void**)&dev)) && dev) {
-                    ok = true;
-                } else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11DeviceContext), (void**)&ctx)) && ctx) {
-                    ctx->GetDevice(&dev);
-                    ctx->Release();
-                    ctx = nullptr;
-                    ok = (dev != nullptr);
+    BYTE* addr = nullptr;
+    while ((ULONG_PTR)addr < 0x7FFFFFFF0000ULL && !best) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(addr, &mbi, sizeof(mbi))) break;
+        BYTE* base = (BYTE*)mbi.BaseAddress;
+        SIZE_T sz = mbi.RegionSize;
+        if (!sz) break;
+        DWORD prot = mbi.Protect & 0xFF;
+        bool readable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                 PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && readable &&
+            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && sz <= (512u << 20) &&
+            !ptrInImage(base, dbase, dsize)) {
+            for (SIZE_T off = 0; off + sizeof(void*) <= sz; off += sizeof(void*)) {
+                BYTE* p = base + off;
+                if (!looksLikeD3DObject(p, dbase, dsize)) continue;
+                cand++;
+                ID3D11Device* dev = nullptr;
+                __try {
+                    ((IUnknown*)p)->QueryInterface(__uuidof(ID3D11Device), (void**)&dev);
+                } __except (EXCEPTION_EXECUTE_HANDLER) { dev = nullptr; }
+                if (!dev) {
+                    ID3D11DeviceContext* c2 = nullptr;
+                    __try {
+                        ((IUnknown*)p)->QueryInterface(__uuidof(ID3D11DeviceContext), (void**)&c2);
+                        if (c2) { c2->GetDevice(&dev); c2->Release(); }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { dev = nullptr; }
                 }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                ok = false;
-                dev = nullptr;
+                if (!dev) continue;
+                qi++;
+                if (ctxHasRT(dev)) {
+                    if (best) dev->Release();
+                    else {
+                        best = dev;
+                        if (any) { any->Release(); any = nullptr; }
+                    }
+                } else if (!best && !any) {
+                    any = dev;
+                } else {
+                    dev->Release();
+                }
+                if (best) break;
             }
-            if (ok && dev) { found = dev; break; }
+            qwords += (int)(sz / sizeof(void*));
         }
+        if (best) break;
+        addr = base + sz;
     }
 
-    char b[240];
-    wsprintfA(b, "dwm: scan round %ld: qwords=%d cand=%d -> device=%s",
-              g_scanRounds, scanned, cand, found ? "FOUND" : "no");
+    char b[260];
+    wsprintfA(b, "dwm: scan round %ld: qwords=%d cand=%d qi=%d -> %s",
+              g_scanRounds, qwords, cand, qi,
+              best ? "FOUND with bound RT" : (any ? "FOUND no-RT" : "no"));
     iwnHookLog(b);
-    if (!found) return false;
 
-    g_dev = found;                       // 自己持有，不释放
+    ID3D11Device* use = best ? best : any;
+    if (!use) return false;
+    g_dev = use;
     D3D_FEATURE_LEVEL fl = (D3D_FEATURE_LEVEL)0;
     __try { fl = g_dev->GetFeatureLevel(); } __except (EXCEPTION_EXECUTE_HANDLER) { fl = (D3D_FEATURE_LEVEL)0; }
     g_devFeature = (LONG)fl;
-    wsprintfA(b, "dwm: device recovered by scan feature=0x%X", (unsigned)fl);
-    iwnHookLog(b);
-
     ID3D11DeviceContext* ic = nullptr;
-    g_dev->GetImmediateContext(&ic);   // returns void, cannot be wrapped in SUCCEEDED()
-    if (ic) {
-        patchContextVtable(ic);
-        ic->Release();
-    }
+    __try { g_dev->GetImmediateContext(&ic); } __except (EXCEPTION_EXECUTE_HANDLER) { ic = nullptr; }
+    bool hooked = false;
+    if (ic) { patchContextVtable(ic); ic->Release(); hooked = true; }
+    wsprintfA(b, "dwm: device recovered by scan feature=0x%X ctx=%s",
+              (unsigned)fl, hooked ? "ok" : "none");
+    iwnHookLog(b);
     return true;
 }
 
@@ -485,8 +521,9 @@ static DWORD WINAPI reporter(LPVOID) {
     LONG lastC = -1;
     for (;;) {
         Sleep(1000);
-        // 晚注入路径：设备早就建好了，D3D11CreateDevice 不会再来 —— 主动去内存里找
-        if (!g_origOMSetRT && g_coreMod && g_scanRounds < 30) {
+        // 晚注入路径：设备早就建好了，D3D11CreateDevice 不会再来 —— 主动去内存里找。
+        // 全地址空间扫描很重（几十 MB），只在前 4 轮做，避免拖慢 dwm。
+        if (!g_origOMSetRT && g_scanRounds < 4) {
             recoverDeviceByScan();
         }
         LONG c = g_cntConfirm;
