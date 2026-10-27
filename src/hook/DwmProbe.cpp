@@ -21,6 +21,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi.h>
 #include "hook_ipc.h"
 
 extern void iwnHookLog(const char* line);
@@ -130,6 +131,9 @@ static HRESULT(WINAPI* g_origOMSetRT)(ID3D11DeviceContext*, UINT,
 static PVOID g_origConfirm = nullptr;
 static PVOID g_origRetire = nullptr;
 
+// 只做一次的深度采集开关（零初始化，不触发 thread-safe static guard）
+static volatile LONG g_deepDone = 0;
+
 // 合成帧的 RT 描述（只保留数值，不持有纹理引用，避免拖住 dwm 的资源）
 static void noteRenderTarget(ID3D11RenderTargetView* rtv) {
     if (!rtv) return;
@@ -148,6 +152,56 @@ static void noteRenderTarget(ID3D11RenderTargetView* rtv) {
             wsprintfA(b, "dwm: RT now %ldx%ld fmt=%ld mip=%u arr=%u samp=%u",
                       w, h, f, (unsigned)d.MipLevels, (unsigned)d.ArraySize, (unsigned)d.SampleDesc.Count);
             iwnHookLog(b);
+        }
+        // ---- 一次性深度采集：Stage 1 能不能在这个 RT 上做 copy + 网格变形 ----
+        if (InterlockedCompareExchange(&g_deepDone, 1, 0) == 0) {
+            char b[300];
+            wsprintfA(b, "dwm: RTDESC %lux%lu fmt=%lu mip=%u arr=%u samp=%u/%u usage=%u bind=0x%X cpu=0x%X misc=0x%X",
+                      (unsigned long)d.Width, (unsigned long)d.Height, (unsigned long)d.Format,
+                      (unsigned)d.MipLevels, (unsigned)d.ArraySize,
+                      (unsigned)d.SampleDesc.Count, (unsigned)d.SampleDesc.Quality,
+                      (unsigned)d.Usage, (unsigned)d.BindFlags,
+                      (unsigned)d.CPUAccessFlags, (unsigned)d.MiscFlags);
+            iwnHookLog(b);
+
+            ID3D11Device* dev = nullptr;
+            tex->GetDevice(&dev);
+            if (dev) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+                sd.Format = d.Format;
+                sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                sd.Texture2D.MipLevels = 1;
+                ID3D11ShaderResourceView* srv = nullptr;
+                HRESULT shr = dev->CreateShaderResourceView(tex, &sd, &srv);
+                wsprintfA(b, "dwm: SRV on composed RT hr=0x%08X -> %s",
+                          (unsigned)shr, SUCCEEDED(shr) ? "warp input OK" : "cannot sample (needs staging copy)");
+                iwnHookLog(b);
+                if (srv) srv->Release();
+
+                D3D11_TEXTURE2D_DESC cd = d;
+                cd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+                cd.MiscFlags = 0;
+                cd.CPUAccessFlags = 0;
+                cd.Usage = D3D11_USAGE_DEFAULT;
+                ID3D11Texture2D* twin = nullptr;
+                HRESULT chr = dev->CreateTexture2D(&cd, nullptr, &twin);
+                wsprintfA(b, "dwm: twin RT %lux%lu create hr=0x%08X",
+                          (unsigned long)cd.Width, (unsigned long)cd.Height, (unsigned)chr);
+                iwnHookLog(b);
+                if (twin) twin->Release();
+
+                dev->Release();
+            }
+
+            IDXGIResource* dxres = nullptr;
+            if (SUCCEEDED(res->QueryInterface(__uuidof(IDXGIResource), (void**)&dxres)) && dxres) {
+                HANDLE sh = nullptr;
+                HRESULT ghr = dxres->GetSharedHandle(&sh);
+                wsprintfA(b, "dwm: RT IDXGIResource hr=0x%08X shared=%08X",
+                          (unsigned)ghr, (unsigned)(ULONG_PTR)sh);
+                iwnHookLog(b);
+                dxres->Release();
+            }
         }
         tex->Release();
     }
