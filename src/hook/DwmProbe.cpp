@@ -391,35 +391,29 @@ static LONG WINAPI HookRetireFrame(void* a1, void* a2, void* a3, void* a4) {
 // ------------------------------------------------- 晚注入：从内存里找回 dwm 的 D3D11 设备
 // 本 DLL 通常是在 dwm 已经建好 D3D11 设备之后才注入的，D3D11CreateDevice 不会再来
 // 第二次 —— 于是拿不到设备、也就拿不到合成 RT（实测 rtset=0 / rt=0x0 / fl=0）。
-// 但 dwm 进程里必然存在活的 ID3D11Device / ID3D11DeviceContext 对象：
-// 在 dwmcore 的可写段里扫描 "指针 -> 对象 -> vtable 三者都落在 d3d11.dll 映像内" 的
-// 候选，再用 QueryInterface 验证（失败的候选被 __except 吞掉，不会崩 dwm）。
+// 但 dwm 进程里必然存在活的 ID3D11Device / ID3D11DeviceContext 对象，用下面的
+// vtable 指纹法把它们找出来（不调用任何未验证的指针）。
 static HMODULE g_coreMod = nullptr;
 static ID3D11Device* g_dev = nullptr;
 static volatile LONG g_scanRounds = 0;
 
-static bool ptrInImage(const BYTE* p, const BYTE* base, ULONG_PTR size) {
-    return p >= base && p < base + size;
-}
-
-static ULONG_PTR imageSizeOf(HMODULE m) {
-    if (!m) return 0;
-    auto dos = (IMAGE_DOS_HEADER*)m;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    auto nt = (IMAGE_NT_HEADERS*)((BYTE*)m + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-    return nt->OptionalHeader.SizeOfImage;
-}
-
-// 返回 true 表示已经拿到设备（并已给 context vtable 打点）。
+// ------------------------------------------------ 设备定位（不做任何盲虚调用）
 //
-// 旧实现只在 dwmcore 的可写段里找，并且要求"对象指针本身也落在 d3d11.dll 映像内"——
-// 这个条件对真实 COM 对象永远不成立：ID3D11Device / Context / Texture 的实例都分配在
-// **堆**上（MEM_PRIVATE），只有它的 vtable 落在 d3d11.dll 映像里。实测 30 轮全是 cand=0。
-// 正解：遍历所有私有可读内存，把"被扫位置本身"当成对象首地址，要求
-//   ① 第一个 qword（vtable）落在 d3d11 映像内
-//   ② vtable 的第一个槽（QueryInterface 实现）也落在 d3d11 映像内
-// 只有真 COM 对象同时满足；再用 QueryInterface 验证（失败候选被 __except 吞掉）。
+// 关键教训（2026-10-27，两次黑屏换来）：
+// 上一版扫描把"对象首 qword 落在 d3d11 映像内"当成"可能是 COM 对象"，然后对它调
+// QueryInterface。堆里大量普通数据（缓存下来的 vtable 指针、函数指针、跳转表）也满足
+// 那个条件，对它们做虚调用 = 跳到 d3d11 内部某个随机函数、this 指向垃圾 -> AV。
+// 实测特征：注入后**恰好 1.0 秒**（reporter 线程第一轮扫描）dwm 死，
+// 0xC0000005 落在 d3d11.dll+0x7DCB0，两次运行同一地址，且日志里从来没有扫描汇总行
+// （= 死在扫描中途）。dwm 一死，原版载荷随之消失，桌面扭曲失效。
+//
+// 现在的做法：先自己建一个临时设备，把它的 vtable 指针当**指纹**，再按指纹在私有
+// 内存里找"值完全等于指纹"的 qword。命中即真实 ID3D11Device 对象（同一个 C++ 类），
+// 全程不需要任何虚调用就能确认身份，之后的操作才是安全的。
+static void* g_vtDevice = nullptr;      // 临时设备的 vtable 指纹
+static void* g_vtCtx = nullptr;         // 临时设备立即上下文的 vtable 指纹
+
+// 只对"已确认身份"的真设备调用（内部全被 __try 包住）
 static bool ctxHasRT(ID3D11Device* dev) {
     ID3D11DeviceContext* c = nullptr;
     __try { dev->GetImmediateContext(&c); } __except (EXCEPTION_EXECUTE_HANDLER) { c = nullptr; }
@@ -432,25 +426,55 @@ static bool ctxHasRT(ID3D11Device* dev) {
     return true;
 }
 
-static bool looksLikeD3DObject(BYTE* p, const BYTE* dbase, ULONG_PTR dsize) {
-    void* vt = *(void**)p;
-    if (!ptrInImage((BYTE*)vt, dbase, dsize)) return false;
-    void* vt0 = *(void**)vt;               // vtable[0] = QueryInterface
-    return ptrInImage((BYTE*)vt0, dbase, dsize);
+// 采指纹：建一个属于我们自己的临时设备，读完 vtable 立刻释放。
+// dwm 用硬件驱动，所以优先 HARDWARE；失败退 WARP。
+static void buildVtableFingerprint() {
+    if (g_vtDevice) return;
+    HMODULE d3d = GetModuleHandleW(L"d3d11.dll");
+    if (!d3d) { iwnHookLog("dwm: fingerprint no d3d11.dll"); return; }
+    auto create = (PFN_CreateDevice)GetProcAddress(d3d, "D3D11CreateDevice");
+    if (!create) { iwnHookLog("dwm: fingerprint no D3D11CreateDevice export"); return; }
+
+    const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3 };
+    const D3D_DRIVER_TYPE types[] = { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP };
+    for (int i = 0; i < 2 && !g_vtDevice; i++) {
+        ID3D11Device* dev = nullptr;
+        ID3D11DeviceContext* ctx = nullptr;
+        D3D_FEATURE_LEVEL got = (D3D_FEATURE_LEVEL)0;
+        HRESULT hr = E_FAIL;
+        __try {
+            hr = create(nullptr, types[i], nullptr, 0, levels,
+                        (UINT)(sizeof(levels) / sizeof(levels[0])),
+                        D3D11_SDK_VERSION, &dev, &got, &ctx);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { hr = E_FAIL; }
+        char b[160];
+        wsprintfA(b, "dwm: fingerprint type=%d hr=0x%08X dev=%08X",
+                  (int)types[i], (unsigned)hr, (unsigned)(ULONG_PTR)dev);
+        iwnHookLog(b);
+        if (SUCCEEDED(hr) && dev) {
+            g_vtDevice = *(void**)dev;
+            if (ctx) g_vtCtx = *(void**)ctx;
+            dev->Release();
+            if (ctx) ctx->Release();
+        }
+    }
+    char b[160];
+    wsprintfA(b, "dwm: fingerprint vtDevice=%08X vtCtx=%08X",
+              (unsigned)(ULONG_PTR)g_vtDevice, (unsigned)(ULONG_PTR)g_vtCtx);
+    iwnHookLog(b);
 }
 
+// 按指纹在私有可读内存里找设备：纯读取 + 精确比对，不做任何盲虚调用。
 static bool recoverDeviceByScan() {
     if (g_dev) return true;
-    HMODULE d3d = GetModuleHandleW(L"d3d11.dll");
-    if (!d3d) return false;
-    BYTE* dbase = (BYTE*)d3d;
-    ULONG_PTR dsize = imageSizeOf(d3d);
-    if (!dsize) return false;
+    buildVtableFingerprint();
+    if (!g_vtDevice) return false;
 
     InterlockedIncrement(&g_scanRounds);
-    int qwords = 0, cand = 0, qi = 0;
-    ID3D11Device* best = nullptr;      // 有绑定 RT 的（合成用的那个）
-    ID3D11Device* any = nullptr;       // 任一个，作后备
+    int qwords = 0, hits = 0, withRT = 0;
+    ID3D11Device* best = nullptr;
 
     BYTE* addr = nullptr;
     while ((ULONG_PTR)addr < 0x7FFFFFFF0000ULL && !best) {
@@ -463,37 +487,23 @@ static bool recoverDeviceByScan() {
         bool readable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
                                  PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
         if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && readable &&
-            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && sz <= (512u << 20) &&
-            !ptrInImage(base, dbase, dsize)) {
+            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && sz <= (512u << 20)) {
             for (SIZE_T off = 0; off + sizeof(void*) <= sz; off += sizeof(void*)) {
                 BYTE* p = base + off;
-                if (!looksLikeD3DObject(p, dbase, dsize)) continue;
-                cand++;
-                ID3D11Device* dev = nullptr;
-                __try {
-                    ((IUnknown*)p)->QueryInterface(__uuidof(ID3D11Device), (void**)&dev);
-                } __except (EXCEPTION_EXECUTE_HANDLER) { dev = nullptr; }
-                if (!dev) {
-                    ID3D11DeviceContext* c2 = nullptr;
+                if (*(void**)p != g_vtDevice) continue;   // 只有精确指纹命中才算候选
+                hits++;
+                ID3D11Device* dev = (ID3D11Device*)p;
+                bool hasRT = false;
+                __try { hasRT = ctxHasRT(dev); } __except (EXCEPTION_EXECUTE_HANDLER) { hasRT = false; }
+                if (hasRT) { withRT++; best = dev; break; }
+                if (!best) {
+                    // 记一个"没有绑定 RT"的作为后备，避免完全空手而归
                     __try {
-                        ((IUnknown*)p)->QueryInterface(__uuidof(ID3D11DeviceContext), (void**)&c2);
-                        if (c2) { c2->GetDevice(&dev); c2->Release(); }
-                    } __except (EXCEPTION_EXECUTE_HANDLER) { dev = nullptr; }
+                        ID3D11DeviceContext* c = nullptr;
+                        dev->GetImmediateContext(&c);
+                        if (c) { c->Release(); best = dev; }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { }
                 }
-                if (!dev) continue;
-                qi++;
-                if (ctxHasRT(dev)) {
-                    if (best) dev->Release();
-                    else {
-                        best = dev;
-                        if (any) { any->Release(); any = nullptr; }
-                    }
-                } else if (!best && !any) {
-                    any = dev;
-                } else {
-                    dev->Release();
-                }
-                if (best) break;
             }
             qwords += (int)(sz / sizeof(void*));
         }
@@ -502,14 +512,12 @@ static bool recoverDeviceByScan() {
     }
 
     char b[260];
-    wsprintfA(b, "dwm: scan round %ld: qwords=%d cand=%d qi=%d -> %s",
-              g_scanRounds, qwords, cand, qi,
-              best ? "FOUND with bound RT" : (any ? "FOUND no-RT" : "no"));
+    wsprintfA(b, "dwm: scan round %ld: qwords=%d vtHits=%d withRT=%d -> %s",
+              g_scanRounds, qwords, hits, withRT, best ? "FOUND device" : "no");
     iwnHookLog(b);
 
-    ID3D11Device* use = best ? best : any;
-    if (!use) return false;
-    g_dev = use;
+    if (!best) return false;
+    g_dev = best;
     D3D_FEATURE_LEVEL fl = (D3D_FEATURE_LEVEL)0;
     __try { fl = g_dev->GetFeatureLevel(); } __except (EXCEPTION_EXECUTE_HANDLER) { fl = (D3D_FEATURE_LEVEL)0; }
     g_devFeature = (LONG)fl;
@@ -517,8 +525,8 @@ static bool recoverDeviceByScan() {
     __try { g_dev->GetImmediateContext(&ic); } __except (EXCEPTION_EXECUTE_HANDLER) { ic = nullptr; }
     bool hooked = false;
     if (ic) { patchContextVtable(ic); ic->Release(); hooked = true; }
-    wsprintfA(b, "dwm: device recovered by scan feature=0x%X ctx=%s",
-              (unsigned)fl, hooked ? "ok" : "none");
+    wsprintfA(b, "dwm: device recovered by scan feature=0x%X ctx=%s rt=%s",
+              (unsigned)fl, hooked ? "ok" : "none", withRT ? "bound" : "none");
     iwnHookLog(b);
     return true;
 }
@@ -540,7 +548,7 @@ static DWORD WINAPI reporter(LPVOID) {
         Sleep(1000);
         // 晚注入路径：设备早就建好了，D3D11CreateDevice 不会再来 —— 主动去内存里找。
         // 全地址空间扫描很重（几十 MB），只在前 4 轮做，避免拖慢 dwm。
-        if (!g_origOMSetRT && g_scanRounds < 4) {
+        if (!g_dev && g_scanRounds < 3) {
             recoverDeviceByScan();
         }
         LONG c = g_cntConfirm;
