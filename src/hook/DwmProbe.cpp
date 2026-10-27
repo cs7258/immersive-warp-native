@@ -427,6 +427,7 @@ static volatile LONG g_scanRounds = 0;
 static void* g_vtDevice = nullptr;      // 临时设备的 vtable 指纹
 static void* g_vtCtx = nullptr;         // 临时设备立即上下文的 vtable 指纹
 static void* g_vtTex = nullptr;         // 临时纹理的 vtable 指纹（找 dwm 的全部纹理）
+static LONG g_scrW = 0, g_scrH = 0;     // 主屏像素尺寸（合成表面必然等于它）
 
 // 只对"已确认身份"的真设备调用（内部全被 __try 包住）
 static bool ctxHasRT(ID3D11Device* dev) {
@@ -660,7 +661,7 @@ static void scanTextures() {
     if (!g_vtTex) return;                       // 指纹还没采到，留给下一轮
     if (InterlockedCompareExchange(&g_texScanDone, 1, 0) != 0) return;
 
-    int hits = 0, big = 0, rtBig = 0;
+    int hits = 0, big = 0, rtBig = 0, exactBig = 0, bestScore = 0;
     D3D11_TEXTURE2D_DESC bestDesc = {};
     ID3D11Texture2D* bestTex = nullptr;
     bool capped = false;
@@ -693,23 +694,26 @@ static void scanTextures() {
                 if (!isDesktopSize(d)) continue;
                 big++;
                 bool isRT = (d.BindFlags & D3D11_BIND_RENDER_TARGET) != 0;
-                char b[260];
-                wsprintfA(b, "dwm: TEX %lux%lu fmt=%lu mip=%u arr=%u samp=%u bind=0x%X misc=0x%X usage=%u",
+                // 合成表面必然等于某个输出的像素尺寸。用主屏分辨率做精确判据：
+                // 1366x768 这种尺寸在 dwm 里几乎不可能出现在临时表面上。
+                bool exact = (g_scrW > 0 && (LONG)d.Width == g_scrW && (LONG)d.Height == g_scrH);
+                if (exact) exactBig++;
+                char b[300];
+                wsprintfA(b, "dwm: TEX %lux%lu fmt=%lu mip=%u arr=%u samp=%u bind=0x%X misc=0x%X usage=%u%s",
                           (unsigned long)d.Width, (unsigned long)d.Height, (unsigned long)d.Format,
                           (unsigned)d.MipLevels, (unsigned)d.ArraySize, (unsigned)d.SampleDesc.Count,
-                          (unsigned)d.BindFlags, (unsigned)d.MiscFlags, (unsigned)d.Usage);
+                          (unsigned)d.BindFlags, (unsigned)d.MiscFlags, (unsigned)d.Usage,
+                          exact ? "  <== SCREEN SIZE" : "");
                 iwnHookLog(b);
                 if (isRT) {
                     rtBig++;
-                    // 优先取"和屏幕同尺寸 + 可采样"的那张当代表性表面
-                    bool better = !bestTex;
-                    if (!better) {
-                        bool haveSrv = (bestDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
-                        bool thisSrv = (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
-                        if (thisSrv && !haveSrv) better = true;
-                        else if (thisSrv == haveSrv && d.Width >= bestDesc.Width) better = true;
-                    }
-                    if (better) { bestTex = tex; bestDesc = d; }
+                    // 打分：屏幕尺寸 > RENDER_TARGET > SHADER_RESOURCE > 单采样
+                    int score = 0;
+                    if (exact) score += 8;
+                    score += 4;                                  // 已确认 isRT
+                    if (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) score += 2;
+                    if (d.SampleDesc.Count == 1) score += 1;
+                    if (score > bestScore) { bestScore = score; bestTex = tex; bestDesc = d; }
                 }
                 if (big >= 32 || rtBig >= 6) { capped = true; break; }
             }
@@ -717,9 +721,10 @@ static void scanTextures() {
         addr = base + sz;
     }
 
-    char b[260];
-    wsprintfA(b, "dwm: texscan hits=%d big=%d rtBig=%d -> %s",
-              hits, big, rtBig, bestTex ? "FOUND target surface" : "no target surface");
+    char b[300];
+    wsprintfA(b, "dwm: texscan hits=%d big=%d rtBig=%d exact=%d screen=%ldx%ld -> %s",
+              hits, big, rtBig, exactBig, g_scrW, g_scrH,
+              bestTex ? "FOUND target surface" : "no target surface");
     iwnHookLog(b);
 
     if (bestTex) {
@@ -773,7 +778,16 @@ static DWORD WINAPI reporter(LPVOID) {
 extern "C" void DwmProbeInstall(HMODULE self) {
     if (InterlockedCompareExchange((volatile LONG*)&g_installed, 1, 0) != 0) return;
     g_selfBase = self;
+    // 主屏像素尺寸（dwm 是 per-monitor DPI aware，这里拿到的是物理像素）。
+    // 合成表面必然等于某个输出的像素尺寸，所以这个值同时是"精确判据"的来源。
+    g_scrW = GetSystemMetrics(SM_CXSCREEN);
+    g_scrH = GetSystemMetrics(SM_CYSCREEN);
     iwnHookLog("dwm: probe install begin");
+    {
+        char sb[96];
+        wsprintfA(sb, "dwm: screen %ldx%ld (composite surface must match this)", g_scrW, g_scrH);
+        iwnHookLog(sb);
+    }
 
     HMODULE core = waitModule(L"dwmcore.dll", 30000);
     g_coreMod = core;
