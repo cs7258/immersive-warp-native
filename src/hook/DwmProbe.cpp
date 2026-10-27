@@ -36,6 +36,11 @@ static volatile LONG g_cntRtv = 0;       // 非空 RT 视图次数
 static volatile LONG g_rtW = 0, g_rtH = 0, g_rtFmt = 0;
 static volatile LONG g_devFeature = 0;
 static volatile LONG g_installed = 0;
+// dwm 的立即上下文（early injection 时由 D3D11CreateDevice / 扫描取得）。
+// dwm 合成很可能是"初始化时绑一次 RT，之后每帧只 Draw"，所以 OMSetRenderTargets
+// 一次都不会被调用（实测 rtset=0）—— 拿 RT 的正确方式是提交边界反查。
+static ID3D11DeviceContext* g_ctx = nullptr;
+static volatile LONG g_rtProbes = 0;
 
 // ---------------------------------------------------------------- CFG 注册
 // dwm.exe 全程开启 Control Flow Guard。IAT 槽里的间接 call 会被 CFG 校验，
@@ -144,6 +149,10 @@ static HRESULT WINAPI HookD3D11CreateDevice(IDXGIAdapter* adapter, D3D_DRIVER_TY
     ID3D11Device** dev, D3D_FEATURE_LEVEL* outLevel, ID3D11DeviceContext** ctx);
 static HRESULT WINAPI HookOMSetRenderTargets(ID3D11DeviceContext* self, UINT num,
     ID3D11RenderTargetView* const* rtvs);
+static HRESULT WINAPI HookOMSetRTUAV(ID3D11DeviceContext* self, UINT num,
+    ID3D11RenderTargetView* const* rtvs, ID3D11UnorderedAccessView* uav,
+    UINT uavStart, UINT uavCount, ID3D11UnorderedAccessView* const* uavs,
+    const UINT* counts);
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4);
 static LONG WINAPI HookRetireFrame(void* a1, void* a2, void* a3, void* a4);
 
@@ -152,6 +161,10 @@ typedef HRESULT(WINAPI* PFN_CreateDevice)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODUL
 static PFN_CreateDevice g_origCreate = nullptr;
 static HRESULT(WINAPI* g_origOMSetRT)(ID3D11DeviceContext*, UINT,
     ID3D11RenderTargetView* const*) = nullptr;
+typedef HRESULT(WINAPI* PFN_OMSetRTUAV)(ID3D11DeviceContext*, UINT,
+    ID3D11RenderTargetView* const*, ID3D11UnorderedAccessView*, UINT, UINT,
+    ID3D11UnorderedAccessView* const*, const UINT*);
+static PFN_OMSetRTUAV g_origOMSetRTUAV = nullptr;
 static PVOID g_origConfirm = nullptr;
 static PVOID g_origRetire = nullptr;
 
@@ -178,7 +191,10 @@ static void noteRenderTarget(ID3D11RenderTargetView* rtv) {
             iwnHookLog(b);
         }
         // ---- 一次性深度采集：Stage 1 能不能在这个 RT 上做 copy + 网格变形 ----
-        if (InterlockedCompareExchange(&g_deepDone, 1, 0) == 0) {
+        // 只在"桌面尺寸"的表面上采一次：dwm 内部还有大量小临时表面，
+        // 采到它们会把唯一一次机会浪费掉。
+        bool desktopSized = (w >= 640 && h >= 360);
+        if (desktopSized && InterlockedCompareExchange(&g_deepDone, 1, 0) == 0) {
             char b[300];
             wsprintfA(b, "dwm: RTDESC %lux%lu fmt=%lu mip=%u arr=%u samp=%u/%u usage=%u bind=0x%X cpu=0x%X misc=0x%X",
                       (unsigned long)d.Width, (unsigned long)d.Height, (unsigned long)d.Format,
@@ -235,8 +251,10 @@ static void noteRenderTarget(ID3D11RenderTargetView* rtv) {
 // d3d11 的立即上下文 vtable 是进程内共享的 —— 直接替换 slot 33，
 // 不复制 vtable，也不改对象指针，dwm 的其它 context 一并被观测。
 #define VT_OMSETRT 33
+#define VT_OMSETRT_UAV 34
 static void patchContextVtable(ID3D11DeviceContext* ctx) {
     if (!ctx) return;
+    g_ctx = ctx;                       // 交给我们"提交边界反查 RT"使用
     void** vt = *(void***)ctx;
     if (!vt) return;
     void* cur = vt[VT_OMSETRT];
@@ -251,6 +269,16 @@ static void patchContextVtable(ID3D11DeviceContext* ctx) {
     DWORD dummy = 0;
     VirtualProtect(&vt[VT_OMSETRT], sizeof(void*), old, &dummy);
     iwnHookLog("dwm: OMSetRenderTargets hooked on immediate context");
+
+    // slot 34：dwm 若用 OMSetRenderTargetsAndUnorderedAccessViews 绑定，也能捕获
+    void* cur2 = vt[VT_OMSETRT_UAV];
+    if (cur2 && cur2 != (void*)&HookOMSetRTUAV &&
+        VirtualProtect(&vt[VT_OMSETRT_UAV], sizeof(void*), PAGE_READWRITE, &old)) {
+        g_origOMSetRTUAV = (PFN_OMSetRTUAV)cur2;
+        vt[VT_OMSETRT_UAV] = (void*)&HookOMSetRTUAV;
+        VirtualProtect(&vt[VT_OMSETRT_UAV], sizeof(void*), old, &dummy);
+        iwnHookLog("dwm: OMSetRenderTargetsAndUnorderedAccessViews hooked");
+    }
 }
 
 // ---------------------------------------------------------------- detours
@@ -290,8 +318,45 @@ static HRESULT WINAPI HookOMSetRenderTargets(ID3D11DeviceContext* self, UINT num
     return g_origOMSetRT ? g_origOMSetRT(self, num, rtvs) : S_OK;
 }
 
+static HRESULT WINAPI HookOMSetRTUAV(ID3D11DeviceContext* self, UINT num,
+    ID3D11RenderTargetView* const* rtvs, ID3D11UnorderedAccessView* uav,
+    UINT uavStart, UINT uavCount, ID3D11UnorderedAccessView* const* uavs,
+    const UINT* counts) {
+    InterlockedIncrement((volatile LONG*)&g_cntRtset);
+    if (num && rtvs && rtvs[0]) {
+        InterlockedIncrement((volatile LONG*)&g_cntRtv);
+        noteRenderTarget(rtvs[0]);
+    }
+    if (!g_ctx) g_ctx = self;
+    return g_origOMSetRTUAV
+        ? g_origOMSetRTUAV(self, num, rtvs, uav, uavStart, uavCount, uavs, counts)
+        : S_OK;
+}
+
+// 提交边界反查：dwm 很可能只在初始化时绑定一次 RT，之后每帧只改 viewport/scissor
+// 再 Draw，所以 OMSetRenderTargets 钩子永远不响（实测 rtset=0）。这里在 ConfirmFrame
+// 里直接用 dwm 自己的立即上下文问"你现在绑的是哪个 RT"——不依赖它怎么绑的。
+static void probeActiveRT() {
+    if (!g_ctx) return;
+    LONG n = InterlockedIncrement(&g_rtProbes);
+    if (n > 10 && (n % 180) != 0) return;      // 前 10 帧连探，之后每 180 帧一次
+    ID3D11RenderTargetView* rtv = nullptr;
+    __try {
+        g_ctx->OMGetRenderTargets(1, &rtv, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        rtv = nullptr;
+    }
+    if (!rtv) {
+        if (n <= 10) iwnHookLog("dwm: OMGetRenderTargets -> nothing bound");
+        return;
+    }
+    noteRenderTarget(rtv);
+    rtv->Release();
+}
+
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     InterlockedIncrement((volatile LONG*)&g_cntConfirm);
+    probeActiveRT();
     typedef LONG(WINAPI* PF)(void*, void*, void*, void*);
     return g_origConfirm ? ((PF)g_origConfirm)(a1, a2, a3, a4) : 0;
 }
