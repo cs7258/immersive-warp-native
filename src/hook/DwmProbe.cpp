@@ -172,6 +172,7 @@ static HRESULT WINAPI HookOMSetRTUAV(ID3D11DeviceContext* self, UINT num,
     const UINT* counts);
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4);
 static LONG WINAPI HookRetireFrame(void* a1, void* a2, void* a3, void* a4);
+static void proveTextureIsDesktop(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& d);
 
 typedef HRESULT(WINAPI* PFN_CreateDevice)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
     const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
@@ -187,6 +188,11 @@ static PVOID g_origRetire = nullptr;
 
 // 只做一次的深度采集开关（零初始化，不触发 thread-safe static guard）
 static volatile LONG g_deepDone = 0;
+
+// 纹理扫描选中的"疑似合成表面"（由 scanTextures 登记，ConfirmFrame 里读回验证）
+static ID3D11Texture2D* g_targetTex = nullptr;
+static D3D11_TEXTURE2D_DESC g_targetDesc;
+static volatile LONG g_proofDone = 0;
 
 // 合成帧的 RT 描述（只保留数值，不持有纹理引用，避免拖住 dwm 的资源）
 static void noteRenderTarget(ID3D11RenderTargetView* rtv) {
@@ -378,6 +384,14 @@ static void probeActiveRT() {
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     InterlockedIncrement((volatile LONG*)&g_cntConfirm);
     probeActiveRT();
+    // 纹理扫描已经登记了候选合成表面时，在提交边界做一次性像素读回。
+    // 放在这里而不是扫描线程：immediate context 不是线程安全的，只有在
+    // dwm 自己把这一帧推出去的这一刻用它才安全。
+    if (g_targetTex && InterlockedCompareExchange(&g_proofDone, 1, 0) == 0) {
+        proveTextureIsDesktop(g_targetTex, g_targetDesc);
+        __try { g_targetTex->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        g_targetTex = nullptr;
+    }
     typedef LONG(WINAPI* PF)(void*, void*, void*, void*);
     return g_origConfirm ? ((PF)g_origConfirm)(a1, a2, a3, a4) : 0;
 }
@@ -412,6 +426,7 @@ static volatile LONG g_scanRounds = 0;
 // 全程不需要任何虚调用就能确认身份，之后的操作才是安全的。
 static void* g_vtDevice = nullptr;      // 临时设备的 vtable 指纹
 static void* g_vtCtx = nullptr;         // 临时设备立即上下文的 vtable 指纹
+static void* g_vtTex = nullptr;         // 临时纹理的 vtable 指纹（找 dwm 的全部纹理）
 
 // 只对"已确认身份"的真设备调用（内部全被 __try 包住）
 static bool ctxHasRT(ID3D11Device* dev) {
@@ -427,7 +442,13 @@ static bool ctxHasRT(ID3D11Device* dev) {
 }
 
 // 采指纹：建一个属于我们自己的临时设备，读完 vtable 立刻释放。
-// dwm 用硬件驱动，所以优先 HARDWARE；失败退 WARP。
+//
+// 驱动类型优先 WARP（2026-10-27 第二轮实测调整）：我们只要 vtable 这个"类指纹"，
+// 而 ID3D11Device / ID3D11DeviceContext / ID3D11Texture2D 的实现类都定义在
+// d3d11.dll 内部，与 D3D_DRIVER_TYPE 无关，WARP 与 HARDWARE 取到的 vtable 完全
+// 相同。但 HARDWARE 会在 dwm 里创建第二个硬件设备、触发 UMD 初始化 —— 上一轮
+// 日志里那条 EXC 0xC0000005 @d3d11+0x4EBB7（紧跟在 fingerprint 之后）就是它。
+// 用 WARP 只走软件光栅器，不碰 UMD，对 dwm 的扰动最小。
 static void buildVtableFingerprint() {
     if (g_vtDevice) return;
     HMODULE d3d = GetModuleHandleW(L"d3d11.dll");
@@ -438,7 +459,7 @@ static void buildVtableFingerprint() {
     const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
         D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3 };
-    const D3D_DRIVER_TYPE types[] = { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP };
+    const D3D_DRIVER_TYPE types[] = { D3D_DRIVER_TYPE_WARP, D3D_DRIVER_TYPE_HARDWARE };
     for (int i = 0; i < 2 && !g_vtDevice; i++) {
         ID3D11Device* dev = nullptr;
         ID3D11DeviceContext* ctx = nullptr;
@@ -449,20 +470,36 @@ static void buildVtableFingerprint() {
                         (UINT)(sizeof(levels) / sizeof(levels[0])),
                         D3D11_SDK_VERSION, &dev, &got, &ctx);
         } __except (EXCEPTION_EXECUTE_HANDLER) { hr = E_FAIL; }
-        char b[160];
+        char b[200];
         wsprintfA(b, "dwm: fingerprint type=%d hr=0x%08X dev=%08X",
                   (int)types[i], (unsigned)hr, (unsigned)(ULONG_PTR)dev);
         iwnHookLog(b);
         if (SUCCEEDED(hr) && dev) {
             g_vtDevice = *(void**)dev;
             if (ctx) g_vtCtx = *(void**)ctx;
+            // 顺手建一张 4x4 纹理，取 ID3D11Texture2D 的 vtable 当纹理类指纹
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = 4;
+            td.Height = 4;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            ID3D11Texture2D* t = nullptr;
+            __try {
+                if (SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &t)) && t) g_vtTex = *(void**)t;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { g_vtTex = nullptr; }
+            if (t) t->Release();
             dev->Release();
             if (ctx) ctx->Release();
         }
     }
-    char b[160];
-    wsprintfA(b, "dwm: fingerprint vtDevice=%08X vtCtx=%08X",
-              (unsigned)(ULONG_PTR)g_vtDevice, (unsigned)(ULONG_PTR)g_vtCtx);
+    char b[220];
+    wsprintfA(b, "dwm: fingerprint vtDevice=%08X vtCtx=%08X vtTex=%08X",
+              (unsigned)(ULONG_PTR)g_vtDevice, (unsigned)(ULONG_PTR)g_vtCtx,
+              (unsigned)(ULONG_PTR)g_vtTex);
     iwnHookLog(b);
 }
 
@@ -531,6 +568,171 @@ static bool recoverDeviceByScan() {
     return true;
 }
 
+// ------------------------------------------------- 合成表面定位（纹理指纹法）
+//
+// 为什么不再问 context：这一轮实测已经把"上下文反查"这条路彻底否掉了 ——
+//   * rtset=0      : dwm 从不在这台设备的立即上下文上调 OMSetRenderTargets
+//   * rt=none      : ConfirmFrame 时刻 OMGetRenderTargets 恒为空（10/10 次）
+// dwm 的渲染是"画完就解绑"，提交边界上根本没有 RT 可问。所以改成正向枚举：
+// 按 ID3D11Texture2D 的 vtable 指纹把 dwm 进程里所有纹理对象抓出来，用
+// GetDesc 读尺寸/格式/绑定标志 —— 桌面合成表面必然是 1920x1080 级且带
+// D3D11_BIND_RENDER_TARGET，这一步不需要任何猜测。
+static volatile LONG g_texScanDone = 0;
+
+static bool isDesktopSize(const D3D11_TEXTURE2D_DESC& d) {
+    return d.Width >= 640 && d.Height >= 360;
+}
+
+// 对已确认是 ID3D11Texture2D 的对象做一次读回，证明它装的就是桌面像素。
+// 时机放在 ConfirmFrame 里（dwm 正在提交 = 本帧渲染已结束、context 空闲），
+// 只做一次；Map(READ) 会 stall 一帧，可以接受。
+static void proveTextureIsDesktop(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& d) {
+    char b[512];
+    ID3D11Device* dev = nullptr;
+    __try { tex->GetDevice(&dev); } __except (EXCEPTION_EXECUTE_HANDLER) { dev = nullptr; }
+    if (!dev) { iwnHookLog("dwm: texproof no device"); return; }
+    ID3D11DeviceContext* ctx = nullptr;
+    // ID3D11Device::GetImmediateContext returns void - cannot wrap in SUCCEEDED()
+    __try { dev->GetImmediateContext(&ctx); } __except (EXCEPTION_EXECUTE_HANDLER) { ctx = nullptr; }
+    if (!ctx) { dev->Release(); iwnHookLog("dwm: texproof no context"); return; }
+
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    sd.MipLevels = 1;
+    sd.ArraySize = 1;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    ID3D11Texture2D* stg = nullptr;
+    HRESULT hr = E_FAIL;
+    __try { hr = dev->CreateTexture2D(&sd, nullptr, &stg); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { hr = E_FAIL; stg = nullptr; }
+    if (FAILED(hr) || !stg) {
+        wsprintfA(b, "dwm: texproof staging create hr=0x%08X", (unsigned)hr);
+        iwnHookLog(b);
+        ctx->Release(); dev->Release();
+        return;
+    }
+    __try {
+        if (d.SampleDesc.Count > 1) ctx->ResolveSubresource(stg, 0, tex, 0, d.Format);
+        else                        ctx->CopyResource(stg, tex);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        iwnHookLog("dwm: texproof copy EXCEPTION");
+    }
+
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    hr = E_FAIL;
+    __try { hr = ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { hr = E_FAIL; }
+    if (SUCCEEDED(hr)) {
+        char px[192] = {};
+        int off = 0;
+        const UINT xs[3] = { d.Width / 2, d.Width / 4, d.Width * 3 / 4 };
+        const UINT ys[3] = { d.Height / 2, d.Height / 4, d.Height * 3 / 4 };
+        const char* tag[3] = { "mid", "q1", "q3" };
+        for (int i = 0; i < 3; i++) {
+            DWORD v = 0xDEADBEEF;
+            __try {
+                const BYTE* row = (const BYTE*)m.pData + (SIZE_T)ys[i] * m.RowPitch;
+                v = *(const DWORD*)(row + (SIZE_T)xs[i] * 4);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { v = 0xDEADBEEF; }
+            off += wsprintfA(px + off, "%s=%08lX ", tag[i], (unsigned long)v);
+        }
+        wsprintfA(b, "dwm: TEXPROOF %lux%lu fmt=%lu bind=0x%X -> %s",
+                  (unsigned long)d.Width, (unsigned long)d.Height,
+                  (unsigned long)d.Format, (unsigned)d.BindFlags, px);
+        iwnHookLog(b);
+        __try { ctx->Unmap(stg, 0); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    } else {
+        wsprintfA(b, "dwm: texproof map hr=0x%08X", (unsigned)hr);
+        iwnHookLog(b);
+    }
+    stg->Release();
+    ctx->Release();
+    dev->Release();
+}
+
+// 全地址空间按纹理指纹枚举。命中数可能成百上千，只报"桌面尺寸"的前若干个，
+// 并在其中挑一个带 RENDER_TARGET 的做像素读回验证。
+static void scanTextures() {
+    if (!g_vtTex) return;                       // 指纹还没采到，留给下一轮
+    if (InterlockedCompareExchange(&g_texScanDone, 1, 0) != 0) return;
+
+    int hits = 0, big = 0, rtBig = 0;
+    D3D11_TEXTURE2D_DESC bestDesc = {};
+    ID3D11Texture2D* bestTex = nullptr;
+    bool capped = false;
+
+    BYTE* addr = nullptr;
+    while ((ULONG_PTR)addr < 0x7FFFFFFF0000ULL && !capped) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(addr, &mbi, sizeof(mbi))) break;
+        BYTE* base = (BYTE*)mbi.BaseAddress;
+        SIZE_T sz = mbi.RegionSize;
+        if (!sz) break;
+        DWORD prot = mbi.Protect & 0xFF;
+        bool readable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                 PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && readable &&
+            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && sz <= (512u << 20)) {
+            for (SIZE_T off = 0; off + sizeof(void*) <= sz; off += sizeof(void*)) {
+                BYTE* p = base + off;
+                if (*(void**)p != g_vtTex) continue;    // 精确指纹，不做盲虚调用
+                hits++;
+                if (hits > 8192) { capped = true; break; }
+                ID3D11Texture2D* tex = (ID3D11Texture2D*)p;
+                D3D11_TEXTURE2D_DESC d = {};
+                bool ok = false;
+                __try { tex->GetDesc(&d); ok = true; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+                if (!ok) continue;
+                // 自检：真实纹理的宽高必须落在合法区间，否则是误命中
+                if (d.Width == 0 || d.Height == 0 || d.Width > 16384 || d.Height > 16384) continue;
+                if (!isDesktopSize(d)) continue;
+                big++;
+                bool isRT = (d.BindFlags & D3D11_BIND_RENDER_TARGET) != 0;
+                char b[260];
+                wsprintfA(b, "dwm: TEX %lux%lu fmt=%lu mip=%u arr=%u samp=%u bind=0x%X misc=0x%X usage=%u",
+                          (unsigned long)d.Width, (unsigned long)d.Height, (unsigned long)d.Format,
+                          (unsigned)d.MipLevels, (unsigned)d.ArraySize, (unsigned)d.SampleDesc.Count,
+                          (unsigned)d.BindFlags, (unsigned)d.MiscFlags, (unsigned)d.Usage);
+                iwnHookLog(b);
+                if (isRT) {
+                    rtBig++;
+                    // 优先取"和屏幕同尺寸 + 可采样"的那张当代表性表面
+                    bool better = !bestTex;
+                    if (!better) {
+                        bool haveSrv = (bestDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+                        bool thisSrv = (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+                        if (thisSrv && !haveSrv) better = true;
+                        else if (thisSrv == haveSrv && d.Width >= bestDesc.Width) better = true;
+                    }
+                    if (better) { bestTex = tex; bestDesc = d; }
+                }
+                if (big >= 32 || rtBig >= 6) { capped = true; break; }
+            }
+        }
+        addr = base + sz;
+    }
+
+    char b[260];
+    wsprintfA(b, "dwm: texscan hits=%d big=%d rtBig=%d -> %s",
+              hits, big, rtBig, bestTex ? "FOUND target surface" : "no target surface");
+    iwnHookLog(b);
+
+    if (bestTex) {
+        // 只登记，不在这里读回：immediate context 不是线程安全的，reporter 线程
+        // 直接用它和 dwm 的渲染线程并发会把两边都搞崩。像素验证交给
+        // HookConfirmFrame（提交边界，dwm 自己把帧推出来的那一刻）。
+        __try { bestTex->AddRef(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        g_targetDesc = bestDesc;
+        g_targetTex = bestTex;
+        iwnHookLog("dwm: target surface registered, pixel proof deferred to ConfirmFrame");
+    }
+}
+
 // ---------------------------------------------------------------- 安装
 static HMODULE waitModule(const wchar_t* name, int ms) {
     for (int i = 0; i < ms / 100; i++) {
@@ -550,6 +752,10 @@ static DWORD WINAPI reporter(LPVOID) {
         // 全地址空间扫描很重（几十 MB），只在前 4 轮做，避免拖慢 dwm。
         if (!g_dev && g_scanRounds < 3) {
             recoverDeviceByScan();
+        }
+        // 设备到手后，立刻按纹理指纹把 dwm 的纹理清单抓出来（只做一次）
+        if (g_dev && !g_texScanDone) {
+            scanTextures();
         }
         LONG c = g_cntConfirm;
         iwnHookCounters(g_cntConfirm, g_cntRtset, g_cntCreate);
