@@ -397,7 +397,8 @@ static bool recoverDeviceByScan() {
     iwnHookLog(b);
 
     ID3D11DeviceContext* ic = nullptr;
-    if (SUCCEEDED(g_dev->GetImmediateContext(&ic)) && ic) {
+    g_dev->GetImmediateContext(&ic);   // returns void, cannot be wrapped in SUCCEEDED()
+    if (ic) {
         patchContextVtable(ic);
         ic->Release();
     }
