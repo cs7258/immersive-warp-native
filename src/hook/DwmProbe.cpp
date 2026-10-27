@@ -104,7 +104,8 @@ static PVOID g_origRetire = nullptr;
 static void noteRenderTarget(ID3D11RenderTargetView* rtv) {
     if (!rtv) return;
     ID3D11Resource* res = nullptr;
-    if (FAILED(rtv->GetResource(&res)) || !res) return;
+    rtv->GetResource(&res);          // ID3D11View::GetResource returns void
+    if (!res) return;
     ID3D11Texture2D* tex = nullptr;
     if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex) {
         D3D11_TEXTURE2D_DESC d = {};
