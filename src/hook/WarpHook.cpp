@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <wchar.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <vector>
@@ -44,6 +45,10 @@ __declspec(dllexport) volatile LONG g_entryHits = 0;
 __declspec(dllexport) volatile LONG g_stage = 0;
 }
 static HANDLE g_instMutex = nullptr;   // single-instance guard (leaked on purpose)
+
+// desktop warp stage 0 probe (DwmProbe.cpp): only armed inside dwm.exe
+extern "C" void DwmProbeInstall();
+static DWORD WINAPI probeThread(LPVOID) { DwmProbeInstall(); return 0; }
 
 // ---------------------------------------------------------------- logging
 // No CRT, no std::mutex here: manual-mapped images never run the CRT init, so
@@ -124,6 +129,22 @@ static IWNHookCfg* ensureCfg() {
         hookLog(buf);
     }
     return g_cfg;
+}
+
+// ------------------------------------------------- desktop probe bridge (DwmProbe.cpp)
+// The desktop-warp stage 0 probe lives in its own translation unit so the
+// dwm-specific import-table surgery stays separable from the dxgi path. It
+// needs only two things from here: the file logger and the IPC write-back.
+void iwnHookLog(const char* line) { hookLog(line); }
+
+void iwnHookCounters(LONG c0, LONG c1, LONG c2) {
+    // dwm has no Present detour, so reserved[] is free for the probe counters
+    // (confirm frames / render-target binds / d3d11 device creations).
+    if (g_cfg && g_cfgWrite) {
+        g_cfg->reserved[0] = (DWORD)c0;
+        g_cfg->reserved[1] = (DWORD)c1;
+        g_cfg->reserved[2] = (DWORD)c2;
+    }
 }
 
 // ---------------------------------------------------------------- shaders
@@ -1090,6 +1111,16 @@ extern "C" __declspec(dllexport) BOOL WINAPI HookEntry(HMODULE mod, DWORD reason
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         wsprintfA(buf, "WarpHook.dll attached pid=%u exe=%ls", (unsigned)GetCurrentProcessId(), exe);
         hookLog(buf);
+        // dwm.exe is the composition host: the dxgi Present path does not exist
+        // there (dwm imports no swapchain API). Arm the desktop probe instead,
+        // on its own thread - DwmProbeInstall waits up to 30s for dwmcore.dll
+        // and HookEntry must return promptly for the manual-map handshake.
+        const wchar_t* base = wcsrchr(exe, L'\\');
+        if (base && _wcsicmp(base + 1, L"dwm.exe") == 0) {
+            hookLog("he: dwm.exe detected -> arming desktop probe");
+            HANDLE tp = CreateThread(nullptr, 0, probeThread, nullptr, 0, nullptr);
+            if (tp) CloseHandle(tp);
+        }
         HANDLE t = CreateThread(nullptr, 0, initThread, nullptr, 0, &g_initTid);
         g_stage = 5;                                 // init thread spawned
         hookLog("he: thread spawned");
