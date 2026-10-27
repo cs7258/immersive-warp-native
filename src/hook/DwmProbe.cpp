@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <tlhelp32.h>
 #include "hook_ipc.h"
 
 extern void iwnHookLog(const char* line);
@@ -738,6 +739,161 @@ static void scanTextures() {
     }
 }
 
+// ---------------------------------------------------------------- 取证 Census（只读）
+// 目的：把"原版桌面扭曲到底钩了什么"变成清单而不是猜测。
+//   1) IAT 普查：遍历 dwm 每个模块的导入表，凡槽位指向"任何已加载映像之外"
+//      就是 detour（manual-mapped 载荷 / VirtualAlloc 的 trampoline）。
+//      自己（manual map 不在加载器链表）以 WarpHook(self) 名义加入模块表，避免误报。
+//   2) vtable 普查：dwm 的 D3D11 设备/立即上下文/纹理类的 vtable 槽，
+//      凡指向 d3d11.dll 映像之外的即 vtable 补丁。
+// 跑两次（原版扭曲 off / on）取差集 = 原版桌面扭曲的确切 API 清单。
+struct CensusMod { HMODULE base; DWORD size; char name[48]; };
+
+static int censusModules(CensusMod* out, int cap) {
+    int n = 0;
+    if (g_selfBase) {
+        auto dos = (IMAGE_DOS_HEADER*)g_selfBase;
+        __try {
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                auto nt = (IMAGE_NT_HEADERS*)((BYTE*)g_selfBase + dos->e_lfanew);
+                if (n < cap) {
+                    out[n].base = g_selfBase;
+                    out[n].size = nt->OptionalHeader.SizeOfImage;
+                    lstrcpynA(out[n].name, "WarpHook(self)", 48);
+                    n++;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return n;
+    MODULEENTRY32W me = {}; me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (n >= cap) break;
+            out[n].base = me.hModule;
+            out[n].size = me.modBaseSize;
+            int i = 0;
+            for (; me.szModule[i] && i < 47; ++i) {
+                wchar_t c = me.szModule[i];
+                out[n].name[i] = (c < 128) ? (char)c : '?';
+            }
+            out[n].name[i] = 0;
+            n++;
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+static int censusFindMod(const CensusMod* mods, int n, void* addr) {
+    uintptr_t a = (uintptr_t)addr;
+    for (int i = 0; i < n; i++) {
+        if (a >= (uintptr_t)mods[i].base &&
+            a <  (uintptr_t)mods[i].base + mods[i].size) return i;
+    }
+    return -1;
+}
+
+static void iatCensus() {
+    CensusMod mods[96];
+    int n = censusModules(mods, 96);
+    char b[260];
+    wsprintfA(b, "census: modules=%d (below: IAT slots pointing outside every image)", n);
+    iwnHookLog(b);
+    int reported = 0;
+    for (int i = 0; i < n && reported < 48; i++) {
+        BYTE* mod = (BYTE*)mods[i].base;
+        auto dos = (IMAGE_DOS_HEADER*)mod;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+        auto nt = (IMAGE_NT_HEADERS*)(mod + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+        auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!dir.VirtualAddress) continue;
+        auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(mod + dir.VirtualAddress);
+        for (; imp->Name && reported < 48; imp++) {
+            const char* dllName = (const char*)(mod + imp->Name);
+            auto oft = (IMAGE_THUNK_DATA*)(mod + (imp->OriginalFirstThunk ?
+                      imp->OriginalFirstThunk : imp->FirstThunk));
+            auto ft  = (IMAGE_THUNK_DATA*)(mod + imp->FirstThunk);
+            for (; ft->u1.Function && reported < 48; oft++, ft++) {
+                void* target = (void*)ft->u1.Function;
+                if (censusFindMod(mods, n, target) >= 0) continue;
+                char fn[64] = "?";
+                if (!IMAGE_SNAP_BY_ORDINAL(oft->u1.Ordinal)) {
+                    auto ibn = (IMAGE_IMPORT_BY_NAME*)(mod + oft->u1.AddressOfData);
+                    int k = 0;
+                    for (; ibn->Name[k] && k < 60; k++) fn[k] = ibn->Name[k];
+                    fn[k] = 0;
+                } else {
+                    wsprintfA(fn, "#%lu", (unsigned long)IMAGE_ORDINAL(oft->u1.Ordinal));
+                }
+                const char* kind = "unmapped";
+                MEMORY_BASIC_INFORMATION mbi = {};
+                if (VirtualQuery(target, &mbi, sizeof(mbi))) {
+                    if (mbi.Type == MEM_IMAGE)  kind = "image?";
+                    else if (mbi.Type == MEM_MAPPED) kind = "mapped";
+                    else kind = "private";
+                }
+                wsprintfA(b, "census: IAT %s!%s!%s -> %s %08X",
+                          mods[i].name, dllName, fn, kind,
+                          (unsigned)(ULONG_PTR)target);
+                iwnHookLog(b);
+                reported++;
+            }
+        }
+    }
+    wsprintfA(b, "census: IAT detours=%d", reported);
+    iwnHookLog(b);
+}
+
+static void vtableCensus(const char* what, void* const* vt, HMODULE host) {
+    if (!vt || !host) return;
+    CensusMod mods[96];
+    int n = censusModules(mods, 96);
+    auto dos = (IMAGE_DOS_HEADER*)host;
+    auto nt = (IMAGE_NT_HEADERS*)((BYTE*)host + dos->e_lfanew);
+    uintptr_t hBase = (uintptr_t)host;
+    uintptr_t hEnd = hBase + nt->OptionalHeader.SizeOfImage;
+    int patched = 0;
+    for (int i = 0; i < 48; i++) {
+        void* fn = vt[i];                       // vtable 页在映像内，读取安全
+        if (!fn) break;
+        uintptr_t a = (uintptr_t)fn;
+        if (a >= hBase && a < hEnd) continue;
+        const char* kind = "unmapped";
+        int o = censusFindMod(mods, n, fn);
+        if (o >= 0) kind = mods[o].name;
+        else {
+            MEMORY_BASIC_INFORMATION mbi = {};
+            if (VirtualQuery(fn, &mbi, sizeof(mbi)))
+                kind = (mbi.Type == MEM_IMAGE) ? "image?" : "private";
+        }
+        char b[192];
+        wsprintfA(b, "census: VT %s[%d] -> %s %08X", what, i, kind, (unsigned)a);
+        iwnHookLog(b);
+        if (++patched >= 16) { iwnHookLog("census: VT ... (capped 16)"); break; }
+    }
+    if (!patched) {
+        char b[128];
+        wsprintfA(b, "census: VT %s clean (0/48 outside host)", what);
+        iwnHookLog(b);
+    }
+}
+
+static DWORD WINAPI censusThread(LPVOID) {
+    // 等注入/扫描稳定（23:20 实测设备恢复发生在注入后约 1s）
+    Sleep(5000);
+    iatCensus();
+    for (int i = 0; i < 20 && !g_dev; i++) Sleep(500);
+    HMODULE d3d = GetModuleHandleW(L"d3d11.dll");
+    if (g_dev) vtableCensus("device", *(void* const**)g_dev, d3d);
+    if (g_ctx) vtableCensus("ctx",     *(void* const**)g_ctx, d3d);
+    if (g_vtTex) vtableCensus("texclass", (void* const*)g_vtTex, d3d);
+    iwnHookLog("census: done");
+    return 0;
+}
+
 // ---------------------------------------------------------------- 安装
 static HMODULE waitModule(const wchar_t* name, int ms) {
     for (int i = 0; i < ms / 100; i++) {
@@ -855,4 +1011,5 @@ extern "C" void DwmProbeInstall(HMODULE self) {
     }
     iwnHookLog("dwm: probe installed");
     CreateThread(nullptr, 0, reporter, nullptr, 0, nullptr);
+    CreateThread(nullptr, 0, censusThread, nullptr, 0, nullptr);
 }
