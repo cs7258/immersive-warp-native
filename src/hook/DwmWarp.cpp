@@ -180,7 +180,8 @@ static void stateSave(IWNState* s) {
 static void stateRestore(IWNState* s) {
     if (!s || !g_ctx) return;
     __try {
-        g_ctx->OMSetRenderTargets(1, &s->rtv, s->dsv);
+        if (s->rtv) g_ctx->OMSetRenderTargets(1, &s->rtv, s->dsv);
+        else        g_ctx->OMSetRenderTargets(0, nullptr, s->dsv);
         g_ctx->RSSetViewports(s->nvp <= IWN_MAX_VP ? s->nvp : IWN_MAX_VP, s->vp);
         g_ctx->VSSetShader(s->vs, nullptr, 0);
         g_ctx->PSSetShader(s->ps, nullptr, 0);
@@ -471,6 +472,7 @@ bool DwmWarpAttach(ID3D11Texture2D* target, const D3D11_TEXTURE2D_DESC& d) {
 static void paintWarp() {
     if (!g_ready || !g_ctx || !g_rtv) return;
     IWNState st;
+    ZeroMemory(&st, sizeof(st));      // stateRestore releases these; never let it see stack garbage
     stateSave(&st);
 
     fillGrid();
@@ -515,9 +517,12 @@ static void paintWarp() {
 static void advanceStage() {
     DWORD el = GetTickCount() - g_t0;
     LONG want = g_stage;
-    if (el < 6000)       want = 1;
-    else if (el < 14000) want = 2;
-    else if (el < 24000) want = 3;
+    // Timeline is matched to the probe script's observation window (it holds
+    // ~45s after injection). stage 4 gets the bulk of it, because that is the
+    // one that must show a warp if the surface we found is really the screen.
+    if (el < 2000)       want = 1;
+    else if (el < 7000)  want = 2;
+    else if (el < 14000) want = 3;
     else                 want = 4;
     if (want == g_lastLoggedStage) return;
     g_lastLoggedStage = want;
@@ -536,6 +541,15 @@ static void advanceStage() {
 
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
+    // Hard time budget. If the host console dies, or the operator walks away,
+    // we must not leave the desktop painted over forever. Stopping the paint is
+    // enough: dwm's next repaint (any window activity) rebuilds the surface.
+    if ((GetTickCount() - g_t0) > 75000) {
+        g_ready = 0;
+        g_stage = -1;
+        iwnHookLog("dwm: WARP auto-off (75s budget spent) - paint stopped, dwm repaints");
+        return;
+    }
     advanceStage();
     InterlockedIncrement(&g_frames);
     LONG st = g_stage;
