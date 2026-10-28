@@ -91,10 +91,10 @@ static volatile LONG  g_proofWarp = 0;     // one readback after the first warpe
 static DWORD          g_t0 = 0;
 static LONG           g_lastLoggedStage = -1;
 
-// warp corners in SOURCE uv space: TL, TR, BL, BR.
-// Default = classic keystone pre-distortion: the source's top edge is squeezed
-// into the middle 70% so that it fills the screen from a trapezoidal projector
-// setup. Visible immediately, covers the whole surface (no uncovered border).
+// warp corners as DESTINATION positions (uv fractions of the surface): TL, TR,
+// BL, BR. Default = visible keystone: the drawn desktop becomes a trapezoid
+// (top edge pulled toward the middle), the rest of the surface is cleared to
+// black. uv always spans the full source - nothing is zoomed.
 static float g_cTLu = 0.15f, g_cTLv = 0.02f;
 static float g_cTRu = 0.85f, g_cTRv = 0.02f;
 static float g_cBLu = 0.00f, g_cBLv = 1.00f;
@@ -263,14 +263,19 @@ static void fillGrid() {
             for (int k = 0; k < 4; k++) {
                 float u = (float)cx[k] / (float)(n - 1);
                 float v = (float)cy[k] / (float)(n - 1);
-                float su = (1 - u) * (1 - v) * g_cTLu + u * (1 - v) * g_cTRu
+                // The four corner params are DESTINATION positions (exactly how
+                // the original's mesh editor works and how the operator thinks:
+                // "pull the top corners toward the middle -> trapezoid"). uv
+                // always spans the full source, so nothing is zoomed - the
+                // desktop is compressed INTO the trapezoid instead.
+                float du = (1 - u) * (1 - v) * g_cTLu + u * (1 - v) * g_cTRu
                          + (1 - u) * v * g_cBLu + u * v * g_cBRu;
-                float sv = (1 - u) * (1 - v) * g_cTLv + u * (1 - v) * g_cTRv
+                float dv = (1 - u) * (1 - v) * g_cTLv + u * (1 - v) * g_cTRv
                          + (1 - u) * v * g_cBLv + u * v * g_cBRv;
-                q[k].x = u * 2.0f - 1.0f;      // dest: full-screen NDC
-                q[k].y = 1.0f - v * 2.0f;
-                q[k].u = su;                    // src: warped uv
-                q[k].v = sv;
+                q[k].x = du * 2.0f - 1.0f;      // dest: keystone quad in NDC
+                q[k].y = 1.0f - dv * 2.0f;
+                q[k].u = u;                     // src: full-frame uv
+                q[k].v = v;
             }
             // triangle order matches D3D's default (clockwise = front)
             *out++ = q[0]; *out++ = q[1]; *out++ = q[2];
@@ -678,22 +683,29 @@ void DwmWarpBeforeSubmit() {
         char b[160];
         wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el,
                   ph == IWN_PH_IDLE ? "passthrough (must look unchanged)"
-                                    : "warp paint, no restore (dwm re-renders)");
+                                    : "fresh-save + clear + dest-keystone draw");
         iwnHookLog(b);
     }
 
     if (ph == IWN_PH_IDLE) return;
 
     __try {
-        // One clean snapshot for the shutdown cleanup. Taken on the first warp
-        // frame, before the first warp ever touches the surface.
-        if (!g_unpaintDone) {
-            g_unpaintDone = 1;
-            g_ctx->CopyResource(g_twin, g_target);
+        // FRESH snapshot every frame. The PS samples the twin, so a one-time
+        // snapshot (23:46 build) displays the first frame warped forever - the
+        // exact "desktop is frozen" the operator reported. dwm rendered the
+        // current frame into tgt[0] just before ConfirmFrame fired, so copying
+        // it now captures live content.
+        g_ctx->CopyResource(g_twin, g_target);
+        // Black out every candidate AFTER the snapshot: the trapezoid mesh no
+        // longer covers the full surface, and stale desktop content must not
+        // peek through the side wedges.
+        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        for (int i = 0; i < g_tgtN; i++) {
+            if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
-        iwnHookLog("dwm: warp baseline save EXCEPTION");
+        iwnHookLog("dwm: warp save EXCEPTION");
     }
 
     int before = (int)g_draws;
