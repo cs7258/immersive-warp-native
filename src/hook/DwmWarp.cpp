@@ -64,6 +64,7 @@ static ID3D11Texture2D*           g_tgt[IWN_MAX_TGT];   // ALL screen-size RT ca
 static ID3D11RenderTargetView*    g_rtvA[IWN_MAX_TGT];  // one RTV per candidate
 static int                        g_tgtN = 0;           // surfaces painted per frame
 static ID3D11Texture2D*           g_twin = nullptr;     // clean copy buffer
+static ID3D11Texture2D*           g_stageTex = nullptr; // CPU-readable mirror (diagnostics)
 static ID3D11RenderTargetView*    g_rtv = nullptr;      // kept for releaseAll compat (unused)
 static ID3D11ShaderResourceView*  g_srv = nullptr;      // view onto g_twin
 static ID3D11SamplerState*        g_smp = nullptr;
@@ -86,6 +87,9 @@ static volatile LONG  g_fail = 0;
 static volatile LONG  g_draws = 0;
 static volatile LONG  g_pendingRestore = 0;
 static volatile LONG  g_baselineFrozen = 0;
+static volatile LONG  g_unpaintDone = 0;   // cleared the magenta probe off the surfaces
+static volatile LONG  g_proofClear = 0;
+static volatile LONG  g_proofWarp = 0;
 static DWORD          g_t0 = 0;
 static LONG           g_lastLoggedStage = -1;
 
@@ -355,6 +359,7 @@ static void releaseAll() {
     }
     g_tgtN = 0;
     if (g_twin) { g_twin->Release(); g_twin = nullptr; }
+    if (g_stageTex) { g_stageTex->Release(); g_stageTex = nullptr; }
     if (g_rs) { g_rs->Release(); g_rs = nullptr; }
     if (g_bs) { g_bs->Release(); g_bs = nullptr; }
     if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
@@ -432,6 +437,21 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
               (unsigned)td.Width, (unsigned)td.Height, (unsigned)td.Format, (unsigned)hr);
     iwnHookLog(b);
     if (FAILED(hr) || !g_twin) { releaseAll(); return false; }
+
+    // CPU-readable mirror. Every "nothing happened on screen" so far had two
+    // indistinguishable causes: the draw never landed, or it landed on a surface
+    // that is not the one being scanned out. One readback tells them apart
+    // without asking the operator to describe what he sees.
+    {
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.BindFlags = 0;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags = 0;
+        HRESULT hsr = g_dev->CreateTexture2D(&sd, nullptr, &g_stageTex);
+        wsprintfA(b, "dwm: warp staging %ux%u hr=0x%08X", (unsigned)sd.Width, (unsigned)sd.Height, (unsigned)hsr);
+        iwnHookLog(b);
+    }
 
     // One RTV per candidate surface. The 20:22 run painted a single
     // (proof-carrying) surface and the screen showed nothing, so now every
@@ -573,30 +593,46 @@ static void paintWarp() {
     stateRestore(&st);
 }
 
-// ---------------------------------------------------------------- timer / stage
-static void advanceStage() {
-    DWORD el = GetTickCount() - g_t0;
-    LONG want = g_stage;
-    // Timeline is matched to the probe script's observation window (it holds
-    // ~45s after injection). stage 4 gets the bulk of it, because that is the
-    // one that must show a warp if the surface we found is really the screen.
-    if (el < 2000)       want = 1;
-    else if (el < 7000)  want = 2;
-    else if (el < 14000) want = 3;
-    else                 want = 4;
-    if (want == g_lastLoggedStage) return;
-    g_lastLoggedStage = want;
-    g_stage = want;
-    char b[192];
-    const char* what = "?";
-    switch (want) {
-        case 1: what = "save+restore only (must look unchanged)"; break;
-        case 2: what = "save + paint + restore (original shape)"; break;
-        case 3: what = "save + paint, restore one submit later"; break;
-        case 4: what = "frozen clean baseline, never restore"; break;
+// ---------------------------------------------------------------- diagnostics
+// One pixel out of a candidate surface, via a staging copy. Never call this from
+// the reporter thread: the immediate context is not free-threaded.
+static void readbackPixel(int i, const char* tag) {
+    if (!g_stageTex || !g_ctx || i < 0 || i >= g_tgtN || !g_tgt[i]) return;
+    __try {
+        g_ctx->CopyResource(g_stageTex, g_tgt[i]);
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (SUCCEEDED(g_ctx->Map(g_stageTex, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
+            size_t off = (size_t)(g_rtH / 2) * m.RowPitch + (size_t)(g_rtW / 2) * 4;
+            unsigned mid = *(const unsigned*)((const BYTE*)m.pData + off);
+            size_t off2 = (size_t)4 * m.RowPitch + 4 * 4;
+            unsigned near = *(const unsigned*)((const BYTE*)m.pData + off2);
+            g_ctx->Unmap(g_stageTex, 0);
+            char b[192];
+            wsprintfA(b, "dwm: READBACK %s tgt=%d mid=%08X near=%08X", tag, i, mid, near);
+            iwnHookLog(b);
+        } else {
+            iwnHookLog("dwm: READBACK map failed");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        iwnHookLog("dwm: READBACK EXCEPTION");
     }
-    wsprintfA(b, "dwm: WARP stage %ld @%lums - %s", want, (unsigned long)el, what);
-    iwnHookLog(b);
+}
+
+// ---------------------------------------------------------------- phase machine
+// The only unambiguous question left is: does *anything* we write into these
+// surfaces reach the panel? ClearRenderTargetView needs no shaders, no input
+// layout, no vertex buffer - if a flat magenta screen does not appear, the
+// surface set is wrong, not the warp pipeline. If it does appear, the surface is
+// right and the bug is in the mesh/shader binding.
+#define IWN_PH_IDLE    1
+#define IWN_PH_MAGENTA 2
+#define IWN_PH_GREEN   3
+#define IWN_PH_WARP    4
+
+static void clearAll(const float c[4]) {
+    for (int i = 0; i < g_tgtN; i++) {
+        if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], c);
+    }
 }
 
 void DwmWarpBeforeSubmit() {
@@ -604,43 +640,73 @@ void DwmWarpBeforeSubmit() {
     // Hard time budget. If the host console dies, or the operator walks away,
     // we must not leave the desktop painted over forever. Stopping the paint is
     // enough: dwm's next repaint (any window activity) rebuilds the surface.
-    if ((GetTickCount() - g_t0) > 75000) {
+    DWORD el = GetTickCount() - g_t0;
+    if (el > 75000) {
         g_ready = 0;
         g_stage = -1;
         iwnHookLog("dwm: WARP auto-off (75s budget spent) - paint stopped, dwm repaints");
         return;
     }
-    advanceStage();
     InterlockedIncrement(&g_frames);
-    LONG st = g_stage;
+
+    LONG ph;
+    const char* what;
+    if (el < 1500)       { ph = IWN_PH_IDLE;    what = "passthrough (must look unchanged)"; }
+    else if (el < 5500)  { ph = IWN_PH_MAGENTA; what = "CLEAR magenta on all candidates"; }
+    else if (el < 9500)  { ph = IWN_PH_GREEN;   what = "CLEAR green on all candidates"; }
+    else                 { ph = IWN_PH_WARP;    what = "save + warped draw + restore"; }
+
+    if (ph != g_lastLoggedStage) {
+        g_lastLoggedStage = ph;
+        g_stage = ph;
+        char b[192];
+        wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el, what);
+        iwnHookLog(b);
+    }
+
+    if (ph == IWN_PH_IDLE) return;
+
+    if (ph == IWN_PH_MAGENTA || ph == IWN_PH_GREEN) {
+        const float mag[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+        const float grn[4] = { 0.05f, 0.85f, 0.05f, 1.0f };
+        __try {
+            clearAll(ph == IWN_PH_MAGENTA ? mag : grn);
+            if (!g_proofClear) {
+                g_proofClear = 1;
+                readbackPixel(0, ph == IWN_PH_MAGENTA ? "clear-magenta" : "clear-green");
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            InterlockedIncrement(&g_fail);
+            iwnHookLog("dwm: warp clear EXCEPTION");
+        }
+        return;
+    }
 
     __try {
-        // A restore owed from the previous submit runs first, so that we always
-        // start from a clean surface.
-        if (g_pendingRestore) {
-            g_ctx->CopyResource(g_target, g_twin);
-            g_pendingRestore = 0;
+        if (!g_unpaintDone) {
+            // The probe colours are still sitting in the surfaces; put the clean
+            // copy back before the first warped frame, otherwise we would paint
+            // (and then keep restoring) solid magenta.
+            g_unpaintDone = 1;
+            for (int i = 0; i < g_tgtN; i++) {
+                if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
+            }
+            g_ctx->Flush();
+            iwnHookLog("dwm: warp surfaces reset from clean baseline");
         }
-        // stage 4 keeps the very first clean frame forever: painting from a
-        // frozen baseline cannot feed back into itself.
-        if (st >= 4 && g_baselineFrozen) {
-            // skip the save: baseline is frozen
-        } else {
-            g_ctx->CopyResource(g_twin, g_target);
-            if (st >= 4) { g_baselineFrozen = 1; iwnHookLog("dwm: warp baseline frozen"); }
-        }
+        g_ctx->CopyResource(g_twin, g_target);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
         iwnHookLog("dwm: warp save EXCEPTION");
     }
 
-    if (st >= 2) {
-        int before = (int)g_draws;
-        paintWarp();
-        if ((int)g_draws == before) {
-            // one log line per failure burst, not per frame
-            if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw");
-        }
+    int before = (int)g_draws;
+    paintWarp();
+    if ((int)g_draws == before) {
+        if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw");
+    } else if (!g_proofWarp) {
+        g_proofWarp = 1;
+        readbackPixel(0, "warp");
     }
 
     if (g_fail > 30) {
@@ -652,17 +718,12 @@ void DwmWarpBeforeSubmit() {
 
 void DwmWarpAfterSubmit() {
     if (!g_ready) return;
-    LONG st = g_stage;
-    if (st == 1 || st == 2) {
-        __try { g_ctx->CopyResource(g_target, g_twin); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            InterlockedIncrement(&g_fail);
-            iwnHookLog("dwm: warp restore EXCEPTION");
-        }
-    } else if (st == 3) {
-        g_pendingRestore = 1;      // deferred by exactly one submit
+    if (g_stage != IWN_PH_WARP) return;      // probe colours stay up on purpose
+    __try { g_ctx->CopyResource(g_target, g_twin); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: warp restore EXCEPTION");
     }
-    // stage 4 never restores
 }
 
 int DwmWarpStage() { return (int)g_stage; }
