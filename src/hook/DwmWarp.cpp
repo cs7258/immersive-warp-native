@@ -783,11 +783,26 @@ void DwmWarpInstallPresentHook() {
         CopyMemory(p, &back, 8); p += 8;
         *p++ = 0xFF; *p++ = 0xE0;
     }
-    // stub operands (template stays in .data; the executable copy runs)
+    // stub operands (template stays in .data; the executable copy runs).
+    // Layout: 0=51, 1-2=48 B8, 3-10=imm(ourC), 11-12=FF D0, 13=59,
+    //         14-15=48 B8, 16-23=imm(tramp), 24-25=FF E0.
+    // CRITICAL: the operands go at +3 and +16. The previous +2/+14 clobbered
+    // the 0xB8 opcode byte and shifted both addresses by one - every
+    // PresentInternal call then derailed into garbage and AV'd dwm (WER events
+    // 00:40/00:59/01:20 all show IP = RWX block base + small offset, module
+    // "unknown"). Three crashes, one typo.
     UINT64 cb = (UINT64)&IWN_PresentCallback;
-    CopyMemory(g_detourStub + 2,  &cb, 8);
-    CopyMemory(g_detourStub + 14, tr, 8);
+    CopyMemory(g_detourStub + 3,  &cb, 8);
+    CopyMemory(g_detourStub + 16, tr, 8);
     CopyMemory(stubX, g_detourStub, sizeof(g_detourStub));
+    // verify the executable copy: opcodes intact and both operands exact
+    if (stubX[0] != 0x51 || stubX[1] != 0x48 || stubX[2] != 0xB8 ||
+        *(UINT64*)(stubX + 3) != cb || stubX[11] != 0xFF || stubX[12] != 0xD0 ||
+        stubX[13] != 0x59 || stubX[14] != 0x48 || stubX[15] != 0xB8 ||
+        *(UINT64*)(stubX + 16) != (UINT64)tr || stubX[24] != 0xFF || stubX[25] != 0xE0) {
+        iwnHookLog("dwm: present hook skipped (stub bytes corrupted)");
+        return;
+    }
     g_trampMem = tr;
     FlushInstructionCache(GetCurrentProcess(), stubX, 32);
     FlushInstructionCache(GetCurrentProcess(), tr, 40);
