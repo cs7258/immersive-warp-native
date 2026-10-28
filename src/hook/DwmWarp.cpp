@@ -85,8 +85,7 @@ static volatile LONG  g_stage = 0;      // 0 off, 1..4 staged rollout
 static volatile LONG  g_frames = 0;
 static volatile LONG  g_fail = 0;
 static volatile LONG  g_draws = 0;
-static volatile LONG  g_pendingRestore = 0;
-static volatile LONG  g_baselineFrozen = 0;
+static volatile LONG  g_unpaintDone = 0;   // clean baseline saved / probe colours cleared
 static volatile LONG  g_gridDirty = 1;     // vertex buffer needs a refill
 static volatile LONG  g_proofWarp = 0;     // one readback after the first warped draw
 static DWORD          g_t0 = 0;
@@ -629,30 +628,45 @@ static void readbackPixel(int i, const char* tag) {
 }
 
 // ---------------------------------------------------------------- phase machine
-// 22:51 run established contact: ClearRenderTargetView reached the panel
-// (screenshots t02-t08 were solid magenta / solid green), so the surfaces we
-// paint ARE the ones being scanned out. But the warped frames were only seen
-// flickering: the restore in AfterSubmit raced the kernel transport's readout
-// of the just-confirmed frame and usually won. Two bugs, both fixed here:
-//   1. the restore copied the twin back into g_target (= tgt[0]) only, leaving
-//      tgt[1] warped forever - it accumulated warp every frame, which is
-//      exactly the "zooms in and distorts more and more" the operator saw;
-//   2. restoring immediately after ConfirmFrame can beat the scanout.
-// Fix: restore is deferred to the START of the next submit and covers ALL
-// surfaces, so the warped frame stays in place for a full frame window.
+// 23:18 run: warp VISIBLE (screenshots hold a constant +21.9 mean offset from
+// the pre-inject baseline) but the desktop was FROZEN - inter-frame diff decayed
+// 5.9 -> 1.0, i.e. dwm's fresh renders were being erased. Root cause: the
+// deferred restore ran at the start of the next submit, which is AFTER dwm has
+// already rendered the new frame into the surface - so every fresh render was
+// clobbered by the stale twin, freezing the desktop at the moment warp began.
+// dwm is a compositor: it redraws the full visual tree into this surface every
+// frame. So the correct shape is NO save/restore at all - paint the warp, let
+// dwm's next render wipe it. One baseline copy is kept only for the shutdown
+// cleanup (otherwise the last warped frame lingers until a manual refresh,
+// which the operator actually experienced).
 #define IWN_PH_IDLE 1
 #define IWN_PH_WARP 4
 
+static void restoreBaseline(const char* why) {
+    __try {
+        for (int i = 0; i < g_tgtN; i++) {
+            if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
+        }
+        g_ctx->Flush();
+        char b[128];
+        wsprintfA(b, "dwm: warp baseline restored to all %d surfaces (%s)", g_tgtN, why);
+        iwnHookLog(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: baseline restore EXCEPTION");
+    }
+}
+
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
-    // Hard time budget. If the host console dies, or the operator walks away,
-    // we must not leave the desktop painted over forever. Stopping the paint is
-    // enough: dwm's next repaint (any window activity) rebuilds the surface.
     DWORD el = GetTickCount() - g_t0;
     if (el > 75000) {
         g_ready = 0;
         g_stage = -1;
-        iwnHookLog("dwm: WARP auto-off (75s budget spent) - paint stopped, dwm repaints");
+        // Hand the desktop back: dwm only redraws dirty regions, so the last
+        // warped frame would otherwise sit on screen until a manual refresh.
+        restoreBaseline("75s budget spent");
+        iwnHookLog("dwm: WARP auto-off (75s budget spent)");
         return;
     }
     InterlockedIncrement(&g_frames);
@@ -664,27 +678,22 @@ void DwmWarpBeforeSubmit() {
         char b[160];
         wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el,
                   ph == IWN_PH_IDLE ? "passthrough (must look unchanged)"
-                                    : "deferred-restore warp (all surfaces)");
+                                    : "warp paint, no restore (dwm re-renders)");
         iwnHookLog(b);
     }
 
     if (ph == IWN_PH_IDLE) return;
 
     __try {
-        // A restore owed from the previous submit runs first, so every surface
-        // starts this frame from the same clean snapshot.
-        if (g_pendingRestore) {
-            g_pendingRestore = 0;
-            for (int i = 0; i < g_tgtN; i++) {
-                if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
-            }
+        // One clean snapshot for the shutdown cleanup. Taken on the first warp
+        // frame, before the first warp ever touches the surface.
+        if (!g_unpaintDone) {
+            g_unpaintDone = 1;
+            g_ctx->CopyResource(g_twin, g_target);
         }
-        // Fresh clean source. tgt[0] is clean here because either dwm redrew it
-        // since the last confirm, or we restored it a line above.
-        g_ctx->CopyResource(g_twin, g_target);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
-        iwnHookLog("dwm: warp save EXCEPTION");
+        iwnHookLog("dwm: warp baseline save EXCEPTION");
     }
 
     int before = (int)g_draws;
@@ -699,16 +708,16 @@ void DwmWarpBeforeSubmit() {
     if (g_fail > 30) {
         g_ready = 0;
         g_stage = -1;
-        iwnHookLog("dwm: WARP DISABLED after repeated failures - back to passthrough");
+        restoreBaseline("repeated failures");
+        iwnHookLog("dwm: WARP DISABLED after repeated failures - baseline restored");
     }
 }
 
 void DwmWarpAfterSubmit() {
-    if (!g_ready) return;
-    if (g_stage != IWN_PH_WARP) return;
-    // Do NOT touch the surfaces here: the kernel transport may not have read
-    // the frame yet. The restore happens at the next submit's start.
-    g_pendingRestore = 1;
+    // Intentionally empty: restoring here either races the scanout (warp
+    // flickers away) or, when deferred, erases dwm's fresh render (frozen
+    // desktop). dwm's own next-frame render is what cleans the surface.
+    (void)0;
 }
 
 int DwmWarpStage() { return (int)g_stage; }
