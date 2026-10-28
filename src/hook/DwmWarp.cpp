@@ -668,53 +668,66 @@ static void readbackPixel(int i, const char* tag) {
 static volatile LONG  g_pendingRestore = 0;
 static DWORD          g_lastPaintTick = 0;
 
-// ---- PresentInternal prologue detour --------------------------------------
-// Original prologue at dwmcore+0x6C6B0 (28 bytes, no RIP-relative, moves verbatim):
-//   push rbp/rbx/rsi/rdi/r12/r13/r14/r15; lea rbp,[rsp-0x98]; sub rsp,0x1c8
-// Patch: movabs rax,stub; jmp rax  (12 bytes). The stub runs our pre-present
-// paint with rcx (=this) preserved, then jmps to the trampoline with rsp exactly
-// as at entry, so the displaced prologue and the whole function body execute
-// with unshifted stack (rbp-relative parameter access and the /GS cookie stay
-// correct). Painting once per millisecond guards against multiple presents
-// (second monitor / MPO) inside one composition.
-static BYTE g_detourStub[26] = {
-    0x51,                                                   // push rcx
-    0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,                     // movabs rax, ourC
-    0xFF, 0xD0,                                             // call rax
-    0x59,                                                   // pop rcx
-    0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,                     // movabs rax, tramp
-    0xFF, 0xE0                                              // jmp rax
-};
-static void* g_trampMem = nullptr;
+// ---- PresentInternal wrapper detour ----------------------------------------
+// 07:00 run established WHY the CF paint point cannot warp windows: dwm paints
+// window content into the composite surface AFTER our CF paint (dirty-rect
+// rendering - the wallpaper keeps our warp because dwm never redraws it, every
+// window is redrawn unwarped on top). The only point where the frame is FINAL
+// (wallpaper + all windows) and still pre-scanout is inside
+// CDWMSwapChain::PresentInternal, right before the real present runs.
+//
+// Implementation: patch the entry with movabs rax,&IWN_PresentWrap; jmp rax.
+// IWN_PresentWrap is an ORDINARY C++ function - the compiler emits the whole
+// ABI (stack alignment, shadow space, register saves) instead of us hand-writing
+// a stub (three dwm deaths were caused by stub byte bugs). PresentInternal's
+// real signature has 4 register args + exactly ONE stack arg (measured: the
+// body reads [rbp+0x100] once and nothing beyond, rbp = entryRsp-0xD8), so the
+// wrapper declares 5 parameters and forwards them unchanged.
+// After the original body returns (frame already submitted) we restore the
+// clean composed frame, so dwm's next dirty-rect pass never sees our warp -
+// no accumulation. SyncInterval is normalized to 0 + ALLOW_TEARING in dwm
+// (measured in the original's utilPostPresent), so the flip happens inside the
+// present call, which is what makes an immediate restore viable.
+static void* g_trampMem = nullptr;             // RWX: displaced prologue + jmp back
+static HRESULT (STDMETHODCALLTYPE* g_presentTramp)(void*, void*, void*, void*, UINT64) = nullptr;
 static LONG  g_detourInstalled = 0;
+static void restoreAllSurfaces(const char* why);   // defined below the wrapper
 
 // Paints the warp into all candidates while dwm is inside PresentInternal,
 // i.e. after its render is final and before the real present runs.
-void IWN_PresentCallback(void* /*self*/) {
-    if (!g_ready || (LONG)g_stage != IWN_PH_PRESNT) return;
-    DWORD t = GetTickCount();
-    if (t == g_lastPaintTick) return;          // one paint per compose
-    g_lastPaintTick = t;
-    InterlockedIncrement(&g_frames);
-    __try {
-        g_ctx->CopyResource(g_twin, g_target); // fresh frame, pre-warp
-        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-        for (int i = 0; i < g_tgtN; i++) {
-            if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
+static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3, void* a4, UINT64 a5) {
+    BOOL painted = FALSE;
+    if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx) {
+        DWORD t = GetTickCount();
+        if (t != g_lastPaintTick) {            // one paint per compose
+            g_lastPaintTick = t;
+            InterlockedIncrement(&g_frames);
+            __try {
+                g_ctx->CopyResource(g_twin, g_target); // fresh COMPLETE frame
+                const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                for (int i = 0; i < g_tgtN; i++) {
+                    if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                InterlockedIncrement(&g_fail);
+                iwnHookLog("dwm: warp save EXCEPTION (present)");
+            }
+            int before = (int)g_draws;
+            paintWarp();
+            if ((int)g_draws == before) {
+                if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (present)");
+            } else {
+                painted = TRUE;
+                if (!g_proofWarp) {
+                    g_proofWarp = 1;
+                    readbackPixel(0, "warp-present");
+                }
+            }
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        InterlockedIncrement(&g_fail);
-        iwnHookLog("dwm: warp save EXCEPTION (present)");
-        return;
     }
-    int before = (int)g_draws;
-    paintWarp();
-    if ((int)g_draws == before) {
-        if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (present)");
-    } else if (!g_proofWarp) {
-        g_proofWarp = 1;
-        readbackPixel(0, "warp");
-    }
+    HRESULT hr = g_presentTramp(self, a2, a3, a4, a5);
+    if (painted) restoreAllSurfaces("post-present");
+    return hr;
 }
 
 static void restoreAllSurfaces(const char* why) {
@@ -765,21 +778,21 @@ static void suspendOtherThreads(int* suspended, HANDLE* handles, int cap) {
     CloseHandle(snap);
 }
 
-void DwmWarpInstallPresentHook() {
-    if (InterlockedCompareExchange(&g_detourInstalled, 1, 0) != 0) return;
+// Returns TRUE when the wrapper detour is live (entry patched + verified).
+BOOL DwmWarpInstallPresentHook() {
+    if (InterlockedCompareExchange(&g_detourInstalled, 1, 0) != 0)
+        return g_presentTramp != nullptr;
     HMODULE h = GetModuleHandleW(L"dwmcore.dll");
-    if (!h) { iwnHookLog("dwm: present hook skipped (no dwmcore)"); return; }
+    if (!h) { iwnHookLog("dwm: present hook skipped (no dwmcore)"); return FALSE; }
     BYTE* fn = (BYTE*)h + 0x6C6B0;
 
-    // 00:40 run: the stub lived in g_detourStub (.data, NOT executable) and the
-    // first jmp into it AV'd dwm within ~1s of install. Both the stub and the
-    // trampoline must live in RWX memory.
-    BYTE* blk = (BYTE*)VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!blk) { iwnHookLog("dwm: present hook skipped (no RWX mem)"); return; }
-    BYTE* stubX = blk;          // 26 bytes
-    BYTE* tr    = blk + 32;     // 28 displaced + 12 tail = 40 bytes
+    // Trampoline = the 28 displaced prologue bytes + jmp back to fn+0x1C. It is
+    // called AS AN ORDINARY FUNCTION POINTER from IWN_PresentWrap, so it must
+    // live in RWX memory (00:40 lesson: .data is not executable).
+    BYTE* blk = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!blk) { iwnHookLog("dwm: present hook skipped (no RWX mem)"); return FALSE; }
+    BYTE* tr = blk;
 
-    // trampoline = 28 displaced bytes + movabs rax,(fn+0x1C); jmp rax
     CopyMemory(tr, fn, 0x1C);
     {
         BYTE* p = tr + 0x1C;
@@ -788,33 +801,16 @@ void DwmWarpInstallPresentHook() {
         CopyMemory(p, &back, 8); p += 8;
         *p++ = 0xFF; *p++ = 0xE0;
     }
-    // stub operands (template stays in .data; the executable copy runs).
-    // Layout: 0=51, 1-2=48 B8, 3-10=imm(ourC), 11-12=FF D0, 13=59,
-    //         14-15=48 B8, 16-23=imm(tramp), 24-25=FF E0.
-    // CRITICAL: the operands go at +3 and +16. The previous +2/+14 clobbered
-    // the 0xB8 opcode byte and shifted both addresses by one - every
-    // PresentInternal call then derailed into garbage and AV'd dwm (WER events
-    // 00:40/00:59/01:20 all show IP = RWX block base + small offset, module
-    // "unknown"). Three crashes, one typo.
-    UINT64 cb = (UINT64)&IWN_PresentCallback;
-    CopyMemory(g_detourStub + 3,  &cb, 8);
-    UINT64 trv = (UINT64)tr;               // NOTE: must pass &trv - passing tr
-    CopyMemory(g_detourStub + 16, &trv, 8);// copies the TRAMPOLINE CONTENT, not
-                                           // its address (caught by the stub
-                                           // verification in the 01:38/01:43
-                                           // runs: "stub bytes corrupted")
-    CopyMemory(stubX, g_detourStub, sizeof(g_detourStub));
-    // verify the executable copy: opcodes intact and both operands exact
-    if (stubX[0] != 0x51 || stubX[1] != 0x48 || stubX[2] != 0xB8 ||
-        *(UINT64*)(stubX + 3) != cb || stubX[11] != 0xFF || stubX[12] != 0xD0 ||
-        stubX[13] != 0x59 || stubX[14] != 0x48 || stubX[15] != 0xB8 ||
-        *(UINT64*)(stubX + 16) != (UINT64)tr || stubX[24] != 0xFF || stubX[25] != 0xE0) {
-        iwnHookLog("dwm: present hook skipped (stub bytes corrupted)");
-        return;
-    }
+    // Verify the trampoline tail before going live: movabs rax,imm64 must hold
+    // exactly the return address (the 01:38 run caught a wrong operand only
+    // because of byte verification - keep verifying everything handwritten).
+    BOOL trOk = tr[0x1C] == 0x48 && tr[0x1D] == 0xB8 &&
+                *(UINT64*)(tr + 0x1E) == (UINT64)(fn + 0x1C) &&
+                tr[0x26] == 0xFF && tr[0x27] == 0xE0;
+    if (!trOk) { iwnHookLog("dwm: present hook skipped (trampoline bytes bad)"); return FALSE; }
+    g_presentTramp = (HRESULT (STDMETHODCALLTYPE*)(void*, void*, void*, void*, UINT64))tr;
     g_trampMem = tr;
-    FlushInstructionCache(GetCurrentProcess(), stubX, 32);
-    FlushInstructionCache(GetCurrentProcess(), tr, 40);
+    FlushInstructionCache(GetCurrentProcess(), tr, 0x28);
 
     // ---- patch with every other thread suspended ----
     HANDLE th[128]; int ns = 0;
@@ -829,10 +825,10 @@ void DwmWarpInstallPresentHook() {
     if (!VirtualProtect(fn, 32, PAGE_EXECUTE_READWRITE, &old)) {
         iwnHookLog("dwm: present hook skipped (VirtualProtect denied)");
         for (int i = ns - 1; i >= 0; i--) { ResumeThread(th[i]); CloseHandle(th[i]); }
-        return;
+        return FALSE;
     }
     BYTE patch[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
-    UINT64 sa = (UINT64)stubX;
+    UINT64 sa = (UINT64)&IWN_PresentWrap;
     CopyMemory(patch + 2, &sa, 8);
     CopyMemory(fn, patch, 12);
     VirtualProtect(fn, 32, old, &old);
@@ -852,8 +848,9 @@ void DwmWarpInstallPresentHook() {
         CopyMemory(fn, orig, 12);
         VirtualProtect(fn, 32, old, &old);
         FlushInstructionCache(GetCurrentProcess(), fn, 12);
+        g_presentTramp = nullptr;
         iwnHookLog("dwm: present hook rolled back (patch did not verify)");
-        return;
+        return FALSE;
     }
 
     // Restore CFG call-target validity for the patched page. VirtualProtect
@@ -873,7 +870,8 @@ void DwmWarpInstallPresentHook() {
                   (void*)page, (long)ok, (long)GetLastError());
         iwnHookLog(b);
     }
-    iwnHookLog("dwm: PresentInternal detour installed @0x6C6B0 (phase C active)");
+    iwnHookLog("dwm: PresentInternal WRAPPER installed @0x6C6B0 (paint pre-present, restore post-present)");
+    return TRUE;
 }
 
 // ------------------------------------------------------------ MPO/DirectFlip off
@@ -984,11 +982,11 @@ void DwmWarpBeforeSubmit() {
         return;
     }
     LONG ph;
-    // Steady state (proven 01:38 + 01:43 runs, screenshots t06-t12 vs-base
-    // ~27 STABLE, vs-prev ~5 = live content, no accumulation, no crash):
-    // CF paint + deferred restore over ALL surfaces. The PresentInternal
-    // detour is retired: it killed dwm three times and the deferred-restore
-    // mode already delivers a visible, live warp.
+    // Timeline: passthrough -> CF immediate-restore sanity phase -> steady.
+    // At steady entry the PresentInternal WRAPPER is installed; on success the
+    // paint point moves there (frame is FINAL there - windows included - which
+    // the CF point can never be, 07:00 run: windows stay unwarped because dwm
+    // dirty-rect redraws them after our CF paint).
     if (el < 1500)       ph = IWN_PH_IDLE;
     else if (el < 8000)  ph = IWN_PH_CF_IMM;
     else                 ph = IWN_PH_CF_DEF;
@@ -1001,18 +999,27 @@ void DwmWarpBeforeSubmit() {
         switch (ph) {
             case IWN_PH_IDLE:   what = "passthrough (must look unchanged)"; break;
             case IWN_PH_CF_IMM: what = "CF paint + immediate restore (forcePreserveBB)"; break;
-            case IWN_PH_CF_DEF: what = "steady warp: CF paint + deferred restore (all surfaces)"; break;
-            case IWN_PH_PRESNT: what = "retired"; break;
+            case IWN_PH_CF_DEF: what = "CF paint + deferred restore (fallback mode)"; break;
+            case IWN_PH_PRESNT: what = "present-wrapper paint (frame final)"; break;
         }
         wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el, what);
         iwnHookLog(b);
         // Steady-warp entry: suppress MPO/DirectFlip so overlay-direct windows
         // (cmd.exe, video, fullscreen) are routed back through the composite
         // surface we paint. Restored on every shutdown path via restoreBaseline.
-        if (ph == IWN_PH_CF_DEF) DwmWarpSetMpoSuppressed(TRUE);
+        if (ph == IWN_PH_CF_DEF) {
+            DwmWarpSetMpoSuppressed(TRUE);
+            if (DwmWarpInstallPresentHook()) {
+                g_stage = IWN_PH_PRESNT;
+                iwnHookLog("dwm: paint point moved to PresentInternal wrapper");
+            } else {
+                iwnHookLog("dwm: present wrapper NOT installed - staying on CF deferred-restore mode");
+            }
+        }
     }
 
     if (ph == IWN_PH_IDLE) return;
+    if ((LONG)g_stage == IWN_PH_PRESNT) return;   // painted by the wrapper now
 
     InterlockedIncrement(&g_frames);
     paintAtConfirmFrame(ph);
