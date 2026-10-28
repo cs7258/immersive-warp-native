@@ -29,6 +29,7 @@
 // never appears.
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include "DwmWarp.h"
@@ -730,6 +731,35 @@ static void restoreAllSurfaces(const char* why) {
     }
 }
 
+// --- patch-time thread suspension -------------------------------------------
+// The 12-byte inline patch is NOT atomic. A live dwm thread executing the first
+// bytes of PresentInternal while we write can fetch a torn instruction stream,
+// do `movabs rax,<garbage>; jmp rax` and AV in unknown memory (exactly what WER
+// reported for the 00:40 and 00:59 deaths: 0xC0000005, IP 0x1c098070001).
+// Suspending every other thread for the few microseconds of the write closes
+// that window. A thread suspended while inside fn[0..11] would resume into the
+// patch - an accepted residual risk of every inline detour; the window is 12
+// bytes of a multi-kilobyte function.
+static void suspendOtherThreads(int* suspended, HANDLE* handles, int cap) {
+    *suspended = 0;
+    DWORD self = GetCurrentThreadId();
+    DWORD pid  = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te; te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == (DWORD)self) continue;
+            if (*suspended >= cap) break;
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+            if (!t) continue;
+            if (SuspendThread(t) != (DWORD)-1) handles[(*suspended)++] = t;
+            else CloseHandle(t);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
 void DwmWarpInstallPresentHook() {
     if (InterlockedCompareExchange(&g_detourInstalled, 1, 0) != 0) return;
     HMODULE h = GetModuleHandleW(L"dwmcore.dll");
@@ -759,10 +789,22 @@ void DwmWarpInstallPresentHook() {
     CopyMemory(g_detourStub + 14, tr, 8);
     CopyMemory(stubX, g_detourStub, sizeof(g_detourStub));
     g_trampMem = tr;
+    FlushInstructionCache(GetCurrentProcess(), stubX, 32);
+    FlushInstructionCache(GetCurrentProcess(), tr, 40);
 
+    // ---- patch with every other thread suspended ----
+    HANDLE th[128]; int ns = 0;
+    suspendOtherThreads(&ns, th, 128);
+    char b[160];
+    wsprintfA(b, "dwm: present hook patching with %d threads suspended", ns);
+    iwnHookLog(b);
+
+    BYTE orig[12];
+    CopyMemory(orig, fn, 12);
     DWORD old = 0;
     if (!VirtualProtect(fn, 32, PAGE_EXECUTE_READWRITE, &old)) {
         iwnHookLog("dwm: present hook skipped (VirtualProtect denied)");
+        for (int i = ns - 1; i >= 0; i--) { ResumeThread(th[i]); CloseHandle(th[i]); }
         return;
     }
     BYTE patch[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
@@ -771,8 +813,43 @@ void DwmWarpInstallPresentHook() {
     CopyMemory(fn, patch, 12);
     VirtualProtect(fn, 32, old, &old);
     FlushInstructionCache(GetCurrentProcess(), fn, 12);
-    FlushInstructionCache(GetCurrentProcess(), stubX, 32);
-    iwnHookLog("dwm: PresentInternal detour installed @0x6C6B0 (gated to phase C)");
+
+    // verify the patch landed intact
+    BYTE now[12];
+    CopyMemory(now, fn, 12);
+    BOOL patchOk = memcmp(now, patch, 12) == 0;
+    for (int i = ns - 1; i >= 0; i--) { ResumeThread(th[i]); CloseHandle(th[i]); }
+    wsprintfA(b, "dwm: present hook patch %s (first byte %02X->%02X)",
+              patchOk ? "verified" : "MISMATCH", orig[0], now[0]);
+    iwnHookLog(b);
+    if (!patchOk) {
+        // roll back: a torn patch left in place is exactly the crash we fixed
+        VirtualProtect(fn, 32, PAGE_EXECUTE_READWRITE, &old);
+        CopyMemory(fn, orig, 12);
+        VirtualProtect(fn, 32, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), fn, 12);
+        iwnHookLog("dwm: present hook rolled back (patch did not verify)");
+        return;
+    }
+
+    // Restore CFG call-target validity for the patched page. VirtualProtect
+    // cycles on a CFG image page can drop the valid-target bitmap; the patched
+    // entry is reached through COM vtable indirect calls. Marking every
+    // 16-aligned offset on the page valid restores the pre-patch state.
+    typedef struct { ULONG Offset; ULONG Flags; } IWN_CFG_TARGET;
+    typedef BOOL (WINAPI *PFN_SVCT)(HANDLE, PVOID, SIZE_T, ULONG, IWN_CFG_TARGET*);
+    PFN_SVCT svct = (PFN_SVCT)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                             "SetProcessValidCallTargets");
+    if (svct) {
+        uintptr_t page = (uintptr_t)fn & ~(uintptr_t)0xFFF;
+        IWN_CFG_TARGET info[256];
+        for (int i = 0; i < 256; i++) { info[i].Offset = (ULONG)(i * 16); info[i].Flags = 1; }
+        BOOL ok = svct(GetCurrentProcess(), (PVOID)page, 0x1000, 256, info);
+        wsprintfA(b, "dwm: CFG call targets re-validated for page %p (ok=%ld gle=%ld)",
+                  (void*)page, (long)ok, (long)GetLastError());
+        iwnHookLog(b);
+    }
+    iwnHookLog("dwm: PresentInternal detour installed @0x6C6B0 (phase C active)");
 }
 
 static void restoreBaseline(const char* why) {
@@ -850,6 +927,12 @@ void DwmWarpBeforeSubmit() {
         }
         wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el, what);
         iwnHookLog(b);
+        // Phase C entry: NOW install the present detour. Installing at attach
+        // time killed dwm twice (00:40, 00:59 - WER 0xC0000005, faulting IP in
+        // unknown/private memory = another thread fetched the patch mid-write).
+        // Installing late means A/B already ran clean for 16s, and the patch
+        // itself is now guarded by thread suspension.
+        if (ph == IWN_PH_PRESNT) DwmWarpInstallPresentHook();
     }
 
     if (ph == IWN_PH_IDLE) return;

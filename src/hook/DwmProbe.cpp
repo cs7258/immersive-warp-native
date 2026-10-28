@@ -409,9 +409,12 @@ static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
         }
         bool ok = DwmWarpAttachTargets(list, g_targetN);
         iwnHookLog(ok ? "dwm: warp attach OK" : "dwm: warp attach FAILED");
-        if (ok) {
-            DwmWarpInstallPresentHook();
-        }
+        // NOTE: the PresentInternal detour is NOT installed here anymore. Both
+        // 00:40 and 00:59 runs show dwm dying ~1s after install (WER event:
+        // 0xC0000005 with faulting IP in UNKNOWN/private memory = a live thread
+        // fetched the 12-byte patch half-written and jumped to a torn garbage
+        // address). It is now installed lazily at phase C entry, so phases A/B
+        // (pure ConfirmFrame painting) get a clean 16s window first.
         for (int i = 0; i < g_targetN; i++) {
             __try { g_targets[i]->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
             g_targets[i] = nullptr;
