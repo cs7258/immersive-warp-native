@@ -722,9 +722,14 @@ static void restoreAllSurfaces(const char* why) {
         for (int i = 0; i < g_tgtN; i++) {
             if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
         }
-        char b[128];
-        wsprintfA(b, "dwm: warp surfaces restored (%s)", why);
-        iwnHookLog(b);
+        // This runs once per frame in steady mode; logging every call produced
+        // 454 near-identical lines in the 06:41 run. Log every 128th.
+        static volatile LONG rlog = 0;
+        if ((InterlockedIncrement(&rlog) & 127) == 1) {
+            char b[128];
+            wsprintfA(b, "dwm: warp surfaces restored (%s) [log every 128]", why);
+            iwnHookLog(b);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
         iwnHookLog("dwm: restore EXCEPTION");
@@ -871,7 +876,58 @@ void DwmWarpInstallPresentHook() {
     iwnHookLog("dwm: PresentInternal detour installed @0x6C6B0 (phase C active)");
 }
 
+// ------------------------------------------------------------ MPO/DirectFlip off
+// CMD windows (and video / fullscreen apps) render through hardware overlay
+// planes that the GPU scans out directly - they never pass through the
+// composite surface we paint, so they stay unwarped. Measured 06:41 run: the
+// wallpaper warped, the cmd.exe window did not. dwm_lut's answer, adopted
+// verbatim: force COverlayContext::OverlaysEnabled and
+// COverlayContext::IsCandidateDirectFlipCompatbile to return FALSE while the
+// warp is up. Both are plain predicates, so instead of a detour we overwrite
+// the prologue with "xor eax,eax; ret" (3 bytes) and restore the saved
+// original bytes at shutdown - no trampoline, no calling convention risk.
+// RVAs from dwmcore.pdb (18363, SizeOfImage 0x367000):
+//   0x185B6C COverlayContext::OverlaysEnabled
+//   0x184D2C COverlayContext::IsCandidateDirectFlipCompatbile
+struct MpoPatch { const char* name; DWORD rva; BYTE orig[8]; BOOL installed; };
+static MpoPatch g_mpoPatches[2] = {
+    { "OverlaysEnabled",                 0x185B6C, {0}, FALSE },
+    { "IsCandidateDirectFlipCompatbile", 0x184D2C, {0}, FALSE },
+};
+
+static void DwmWarpSetMpoSuppressed(BOOL on) {
+    HMODULE h = GetModuleHandleW(L"dwmcore.dll");
+    if (!h) { iwnHookLog("dwm: mpo toggle skipped (no dwmcore)"); return; }
+    for (int i = 0; i < 2; i++) {
+        MpoPatch& m = g_mpoPatches[i];
+        if (on == m.installed) continue;              // already in the wanted state
+        BYTE* fn = (BYTE*)h + m.rva;
+        HANDLE th[128]; int ns = 0;
+        suspendOtherThreads(&ns, th, 128);
+        DWORD old = 0;
+        BOOL ok = VirtualProtect(fn, 16, PAGE_EXECUTE_READWRITE, &old) != 0;
+        if (ok && on) {
+            CopyMemory(m.orig, fn, 8);                // save before first patch
+            const BYTE ret0[3] = { 0x31, 0xC0, 0xC3 };// xor eax,eax ; ret
+            CopyMemory(fn, ret0, 3);
+            FlushInstructionCache(GetCurrentProcess(), fn, 3);
+            m.installed = TRUE;
+        } else if (ok) {
+            CopyMemory(fn, m.orig, 8);                // exact original bytes back
+            FlushInstructionCache(GetCurrentProcess(), fn, 8);
+            m.installed = FALSE;
+        }
+        if (ok) VirtualProtect(fn, 16, old, &old);
+        for (int k = ns - 1; k >= 0; k--) { ResumeThread(th[k]); CloseHandle(th[k]); }
+        char b[128];
+        wsprintfA(b, "dwm: MPO %s %s", m.name,
+                  ok ? (on ? "-> forced false" : "-> restored") : "-> VirtualProtect FAILED");
+        iwnHookLog(b);
+    }
+}
+
 static void restoreBaseline(const char* why) {
+    DwmWarpSetMpoSuppressed(FALSE);   // overlays back on, whatever brought us here
     __try {
         for (int i = 0; i < g_tgtN; i++) {
             if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
@@ -950,6 +1006,10 @@ void DwmWarpBeforeSubmit() {
         }
         wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el, what);
         iwnHookLog(b);
+        // Steady-warp entry: suppress MPO/DirectFlip so overlay-direct windows
+        // (cmd.exe, video, fullscreen) are routed back through the composite
+        // surface we paint. Restored on every shutdown path via restoreBaseline.
+        if (ph == IWN_PH_CF_DEF) DwmWarpSetMpoSuppressed(TRUE);
     }
 
     if (ph == IWN_PH_IDLE) return;
