@@ -605,10 +605,11 @@ static void readbackPixel(int i, const char* tag) {
             size_t off = (size_t)(g_rtH / 2) * m.RowPitch + (size_t)(g_rtW / 2) * 4;
             unsigned mid = *(const unsigned*)((const BYTE*)m.pData + off);
             size_t off2 = (size_t)4 * m.RowPitch + 4 * 4;
-            unsigned near = *(const unsigned*)((const BYTE*)m.pData + off2);
+            // "near" is still a legacy MSVC keyword - do not name a variable that
+            unsigned px2 = *(const unsigned*)((const BYTE*)m.pData + off2);
             g_ctx->Unmap(g_stageTex, 0);
             char b[192];
-            wsprintfA(b, "dwm: READBACK %s tgt=%d mid=%08X near=%08X", tag, i, mid, near);
+            wsprintfA(b, "dwm: READBACK %s tgt=%d mid=%08X near=%08X", tag, i, mid, px2);
             iwnHookLog(b);
         } else {
             iwnHookLog("dwm: READBACK map failed");
