@@ -24,6 +24,7 @@
 #include <dxgi.h>
 #include <tlhelp32.h>
 #include "hook_ipc.h"
+#include "DwmWarp.h"
 
 extern void iwnHookLog(const char* line);
 extern void iwnHookCounters(LONG c0, LONG c1, LONG c2);
@@ -388,13 +389,24 @@ static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     // 纹理扫描已经登记了候选合成表面时，在提交边界做一次性像素读回。
     // 放在这里而不是扫描线程：immediate context 不是线程安全的，只有在
     // dwm 自己把这一帧推出去的这一刻用它才安全。
+    //
+    // 像素验证通过后，把这张表面交给扭曲引擎（Stage 1）。引擎自己 AddRef，
+    // 我们随后释放自己这一份引用 —— 谁持有谁负责，不重复保留。
     if (g_targetTex && InterlockedCompareExchange(&g_proofDone, 1, 0) == 0) {
         proveTextureIsDesktop(g_targetTex, g_targetDesc);
+        bool ok = DwmWarpAttach(g_targetTex, g_targetDesc);
+        iwnHookLog(ok ? "dwm: warp attach OK" : "dwm: warp attach FAILED");
         __try { g_targetTex->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
         g_targetTex = nullptr;
     }
+
+    // 双侧结构：提交前存干净副本 + 画扭曲，提交后恢复。
+    // 与原版 forcePreserveBB 同构，也是"屏幕扭曲、截图矩形"的唯一分离点。
+    DwmWarpBeforeSubmit();
     typedef LONG(WINAPI* PF)(void*, void*, void*, void*);
-    return g_origConfirm ? ((PF)g_origConfirm)(a1, a2, a3, a4) : 0;
+    LONG r = g_origConfirm ? ((PF)g_origConfirm)(a1, a2, a3, a4) : 0;
+    DwmWarpAfterSubmit();
+    return r;
 }
 
 static LONG WINAPI HookRetireFrame(void* a1, void* a2, void* a3, void* a4) {
@@ -921,10 +933,13 @@ static DWORD WINAPI reporter(LPVOID) {
         LONG c = g_cntConfirm;
         iwnHookCounters(g_cntConfirm, g_cntRtset, g_cntCreate);
         if (c != lastC) {
+            char ws[192];
+            DwmWarpStatus(ws, (int)sizeof(ws));
             wsprintfA(b, "dwm: confirm=%ld retire=%ld rtset=%ld rtv=%ld rt=%ldx%ld fmt=%ld fl=%ld",
                       g_cntConfirm, g_cntRetire, g_cntRtset, g_cntRtv,
                       g_rtW, g_rtH, g_rtFmt, g_devFeature);
             iwnHookLog(b);
+            iwnHookLog(ws);
             lastC = c;
         }
     }
