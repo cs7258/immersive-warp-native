@@ -736,10 +736,15 @@ void DwmWarpInstallPresentHook() {
     if (!h) { iwnHookLog("dwm: present hook skipped (no dwmcore)"); return; }
     BYTE* fn = (BYTE*)h + 0x6C6B0;
 
+    // 00:40 run: the stub lived in g_detourStub (.data, NOT executable) and the
+    // first jmp into it AV'd dwm within ~1s of install. Both the stub and the
+    // trampoline must live in RWX memory.
+    BYTE* blk = (BYTE*)VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!blk) { iwnHookLog("dwm: present hook skipped (no RWX mem)"); return; }
+    BYTE* stubX = blk;          // 26 bytes
+    BYTE* tr    = blk + 32;     // 28 displaced + 12 tail = 40 bytes
+
     // trampoline = 28 displaced bytes + movabs rax,(fn+0x1C); jmp rax
-    g_trampMem = VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!g_trampMem) { iwnHookLog("dwm: present hook skipped (no tramp mem)"); return; }
-    BYTE* tr = (BYTE*)g_trampMem;
     CopyMemory(tr, fn, 0x1C);
     {
         BYTE* p = tr + 0x1C;
@@ -748,10 +753,12 @@ void DwmWarpInstallPresentHook() {
         CopyMemory(p, &back, 8); p += 8;
         *p++ = 0xFF; *p++ = 0xE0;
     }
-    // stub operands
+    // stub operands (template stays in .data; the executable copy runs)
     UINT64 cb = (UINT64)&IWN_PresentCallback;
     CopyMemory(g_detourStub + 2,  &cb, 8);
-    CopyMemory(g_detourStub + 14, &g_trampMem, 8);
+    CopyMemory(g_detourStub + 14, tr, 8);
+    CopyMemory(stubX, g_detourStub, sizeof(g_detourStub));
+    g_trampMem = tr;
 
     DWORD old = 0;
     if (!VirtualProtect(fn, 32, PAGE_EXECUTE_READWRITE, &old)) {
@@ -759,11 +766,12 @@ void DwmWarpInstallPresentHook() {
         return;
     }
     BYTE patch[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
-    UINT64 sa = (UINT64)g_detourStub;
+    UINT64 sa = (UINT64)stubX;
     CopyMemory(patch + 2, &sa, 8);
     CopyMemory(fn, patch, 12);
     VirtualProtect(fn, 32, old, &old);
     FlushInstructionCache(GetCurrentProcess(), fn, 12);
+    FlushInstructionCache(GetCurrentProcess(), stubX, 32);
     iwnHookLog("dwm: PresentInternal detour installed @0x6C6B0 (gated to phase C)");
 }
 
