@@ -38,6 +38,12 @@ void DwmWarpBeforeSubmit();
 // Called immediately AFTER the original NtDCompositionConfirmFrame returns.
 void DwmWarpAfterSubmit();
 
+// Install a 12-byte prologue detour on dwmcore!CDWMSwapChain::PresentInternal
+// (RVA 0x6C6B0). The detour is inert until the engine reaches its present
+// phase; the callback then paints the warp after dwm's render is final and
+// before the real present runs. Idempotent.
+void DwmWarpInstallPresentHook();
+
 // 0 = off, 1..4 = staged self-diagnosis (see .cpp). Negative = permanently off.
 int  DwmWarpStage();
 

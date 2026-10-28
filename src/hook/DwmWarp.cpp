@@ -633,19 +633,139 @@ static void readbackPixel(int i, const char* tag) {
 }
 
 // ---------------------------------------------------------------- phase machine
-// 23:18 run: warp VISIBLE (screenshots hold a constant +21.9 mean offset from
-// the pre-inject baseline) but the desktop was FROZEN - inter-frame diff decayed
-// 5.9 -> 1.0, i.e. dwm's fresh renders were being erased. Root cause: the
-// deferred restore ran at the start of the next submit, which is AFTER dwm has
-// already rendered the new frame into the surface - so every fresh render was
-// clobbered by the stale twin, freezing the desktop at the moment warp began.
-// dwm is a compositor: it redraws the full visual tree into this surface every
-// frame. So the correct shape is NO save/restore at all - paint the warp, let
-// dwm's next render wipe it. One baseline copy is kept only for the shutdown
-// cleanup (otherwise the last warped frame lingers until a manual refresh,
-// which the operator actually experienced).
-#define IWN_PH_IDLE 1
-#define IWN_PH_WARP 4
+// 00:10 run (dest-keystone + black clear at the ConfirmFrame boundary) gave the
+// unifying fact: dwm renders DIRTY REGIONS only into the composite surfaces.
+// Window/taskbar regions were redrawn straight every compose; everything else
+// kept our last output, so the keystone mesh re-compressed the whole frame each
+// compose and the desktop collapsed toward the bottom edge (faint smear in the
+// t54 capture, vs-base mean climbing 37 -> 60 without settling).
+//
+// Consequences:
+//   * painting WITHOUT restoring feeds back (00:10 run) - the twin must always
+//     be a fresh snapshot of dwm's just-rendered frame, and the surfaces must
+//     be handed back clean after the present (the original's forcePreserveBB);
+//   * restoring at the START of the next submit erases dwm's fresh dirty
+//     renders (23:18 run froze) - the restore must happen right after the
+//     present returns, before dwm renders the next frame;
+//   * the ConfirmFrame boundary is not the present itself. dwmcore
+//     CDWMSwapChain::PresentInternal (RVA 0x6C6B0) is the actual presentation
+//     call, the same layer the original product hooks ("robust DXGI hooking").
+//
+// One run, three phases, so a single operator pass is a controlled experiment:
+//   A  1.5- 8s   paint at ConfirmFrame,  restore right after the submit
+//   B  8- 16s    paint at ConfirmFrame,  restore deferred one submit (23:18
+//                reference: warp visible, desktop frozen)
+//   C  16s-75s   paint inside CDWMSwapChain::PresentInternal (prologue detour,
+//                12-byte patch, 28-byte position-independent prologue moves to
+//                a trampoline), restore at the next ConfirmFrame
+// All phases use the same fresh-save + black-clear + dest-keystone paint.
+#define IWN_PH_IDLE   1
+#define IWN_PH_CF_IMM 2
+#define IWN_PH_CF_DEF 3
+#define IWN_PH_PRESNT 4
+
+static volatile LONG  g_pendingRestore = 0;
+static DWORD          g_lastPaintTick = 0;
+
+// ---- PresentInternal prologue detour --------------------------------------
+// Original prologue at dwmcore+0x6C6B0 (28 bytes, no RIP-relative, moves verbatim):
+//   push rbp/rbx/rsi/rdi/r12/r13/r14/r15; lea rbp,[rsp-0x98]; sub rsp,0x1c8
+// Patch: movabs rax,stub; jmp rax  (12 bytes). The stub runs our pre-present
+// paint with rcx (=this) preserved, then jmps to the trampoline with rsp exactly
+// as at entry, so the displaced prologue and the whole function body execute
+// with unshifted stack (rbp-relative parameter access and the /GS cookie stay
+// correct). Painting once per millisecond guards against multiple presents
+// (second monitor / MPO) inside one composition.
+static BYTE g_detourStub[26] = {
+    0x51,                                                   // push rcx
+    0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,                     // movabs rax, ourC
+    0xFF, 0xD0,                                             // call rax
+    0x59,                                                   // pop rcx
+    0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,                     // movabs rax, tramp
+    0xFF, 0xE0                                              // jmp rax
+};
+static void* g_trampMem = nullptr;
+static LONG  g_detourInstalled = 0;
+
+// Paints the warp into all candidates while dwm is inside PresentInternal,
+// i.e. after its render is final and before the real present runs.
+void IWN_PresentCallback(void* /*self*/) {
+    if (!g_ready || (LONG)g_stage != IWN_PH_PRESNT) return;
+    DWORD t = GetTickCount();
+    if (t == g_lastPaintTick) return;          // one paint per compose
+    g_lastPaintTick = t;
+    InterlockedIncrement(&g_frames);
+    __try {
+        g_ctx->CopyResource(g_twin, g_target); // fresh frame, pre-warp
+        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        for (int i = 0; i < g_tgtN; i++) {
+            if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: warp save EXCEPTION (present)");
+        return;
+    }
+    int before = (int)g_draws;
+    paintWarp();
+    if ((int)g_draws == before) {
+        if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (present)");
+    } else if (!g_proofWarp) {
+        g_proofWarp = 1;
+        readbackPixel(0, "warp");
+    }
+}
+
+static void restoreAllSurfaces(const char* why) {
+    __try {
+        for (int i = 0; i < g_tgtN; i++) {
+            if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
+        }
+        char b[128];
+        wsprintfA(b, "dwm: warp surfaces restored (%s)", why);
+        iwnHookLog(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: restore EXCEPTION");
+    }
+}
+
+void DwmWarpInstallPresentHook() {
+    if (InterlockedCompareExchange(&g_detourInstalled, 1, 0) != 0) return;
+    HMODULE h = GetModuleHandleW(L"dwmcore.dll");
+    if (!h) { iwnHookLog("dwm: present hook skipped (no dwmcore)"); return; }
+    BYTE* fn = (BYTE*)h + 0x6C6B0;
+
+    // trampoline = 28 displaced bytes + movabs rax,(fn+0x1C); jmp rax
+    g_trampMem = VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_trampMem) { iwnHookLog("dwm: present hook skipped (no tramp mem)"); return; }
+    BYTE* tr = (BYTE*)g_trampMem;
+    CopyMemory(tr, fn, 0x1C);
+    {
+        BYTE* p = tr + 0x1C;
+        *p++ = 0x48; *p++ = 0xB8;
+        UINT64 back = (UINT64)(fn + 0x1C);
+        CopyMemory(p, &back, 8); p += 8;
+        *p++ = 0xFF; *p++ = 0xE0;
+    }
+    // stub operands
+    UINT64 cb = (UINT64)&IWN_PresentCallback;
+    CopyMemory(g_detourStub + 2,  &cb, 8);
+    CopyMemory(g_detourStub + 14, &g_trampMem, 8);
+
+    DWORD old = 0;
+    if (!VirtualProtect(fn, 32, PAGE_EXECUTE_READWRITE, &old)) {
+        iwnHookLog("dwm: present hook skipped (VirtualProtect denied)");
+        return;
+    }
+    BYTE patch[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
+    UINT64 sa = (UINT64)g_detourStub;
+    CopyMemory(patch + 2, &sa, 8);
+    CopyMemory(fn, patch, 12);
+    VirtualProtect(fn, 32, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), fn, 12);
+    iwnHookLog("dwm: PresentInternal detour installed @0x6C6B0 (gated to phase C)");
+}
 
 static void restoreBaseline(const char* why) {
     __try {
@@ -662,6 +782,35 @@ static void restoreBaseline(const char* why) {
     }
 }
 
+static void paintAtConfirmFrame(LONG ph) {
+    __try {
+        // Deferred mode (B) owes a restore from the previous submit; pay it
+        // before the fresh snapshot (this clobbers dwm's fresh dirty renders -
+        // that is the known 23:18 behaviour, kept as the reference phase).
+        if (g_pendingRestore) {
+            g_pendingRestore = 0;
+            restoreAllSurfaces("deferred");
+        }
+        g_ctx->CopyResource(g_twin, g_target); // fresh frame, pre-warp
+        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        for (int i = 0; i < g_tgtN; i++) {
+            if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: warp save EXCEPTION");
+        return;
+    }
+    int before = (int)g_draws;
+    paintWarp();
+    if ((int)g_draws == before) {
+        if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw");
+    } else if (!g_proofWarp) {
+        g_proofWarp = 1;
+        readbackPixel(0, "warp");
+    }
+}
+
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
     DWORD el = GetTickCount() - g_t0;
@@ -674,48 +823,32 @@ void DwmWarpBeforeSubmit() {
         iwnHookLog("dwm: WARP auto-off (75s budget spent)");
         return;
     }
-    InterlockedIncrement(&g_frames);
+    LONG ph;
+    if (el < 1500)       ph = IWN_PH_IDLE;
+    else if (el < 8000)  ph = IWN_PH_CF_IMM;
+    else if (el < 16000) ph = IWN_PH_CF_DEF;
+    else                 ph = IWN_PH_PRESNT;
 
-    LONG ph = (el < 1500) ? IWN_PH_IDLE : IWN_PH_WARP;
     if (ph != g_lastLoggedStage) {
         g_lastLoggedStage = ph;
         g_stage = ph;
         char b[160];
-        wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el,
-                  ph == IWN_PH_IDLE ? "passthrough (must look unchanged)"
-                                    : "fresh-save + clear + dest-keystone draw");
+        const char* what = "?";
+        switch (ph) {
+            case IWN_PH_IDLE:   what = "passthrough (must look unchanged)"; break;
+            case IWN_PH_CF_IMM: what = "CF paint + immediate restore (forcePreserveBB)"; break;
+            case IWN_PH_CF_DEF: what = "CF paint + deferred restore (23:18 reference)"; break;
+            case IWN_PH_PRESNT: what = "PresentInternal paint + CF restore"; break;
+        }
+        wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el, what);
         iwnHookLog(b);
     }
 
     if (ph == IWN_PH_IDLE) return;
+    if (ph == IWN_PH_PRESNT) return;           // painted by the detour instead
 
-    __try {
-        // FRESH snapshot every frame. The PS samples the twin, so a one-time
-        // snapshot (23:46 build) displays the first frame warped forever - the
-        // exact "desktop is frozen" the operator reported. dwm rendered the
-        // current frame into tgt[0] just before ConfirmFrame fired, so copying
-        // it now captures live content.
-        g_ctx->CopyResource(g_twin, g_target);
-        // Black out every candidate AFTER the snapshot: the trapezoid mesh no
-        // longer covers the full surface, and stale desktop content must not
-        // peek through the side wedges.
-        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-        for (int i = 0; i < g_tgtN; i++) {
-            if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        InterlockedIncrement(&g_fail);
-        iwnHookLog("dwm: warp save EXCEPTION");
-    }
-
-    int before = (int)g_draws;
-    paintWarp();
-    if ((int)g_draws == before) {
-        if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw");
-    } else if (!g_proofWarp) {
-        g_proofWarp = 1;
-        readbackPixel(0, "warp");
-    }
+    InterlockedIncrement(&g_frames);
+    paintAtConfirmFrame(ph);
 
     if (g_fail > 30) {
         g_ready = 0;
@@ -726,10 +859,15 @@ void DwmWarpBeforeSubmit() {
 }
 
 void DwmWarpAfterSubmit() {
-    // Intentionally empty: restoring here either races the scanout (warp
-    // flickers away) or, when deferred, erases dwm's fresh render (frozen
-    // desktop). dwm's own next-frame render is what cleans the surface.
-    (void)0;
+    if (!g_ready) return;
+    LONG st = g_stage;
+    if (st == IWN_PH_CF_IMM || st == IWN_PH_PRESNT) {
+        // Hand the surfaces back clean BEFORE dwm renders the next frame's
+        // dirty regions, so nothing we painted can feed back into itself.
+        restoreAllSurfaces(st == IWN_PH_CF_IMM ? "immediate" : "present-frame");
+    } else if (st == IWN_PH_CF_DEF) {
+        g_pendingRestore = 1;                  // reference phase: known freeze
+    }
 }
 
 int DwmWarpStage() { return (int)g_stage; }

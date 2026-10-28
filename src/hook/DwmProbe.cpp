@@ -409,6 +409,9 @@ static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
         }
         bool ok = DwmWarpAttachTargets(list, g_targetN);
         iwnHookLog(ok ? "dwm: warp attach OK" : "dwm: warp attach FAILED");
+        if (ok) {
+            DwmWarpInstallPresentHook();
+        }
         for (int i = 0; i < g_targetN; i++) {
             __try { g_targets[i]->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
             g_targets[i] = nullptr;
