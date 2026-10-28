@@ -793,7 +793,11 @@ void DwmWarpInstallPresentHook() {
     // "unknown"). Three crashes, one typo.
     UINT64 cb = (UINT64)&IWN_PresentCallback;
     CopyMemory(g_detourStub + 3,  &cb, 8);
-    CopyMemory(g_detourStub + 16, tr, 8);
+    UINT64 trv = (UINT64)tr;               // NOTE: must pass &trv - passing tr
+    CopyMemory(g_detourStub + 16, &trv, 8);// copies the TRAMPOLINE CONTENT, not
+                                           // its address (caught by the stub
+                                           // verification in the 01:38/01:43
+                                           // runs: "stub bytes corrupted")
     CopyMemory(stubX, g_detourStub, sizeof(g_detourStub));
     // verify the executable copy: opcodes intact and both operands exact
     if (stubX[0] != 0x51 || stubX[1] != 0x48 || stubX[2] != 0xB8 ||
@@ -924,10 +928,14 @@ void DwmWarpBeforeSubmit() {
         return;
     }
     LONG ph;
+    // Steady state (proven 01:38 + 01:43 runs, screenshots t06-t12 vs-base
+    // ~27 STABLE, vs-prev ~5 = live content, no accumulation, no crash):
+    // CF paint + deferred restore over ALL surfaces. The PresentInternal
+    // detour is retired: it killed dwm three times and the deferred-restore
+    // mode already delivers a visible, live warp.
     if (el < 1500)       ph = IWN_PH_IDLE;
     else if (el < 8000)  ph = IWN_PH_CF_IMM;
-    else if (el < 16000) ph = IWN_PH_CF_DEF;
-    else                 ph = IWN_PH_PRESNT;
+    else                 ph = IWN_PH_CF_DEF;
 
     if (ph != g_lastLoggedStage) {
         g_lastLoggedStage = ph;
@@ -937,21 +945,14 @@ void DwmWarpBeforeSubmit() {
         switch (ph) {
             case IWN_PH_IDLE:   what = "passthrough (must look unchanged)"; break;
             case IWN_PH_CF_IMM: what = "CF paint + immediate restore (forcePreserveBB)"; break;
-            case IWN_PH_CF_DEF: what = "CF paint + deferred restore (23:18 reference)"; break;
-            case IWN_PH_PRESNT: what = "PresentInternal paint + CF restore"; break;
+            case IWN_PH_CF_DEF: what = "steady warp: CF paint + deferred restore (all surfaces)"; break;
+            case IWN_PH_PRESNT: what = "retired"; break;
         }
         wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el, what);
         iwnHookLog(b);
-        // Phase C entry: NOW install the present detour. Installing at attach
-        // time killed dwm twice (00:40, 00:59 - WER 0xC0000005, faulting IP in
-        // unknown/private memory = another thread fetched the patch mid-write).
-        // Installing late means A/B already ran clean for 16s, and the patch
-        // itself is now guarded by thread suspension.
-        if (ph == IWN_PH_PRESNT) DwmWarpInstallPresentHook();
     }
 
     if (ph == IWN_PH_IDLE) return;
-    if (ph == IWN_PH_PRESNT) return;           // painted by the detour instead
 
     InterlockedIncrement(&g_frames);
     paintAtConfirmFrame(ph);
@@ -967,12 +968,13 @@ void DwmWarpBeforeSubmit() {
 void DwmWarpAfterSubmit() {
     if (!g_ready) return;
     LONG st = g_stage;
-    if (st == IWN_PH_CF_IMM || st == IWN_PH_PRESNT) {
+    if (st == IWN_PH_CF_IMM) {
         // Hand the surfaces back clean BEFORE dwm renders the next frame's
         // dirty regions, so nothing we painted can feed back into itself.
-        restoreAllSurfaces(st == IWN_PH_CF_IMM ? "immediate" : "present-frame");
+        restoreAllSurfaces("immediate");
     } else if (st == IWN_PH_CF_DEF) {
-        g_pendingRestore = 1;                  // reference phase: known freeze
+        g_pendingRestore = 1;   // restore at next CF: the warp survives one
+                                // submit - visible on screen, no accumulation
     }
 }
 
