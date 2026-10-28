@@ -192,8 +192,16 @@ static PVOID g_origRetire = nullptr;
 static volatile LONG g_deepDone = 0;
 
 // 纹理扫描选中的"疑似合成表面"（由 scanTextures 登记，ConfirmFrame 里读回验证）
-static ID3D11Texture2D* g_targetTex = nullptr;
+static ID3D11Texture2D* g_targetTex = nullptr;   // = g_targets[0], proof subject
 static D3D11_TEXTURE2D_DESC g_targetDesc;
+// dwm keeps several same-size RT|SRV surfaces (buffer rotation / redirection).
+// The 2026-10-28 20:22 run proved painting exactly ONE of them (the
+// TEXPROOF-carrying one) changes nothing on screen, so the scan now collects
+// every exact-size candidate and the engine paints all of them.
+#define IWN_PROBE_MAX_TGT 5
+static ID3D11Texture2D*      g_targets[IWN_PROBE_MAX_TGT];
+static D3D11_TEXTURE2D_DESC  g_tdescs[IWN_PROBE_MAX_TGT];
+static int                   g_targetN = 0;
 static volatile LONG g_proofDone = 0;
 
 // 合成帧的 RT 描述（只保留数值，不持有纹理引用，避免拖住 dwm 的资源）
@@ -392,11 +400,20 @@ static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     //
     // 像素验证通过后，把这张表面交给扭曲引擎（Stage 1）。引擎自己 AddRef，
     // 我们随后释放自己这一份引用 —— 谁持有谁负责，不重复保留。
-    if (g_targetTex && InterlockedCompareExchange(&g_proofDone, 1, 0) == 0) {
-        proveTextureIsDesktop(g_targetTex, g_targetDesc);
-        bool ok = DwmWarpAttach(g_targetTex, g_targetDesc);
+    if (g_targetN > 0 && InterlockedCompareExchange(&g_proofDone, 1, 0) == 0) {
+        proveTextureIsDesktop(g_targets[0], g_tdescs[0]);
+        IWNWarpTarget list[IWN_PROBE_MAX_TGT];
+        for (int i = 0; i < g_targetN; i++) {
+            list[i].tex = g_targets[i];
+            list[i].desc = g_tdescs[i];
+        }
+        bool ok = DwmWarpAttachTargets(list, g_targetN);
         iwnHookLog(ok ? "dwm: warp attach OK" : "dwm: warp attach FAILED");
-        __try { g_targetTex->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        for (int i = 0; i < g_targetN; i++) {
+            __try { g_targets[i]->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            g_targets[i] = nullptr;
+        }
+        g_targetN = 0;
         g_targetTex = nullptr;
     }
 
@@ -674,9 +691,7 @@ static void scanTextures() {
     if (!g_vtTex) return;                       // 指纹还没采到，留给下一轮
     if (InterlockedCompareExchange(&g_texScanDone, 1, 0) != 0) return;
 
-    int hits = 0, big = 0, rtBig = 0, exactBig = 0, bestScore = 0;
-    D3D11_TEXTURE2D_DESC bestDesc = {};
-    ID3D11Texture2D* bestTex = nullptr;
+    int hits = 0, big = 0, rtBig = 0, exactBig = 0;
     bool capped = false;
 
     BYTE* addr = nullptr;
@@ -720,15 +735,25 @@ static void scanTextures() {
                 iwnHookLog(b);
                 if (isRT) {
                     rtBig++;
-                    // 打分：屏幕尺寸 > RENDER_TARGET > SHADER_RESOURCE > 单采样
-                    int score = 0;
-                    if (exact) score += 8;
-                    score += 4;                                  // 已确认 isRT
-                    if (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) score += 2;
-                    if (d.SampleDesc.Count == 1) score += 1;
-                    if (score > bestScore) { bestScore = score; bestTex = tex; bestDesc = d; }
+                    // 收集所有"屏幕尺寸 + RT|SRV + 单采样"的候选。dwm 的合成
+                    // 缓冲是轮换的（多缓冲），只画其中一张 = 画在没上屏的那张。
+                    bool collect = exact &&
+                                   (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 &&
+                                   d.SampleDesc.Count == 1;
+                    if (collect) {
+                        bool dup = false;
+                        for (int i = 0; i < g_targetN; i++) {
+                            if (g_targets[i] == tex) { dup = true; break; }
+                        }
+                        if (!dup && g_targetN < IWN_PROBE_MAX_TGT) {
+                            __try { tex->AddRef(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                            g_tdescs[g_targetN] = d;
+                            g_targets[g_targetN] = tex;
+                            g_targetN++;
+                        }
+                    }
                 }
-                if (big >= 32 || rtBig >= 6) { capped = true; break; }
+                if (big >= 32 || rtBig >= 14) { capped = true; break; }
             }
         }
         addr = base + sz;
@@ -737,16 +762,18 @@ static void scanTextures() {
     char b[300];
     wsprintfA(b, "dwm: texscan hits=%d big=%d rtBig=%d exact=%d screen=%ldx%ld -> %s",
               hits, big, rtBig, exactBig, g_scrW, g_scrH,
-              bestTex ? "FOUND target surface" : "no target surface");
+              g_targetN > 0 ? "FOUND target surface(s)" : "no target surface");
     iwnHookLog(b);
 
-    if (bestTex) {
+    if (g_targetN > 0) {
+        wsprintfA(b, "dwm: registered %d exact-size RT surfaces (engine paints ALL)",
+                  g_targetN);
+        iwnHookLog(b);
         // 只登记，不在这里读回：immediate context 不是线程安全的，reporter 线程
         // 直接用它和 dwm 的渲染线程并发会把两边都搞崩。像素验证交给
         // HookConfirmFrame（提交边界，dwm 自己把帧推出来的那一刻）。
-        __try { bestTex->AddRef(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
-        g_targetDesc = bestDesc;
-        g_targetTex = bestTex;
+        g_targetTex = g_targets[0];
+        g_targetDesc = g_tdescs[0];
         iwnHookLog("dwm: target surface registered, pixel proof deferred to ConfirmFrame");
     }
 }

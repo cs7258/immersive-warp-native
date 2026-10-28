@@ -53,14 +53,18 @@ static void f2a(char* b, float v) {
 // static guard would crash (round 28, measured).
 #define IWN_GRID_N 17          // 17x17 vertices -> 16*16*2*3 = 1536 verts
 #define IWN_MAX_VP 8
+#define IWN_MAX_TGT 5          // dwm keeps several same-size RT surfaces (rotation)
 
 struct IWNVtx { float x, y, u, v; };
 
 static ID3D11Device*              g_dev = nullptr;      // owned ref (dwm's device)
 static ID3D11DeviceContext*       g_ctx = nullptr;      // dwm's immediate context
-static ID3D11Texture2D*           g_target = nullptr;   // dwm composed surface
+static ID3D11Texture2D*           g_target = nullptr;   // first candidate (twin source)
+static ID3D11Texture2D*           g_tgt[IWN_MAX_TGT];   // ALL screen-size RT candidates
+static ID3D11RenderTargetView*    g_rtvA[IWN_MAX_TGT];  // one RTV per candidate
+static int                        g_tgtN = 0;           // surfaces painted per frame
 static ID3D11Texture2D*           g_twin = nullptr;     // clean copy buffer
-static ID3D11RenderTargetView*    g_rtv = nullptr;      // view onto g_target
+static ID3D11RenderTargetView*    g_rtv = nullptr;      // kept for releaseAll compat (unused)
 static ID3D11ShaderResourceView*  g_srv = nullptr;      // view onto g_twin
 static ID3D11SamplerState*        g_smp = nullptr;
 static ID3D11VertexShader*        g_vs = nullptr;
@@ -345,19 +349,54 @@ static void releaseAll() {
     if (g_smp) { g_smp->Release(); g_smp = nullptr; }
     if (g_srv) { g_srv->Release(); g_srv = nullptr; }
     if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
+    for (int i = 0; i < g_tgtN; i++) {
+        if (g_rtvA[i]) { g_rtvA[i]->Release(); g_rtvA[i] = nullptr; }
+        if (g_tgt[i])  { g_tgt[i]->Release();  g_tgt[i]  = nullptr; }
+    }
+    g_tgtN = 0;
     if (g_twin) { g_twin->Release(); g_twin = nullptr; }
     if (g_rs) { g_rs->Release(); g_rs = nullptr; }
     if (g_bs) { g_bs->Release(); g_bs = nullptr; }
     if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
-    if (g_target) { g_target->Release(); g_target = nullptr; }
+    // g_target is a borrowed alias of g_tgt[0] - its ref is owned by g_tgt[0]
+    g_target = nullptr;
 }
 
-bool DwmWarpAttach(ID3D11Texture2D* target, const D3D11_TEXTURE2D_DESC& d) {
-    if (!target) return false;
-    if (g_ready) return true;
+bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
+    if (!list || n <= 0) return false;
     char b[256];
 
+    if (g_ready) {
+        // Re-attach while running (periodic rescan): rebuild the RTV set only.
+        // Twin/SRV/shaders stay alive; the frozen stage-4 baseline is preserved.
+        for (int i = 0; i < g_tgtN; i++) {
+            if (g_rtvA[i]) { g_rtvA[i]->Release(); g_rtvA[i] = nullptr; }
+            if (g_tgt[i])  { g_tgt[i]->Release();  g_tgt[i]  = nullptr; }
+        }
+        g_tgtN = 0;
+        for (int i = 0; i < n && g_tgtN < IWN_MAX_TGT; i++) {
+            if (!list[i].tex) continue;
+            if (!(list[i].desc.BindFlags & D3D11_BIND_RENDER_TARGET)) continue;
+            ID3D11RenderTargetView* rv = nullptr;
+            HRESULT hr2 = g_dev->CreateRenderTargetView(list[i].tex, nullptr, &rv);
+            if (FAILED(hr2) || !rv) continue;
+            list[i].tex->AddRef();
+            g_rtvA[g_tgtN] = rv;
+            g_tgt[g_tgtN]  = list[i].tex;
+            g_tgtN++;
+        }
+        if (g_tgtN > 0) {
+            g_target = g_tgt[0];
+            wsprintfA(b, "dwm: warp re-attach surfaces=%d (twin/frozen baseline kept)", g_tgtN);
+            iwnHookLog(b);
+            return true;
+        }
+        iwnHookLog("dwm: warp re-attach found no RT surface");
+        return false;
+    }
+
+    const D3D11_TEXTURE2D_DESC& d = list[0].desc;
     if (d.SampleDesc.Count != 1) {
         wsprintfA(b, "dwm: warp refuses MSAA surface (samp=%u) - needs Resolve path",
                   (unsigned)d.SampleDesc.Count);
@@ -370,13 +409,11 @@ bool DwmWarpAttach(ID3D11Texture2D* target, const D3D11_TEXTURE2D_DESC& d) {
         return false;
     }
 
-    g_target = target;
-    g_target->AddRef();
     g_desc = d;
     g_rtW = d.Width;
     g_rtH = d.Height;
 
-    __try { g_target->GetDevice(&g_dev); } __except (EXCEPTION_EXECUTE_HANDLER) { g_dev = nullptr; }
+    __try { list[0].tex->GetDevice(&g_dev); } __except (EXCEPTION_EXECUTE_HANDLER) { g_dev = nullptr; }
     if (!g_dev) { iwnHookLog("dwm: warp no device"); releaseAll(); return false; }
     __try { g_dev->GetImmediateContext(&g_ctx); } __except (EXCEPTION_EXECUTE_HANDLER) { g_ctx = nullptr; }
     if (!g_ctx) { iwnHookLog("dwm: warp no immediate context"); releaseAll(); return false; }
@@ -396,10 +433,30 @@ bool DwmWarpAttach(ID3D11Texture2D* target, const D3D11_TEXTURE2D_DESC& d) {
     iwnHookLog(b);
     if (FAILED(hr) || !g_twin) { releaseAll(); return false; }
 
-    hr = g_dev->CreateRenderTargetView(g_target, nullptr, &g_rtv);
-    wsprintfA(b, "dwm: warp RTV-on-composite hr=0x%08X", (unsigned)hr);
+    // One RTV per candidate surface. The 20:22 run painted a single
+    // (proof-carrying) surface and the screen showed nothing, so now every
+    // screen-size RT|SRV surface in dwm gets the same paint - if dwm rotates
+    // composition buffers, at least one of them is the one on the wire.
+    for (int i = 0; i < n && g_tgtN < IWN_MAX_TGT; i++) {
+        if (!list[i].tex) continue;
+        if (!(list[i].desc.BindFlags & D3D11_BIND_RENDER_TARGET)) continue;
+        if (list[i].desc.SampleDesc.Count != 1) continue;
+        ID3D11RenderTargetView* rv = nullptr;
+        HRESULT hr2 = g_dev->CreateRenderTargetView(list[i].tex, nullptr, &rv);
+        if (FAILED(hr2) || !rv) {
+            wsprintfA(b, "dwm: warp RTV[%d] hr=0x%08X (skipped)", i, (unsigned)hr2);
+            iwnHookLog(b);
+            continue;
+        }
+        list[i].tex->AddRef();
+        g_rtvA[g_tgtN] = rv;
+        g_tgt[g_tgtN]  = list[i].tex;
+        g_tgtN++;
+    }
+    wsprintfA(b, "dwm: warp RTV-on-composite n=%d", g_tgtN);
     iwnHookLog(b);
-    if (FAILED(hr) || !g_rtv) { releaseAll(); return false; }
+    if (g_tgtN == 0) { releaseAll(); return false; }
+    g_target = g_tgt[0];      // borrowed ref: twin source + save/restore subject
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
     sd.Format = td.Format;
@@ -470,7 +527,7 @@ bool DwmWarpAttach(ID3D11Texture2D* target, const D3D11_TEXTURE2D_DESC& d) {
 
 // ---------------------------------------------------------------- paint
 static void paintWarp() {
-    if (!g_ready || !g_ctx || !g_rtv) return;
+    if (!g_ready || !g_ctx || g_tgtN == 0) return;
     IWNState st;
     ZeroMemory(&st, sizeof(st));      // stateRestore releases these; never let it see stack garbage
     stateSave(&st);
@@ -487,10 +544,9 @@ static void paintWarp() {
     vp.MaxDepth = 1.0f;
     UINT stride = sizeof(IWNVtx);
     UINT off = 0;
-    ID3D11RenderTargetView* rtv = g_rtv;
 
     __try {
-        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        // common pipeline state once; only the RTV changes per surface
         g_ctx->RSSetViewports(1, &vp);
         g_ctx->RSSetState(g_rs);
         g_ctx->OMSetBlendState(g_bs, nullptr, 0xFFFFFFFF);
@@ -503,8 +559,12 @@ static void paintWarp() {
         g_ctx->PSSetShaderResources(0, 1, &g_srv);
         g_ctx->PSSetSamplers(0, 1, &g_smp);
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
-        g_ctx->Draw(g_vertCount, 0);
-        InterlockedIncrement(&g_draws);
+        for (int i = 0; i < g_tgtN; i++) {
+            if (!g_rtvA[i]) continue;
+            g_ctx->OMSetRenderTargets(1, &g_rtvA[i], nullptr);
+            g_ctx->Draw(g_vertCount, 0);
+            InterlockedIncrement(&g_draws);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
         iwnHookLog("dwm: warp paint EXCEPTION");
@@ -607,10 +667,18 @@ void DwmWarpAfterSubmit() {
 
 int DwmWarpStage() { return (int)g_stage; }
 
+bool DwmWarpAttach(ID3D11Texture2D* target, const D3D11_TEXTURE2D_DESC& d) {
+    IWNWarpTarget t;
+    t.tex = target;
+    t.desc = d;
+    return DwmWarpAttachTargets(&t, 1);
+}
+
 void DwmWarpStatus(char* out, int cap) {
     if (!out || cap < 8) return;
     char a[20], c[20], e[20], g[20];
     f2a(a, g_cTLu); f2a(c, g_cTRu); f2a(e, g_cBLu); f2a(g, g_cBRu);
-    wsprintfA(out, "warp stage=%ld frames=%ld draws=%ld fail=%ld %ux%u keepTL=%s TR=%s BL=%s BR=%s",
-              g_stage, g_frames, g_draws, g_fail, (unsigned)g_rtW, (unsigned)g_rtH, a, c, e, g);
+    wsprintfA(out, "warp stage=%ld frames=%ld draws=%ld fail=%ld surf=%d %ux%u keepTL=%s TR=%s BL=%s BR=%s",
+              g_stage, g_frames, g_draws, g_fail, g_tgtN,
+              (unsigned)g_rtW, (unsigned)g_rtH, a, c, e, g);
 }

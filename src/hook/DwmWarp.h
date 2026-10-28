@@ -21,6 +21,16 @@
 // Returns false on any failure - caller keeps its own reference either way.
 bool DwmWarpAttach(ID3D11Texture2D* target, const D3D11_TEXTURE2D_DESC& d);
 
+// Multi-surface variant. dwm keeps several same-size RT|SRV surfaces (buffer
+// rotation / redirection), and the 2026-10-28 20:22 run proved painting ONE of
+// them changes nothing on screen - so every candidate gets painted. Re-attach
+// while running refreshes the RTV set (twin survives if size/format match).
+struct IWNWarpTarget {
+    ID3D11Texture2D*        tex;
+    D3D11_TEXTURE2D_DESC    desc;
+};
+bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n);
+
 // Called immediately BEFORE the original NtDCompositionConfirmFrame.
 // No-op (cheap) when the engine is off / not ready / already failed out.
 void DwmWarpBeforeSubmit();
