@@ -89,6 +89,7 @@ static volatile LONG  g_draws = 0;
 static volatile LONG  g_unpaintDone = 0;   // clean baseline saved / probe colours cleared
 static volatile LONG  g_gridDirty = 1;     // vertex buffer needs a refill
 static volatile LONG  g_proofWarp = 0;     // one readback after the first warped draw
+static volatile LONG  g_proofFlip = 0;     // one readback at the deferred post-flip restore
 static DWORD          g_t0 = 0;
 static LONG           g_lastLoggedStage = -1;
 
@@ -726,7 +727,15 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
         }
     }
     HRESULT hr = g_presentTramp(self, a2, a3, a4, a5);
-    if (painted) restoreAllSurfaces("post-present");
+    // 07:42 run: immediate post-present restore is INVISIBLE (same failure as
+    // the CF immediate-restore phase: the flip has not scanned out when Present
+    // returns, so the restore wipes the queued frame). The proven restore
+    // policy from phase B applies unchanged here: defer to the next
+    // ConfirmFrame. That is safe because dwm draws window content AFTER CF -
+    // the restore at CF(N+1) cannot clobber frame N+1 renders (they have not
+    // happened yet), and the twin snapshot at PresentInternal(N+1) is a
+    // complete fresh frame.
+    if (painted) g_pendingRestore = 1;
     return hr;
 }
 
@@ -1019,7 +1028,22 @@ void DwmWarpBeforeSubmit() {
     }
 
     if (ph == IWN_PH_IDLE) return;
-    if ((LONG)g_stage == IWN_PH_PRESNT) return;   // painted by the wrapper now
+    if ((LONG)g_stage == IWN_PH_PRESNT) {
+        // Deferred restore from the previous present (mirrors phase B). Done
+        // at CF because dwm draws window content after CF - nothing fresh is
+        // clobbered here. Read the corner once before restoring: if our warp
+        // is STILL on the surface at the next CF, the present did not consume
+        // it and we are painting the wrong texture.
+        if (g_pendingRestore) {
+            g_pendingRestore = 0;
+            if (!g_proofFlip) {
+                g_proofFlip = 1;
+                readbackPixel(0, "post-flip");
+            }
+            restoreAllSurfaces("post-flip");
+        }
+        return;   // painted by the wrapper now
+    }
 
     InterlockedIncrement(&g_frames);
     paintAtConfirmFrame(ph);
