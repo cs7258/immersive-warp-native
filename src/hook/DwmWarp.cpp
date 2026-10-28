@@ -87,9 +87,8 @@ static volatile LONG  g_fail = 0;
 static volatile LONG  g_draws = 0;
 static volatile LONG  g_pendingRestore = 0;
 static volatile LONG  g_baselineFrozen = 0;
-static volatile LONG  g_unpaintDone = 0;   // cleared the magenta probe off the surfaces
-static volatile LONG  g_proofClear = 0;
-static volatile LONG  g_proofWarp = 0;
+static volatile LONG  g_gridDirty = 1;     // vertex buffer needs a refill
+static volatile LONG  g_proofWarp = 0;     // one readback after the first warped draw
 static DWORD          g_t0 = 0;
 static LONG           g_lastLoggedStage = -1;
 
@@ -552,8 +551,14 @@ static void paintWarp() {
     ZeroMemory(&st, sizeof(st));      // stateRestore releases these; never let it see stack garbage
     stateSave(&st);
 
-    fillGrid();
-    fillCb();
+    // The grid and the cbuffer only change when the operator changes a corner or
+    // a blend value; re-uploading them every submit costs a Map/Unmap pair and
+    // showed up as visible stutter on the 22:51 run.
+    if (g_gridDirty) {
+        fillGrid();
+        fillCb();
+        g_gridDirty = 0;
+    }
 
     D3D11_VIEWPORT vp = {};
     vp.TopLeftX = 0.0f;
@@ -604,12 +609,16 @@ static void readbackPixel(int i, const char* tag) {
         if (SUCCEEDED(g_ctx->Map(g_stageTex, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
             size_t off = (size_t)(g_rtH / 2) * m.RowPitch + (size_t)(g_rtW / 2) * 4;
             unsigned mid = *(const unsigned*)((const BYTE*)m.pData + off);
-            size_t off2 = (size_t)4 * m.RowPitch + 4 * 4;
+            // The centre samples nearly the same source uv before and after the
+            // warp (corner uv average = centre), so it proves nothing. The
+            // top-left corner does: after the warp it shows the desktop pixel
+            // from uv~(0.15,0.02), which is a completely different colour.
+            size_t off2 = (size_t)32 * m.RowPitch + 32 * 4;
             // "near" is still a legacy MSVC keyword - do not name a variable that
             unsigned px2 = *(const unsigned*)((const BYTE*)m.pData + off2);
             g_ctx->Unmap(g_stageTex, 0);
             char b[192];
-            wsprintfA(b, "dwm: READBACK %s tgt=%d mid=%08X near=%08X", tag, i, mid, px2);
+            wsprintfA(b, "dwm: READBACK %s tgt=%d mid=%08X corner=%08X", tag, i, mid, px2);
             iwnHookLog(b);
         } else {
             iwnHookLog("dwm: READBACK map failed");
@@ -620,21 +629,19 @@ static void readbackPixel(int i, const char* tag) {
 }
 
 // ---------------------------------------------------------------- phase machine
-// The only unambiguous question left is: does *anything* we write into these
-// surfaces reach the panel? ClearRenderTargetView needs no shaders, no input
-// layout, no vertex buffer - if a flat magenta screen does not appear, the
-// surface set is wrong, not the warp pipeline. If it does appear, the surface is
-// right and the bug is in the mesh/shader binding.
-#define IWN_PH_IDLE    1
-#define IWN_PH_MAGENTA 2
-#define IWN_PH_GREEN   3
-#define IWN_PH_WARP    4
-
-static void clearAll(const float c[4]) {
-    for (int i = 0; i < g_tgtN; i++) {
-        if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], c);
-    }
-}
+// 22:51 run established contact: ClearRenderTargetView reached the panel
+// (screenshots t02-t08 were solid magenta / solid green), so the surfaces we
+// paint ARE the ones being scanned out. But the warped frames were only seen
+// flickering: the restore in AfterSubmit raced the kernel transport's readout
+// of the just-confirmed frame and usually won. Two bugs, both fixed here:
+//   1. the restore copied the twin back into g_target (= tgt[0]) only, leaving
+//      tgt[1] warped forever - it accumulated warp every frame, which is
+//      exactly the "zooms in and distorts more and more" the operator saw;
+//   2. restoring immediately after ConfirmFrame can beat the scanout.
+// Fix: restore is deferred to the START of the next submit and covers ALL
+// surfaces, so the warped frame stays in place for a full frame window.
+#define IWN_PH_IDLE 1
+#define IWN_PH_WARP 4
 
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
@@ -650,51 +657,30 @@ void DwmWarpBeforeSubmit() {
     }
     InterlockedIncrement(&g_frames);
 
-    LONG ph;
-    const char* what;
-    if (el < 1500)       { ph = IWN_PH_IDLE;    what = "passthrough (must look unchanged)"; }
-    else if (el < 5500)  { ph = IWN_PH_MAGENTA; what = "CLEAR magenta on all candidates"; }
-    else if (el < 9500)  { ph = IWN_PH_GREEN;   what = "CLEAR green on all candidates"; }
-    else                 { ph = IWN_PH_WARP;    what = "save + warped draw + restore"; }
-
+    LONG ph = (el < 1500) ? IWN_PH_IDLE : IWN_PH_WARP;
     if (ph != g_lastLoggedStage) {
         g_lastLoggedStage = ph;
         g_stage = ph;
-        char b[192];
-        wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el, what);
+        char b[160];
+        wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el,
+                  ph == IWN_PH_IDLE ? "passthrough (must look unchanged)"
+                                    : "deferred-restore warp (all surfaces)");
         iwnHookLog(b);
     }
 
     if (ph == IWN_PH_IDLE) return;
 
-    if (ph == IWN_PH_MAGENTA || ph == IWN_PH_GREEN) {
-        const float mag[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
-        const float grn[4] = { 0.05f, 0.85f, 0.05f, 1.0f };
-        __try {
-            clearAll(ph == IWN_PH_MAGENTA ? mag : grn);
-            if (!g_proofClear) {
-                g_proofClear = 1;
-                readbackPixel(0, ph == IWN_PH_MAGENTA ? "clear-magenta" : "clear-green");
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            InterlockedIncrement(&g_fail);
-            iwnHookLog("dwm: warp clear EXCEPTION");
-        }
-        return;
-    }
-
     __try {
-        if (!g_unpaintDone) {
-            // The probe colours are still sitting in the surfaces; put the clean
-            // copy back before the first warped frame, otherwise we would paint
-            // (and then keep restoring) solid magenta.
-            g_unpaintDone = 1;
+        // A restore owed from the previous submit runs first, so every surface
+        // starts this frame from the same clean snapshot.
+        if (g_pendingRestore) {
+            g_pendingRestore = 0;
             for (int i = 0; i < g_tgtN; i++) {
                 if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
             }
-            g_ctx->Flush();
-            iwnHookLog("dwm: warp surfaces reset from clean baseline");
         }
+        // Fresh clean source. tgt[0] is clean here because either dwm redrew it
+        // since the last confirm, or we restored it a line above.
         g_ctx->CopyResource(g_twin, g_target);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
@@ -719,12 +705,10 @@ void DwmWarpBeforeSubmit() {
 
 void DwmWarpAfterSubmit() {
     if (!g_ready) return;
-    if (g_stage != IWN_PH_WARP) return;      // probe colours stay up on purpose
-    __try { g_ctx->CopyResource(g_target, g_twin); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        InterlockedIncrement(&g_fail);
-        iwnHookLog("dwm: warp restore EXCEPTION");
-    }
+    if (g_stage != IWN_PH_WARP) return;
+    // Do NOT touch the surfaces here: the kernel transport may not have read
+    // the frame yet. The restore happens at the next submit's start.
+    g_pendingRestore = 1;
 }
 
 int DwmWarpStage() { return (int)g_stage; }
