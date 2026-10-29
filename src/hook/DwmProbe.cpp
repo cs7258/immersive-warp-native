@@ -405,11 +405,11 @@ static DWORD g_texScanTick = 0;   // set when texscan finishes; capture anchor
 
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     InterlockedIncrement((volatile LONG*)&g_cntConfirm);
-    // capture-all: fire 20s after texscan (time-anchored - confirm count is
+    // capture-all: fire 5s after texscan (time-anchored - confirm count is
     // unreliable: dwm idles at ~6 CF/s when the desktop is static, so a count
     // threshold may never be reached in an unattended run)
     if (g_capN > 0 && g_texScanTick &&
-        GetTickCount() - g_texScanTick > 20000 &&
+        GetTickCount() - g_texScanTick > 5000 &&
         InterlockedCompareExchange(&s_capDumped, 1, 0) == 0) {
         __try { dumpAllCaptures(); }
         __except (EXCEPTION_EXECUTE_HANDLER) { iwnHookLog("dwm: CAPTURE EXCEPTION"); }
