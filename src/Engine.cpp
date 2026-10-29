@@ -921,8 +921,12 @@ void Engine::recursionCheck(OutputCtx& oc) {
         if (hits > 24000) {   // >60% of 200x200: our marker leaked into the capture
             m_recDetected = true; m_recSelftest = 3;
             dbgLog("recursion selftest: DETECTED (" + std::to_string(hits) + "/40000 marker px) - own scanout leaks into DD capture");
-        } else if (black > 38000) {   // >95% black: capture is black-holed
-            dbgLog("recursion selftest: capture ALL BLACK (" + std::to_string(black) + "/40000) - capture exclusion or pipeline black-holes the feed");
+        }         else if (black > 38000) {   // >95% black: capture is black-holed
+            if (m_recSelftest != 4) {   // report once, then stop (no log spam)
+                m_recSelftest = 4;
+                m_recDetected = true;
+                dbgLog("recursion selftest: capture ALL BLACK (" + std::to_string(black) + "/40000) - capture exclusion or pipeline black-holes the feed");
+            }
         }
         return;
     }
