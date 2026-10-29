@@ -668,13 +668,62 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
     g_stage = 1;
     g_t0 = GetTickCount();
     g_lastLoggedStage = -1;
+    installCopyObserver();   // find dwm's composition->scanout copy (round 66)
     wsprintfA(b, "dwm: WARP READY %ux%u fmt=%u - staged rollout starting",
               (unsigned)g_rtW, (unsigned)g_rtH, (unsigned)g_desc.Format);
     iwnHookLog(b);
     return true;
 }
 
-// ---------------------------------------------------------------- paint
+// ---- CopyResource observation hook ------------------------------------------
+// Round-66 verdict: painting the live private composition faces at CF AND at
+// PresentInternal entry never reaches the screen, while painting the SHARED
+// input layer does - and the dump proved the private face holds the finished
+// frame at CF time. Conclusion: dwm copies the composition surface into the
+// real scanout allocation (a kernel-side surface with no fingerprintable
+// ID3D11Texture2D wrapper) between CF and flip. This hook OBSERVES dwm's own
+// CopyResource calls to find that copy. Vtable slot 47 = CopyResource. The
+// patch is one aligned 8-byte vtable store (atomic on x64), same pattern as
+// the proven flip-hook vtable patches.
+static void (STDMETHODCALLTYPE* g_cpyOrig)(void*, void*, void*) = nullptr;
+static volatile LONG g_cpyLogged = 0;
+
+static void STDMETHODCALLTYPE IWN_CopyHook(void* self, void* dst, void* src) {
+    // skip our own copies (they always touch twin/warpRT/stageTex)
+    BOOL ours = (dst == (void*)g_twin || src == (void*)g_twin ||
+                 dst == (void*)g_warpRT || src == (void*)g_warpRT ||
+                 dst == (void*)g_stageTex || src == (void*)g_stageTex);
+    if (!ours && g_cpyLogged < 40 && dst && src) {
+        InterlockedIncrement(&g_cpyLogged);
+        D3D11_TEXTURE2D_DESC dd = {}, sd = {};
+        __try { ((ID3D11Texture2D*)dst)->GetDesc(&dd); } __except (EXCEPTION_EXECUTE_HANDLER) { dd.Width = 0; }
+        __try { ((ID3D11Texture2D*)src)->GetDesc(&sd); } __except (EXCEPTION_EXECUTE_HANDLER) { sd.Width = 0; }
+        char b[280];
+        wsprintfA(b, "dwm: CPY[%ld] dst %lux%lu fmt=%lu bind=0x%X misc=0x%X <- src %lux%lu fmt=%lu bind=0x%X misc=0x%X",
+                  (long)g_cpyLogged,
+                  (unsigned long)dd.Width, (unsigned long)dd.Height, (unsigned long)dd.Format,
+                  (unsigned)dd.BindFlags, (unsigned)dd.MiscFlags,
+                  (unsigned long)sd.Width, (unsigned long)sd.Height, (unsigned long)sd.Format,
+                  (unsigned)sd.BindFlags, (unsigned)sd.MiscFlags);
+        iwnHookLog(b);
+    }
+    if (g_cpyOrig) g_cpyOrig(self, dst, src);
+}
+
+static void installCopyObserver() {
+    if (g_cpyOrig || !g_ctx) return;
+    void** vt = *(void***)g_ctx;
+    if (!vt || IsBadReadPtr(&vt[47], 8)) { iwnHookLog("dwm: CPY hook vtable unreadable"); return; }
+    g_cpyOrig = (void (STDMETHODCALLTYPE*)(void*, void*, void*))vt[47];
+    DWORD op = 0;
+    if (!VirtualProtect(&vt[47], 8, PAGE_READWRITE, &op)) { g_cpyOrig = nullptr; return; }
+    vt[47] = (void*)&IWN_CopyHook;
+    DWORD op2 = 0;
+    VirtualProtect(&vt[47], 8, op, &op2);
+    iwnHookLog("dwm: CPY observer installed (ctx vtable slot 47)");
+}
+
+// ---- paint
 static void paintWarp() {
     if (!g_ready || !g_ctx || g_tgtN == 0) return;
     IWNState st;
