@@ -1668,7 +1668,7 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
         phr = oc.swap->Present(0, 0);
     }
     if (phr == DXGI_ERROR_DEVICE_REMOVED || phr == DXGI_ERROR_DEVICE_RESET) {
-        dbgLog("draw: DEVICE LOST (0x" + hresultHex(phr) + ") - stopping render; press Ctrl+Win+Q to recover");
+        dbgLog("draw: DEVICE LOST (0x" + hresultHex(phr) + ") - stopping render; press the emergency-exit hotkey to recover");
         m_deviceLost.store(true);
     }
     if ((++m_frameCount % 180) == 1) {

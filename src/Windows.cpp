@@ -5033,7 +5033,16 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterHotKey(nullptr, 9, MOD_CONTROL, VK_F4);   // desktop warping (in-place overlay)
     for (int i = 0; i < 8; i++)                       // Ctrl+Shift+1..8: presets by name order
         RegisterHotKey(nullptr, 10 + i, MOD_CONTROL | MOD_SHIFT, L'1' + i);
-    RegisterHotKey(nullptr, 18, MOD_CONTROL | MOD_WIN, 'Q');   // emergency exit from exclusive fullscreen
+    // Ctrl+Win+Q is reserved by Windows for Quick Assist: RegisterHotKey for
+    // it fails on stock Windows and the key leaks to the shell (which then
+    // launches Quick Assist). Try it first, then fall back to the unreserved
+    // Ctrl+Win+Shift+Q. Log the outcome either way.
+    if (RegisterHotKey(nullptr, 18, MOD_CONTROL | MOD_WIN, 'Q'))
+        dbgLogLine("hotkey: emergency exit = Ctrl+Win+Q");
+    else if (RegisterHotKey(nullptr, 18, MOD_CONTROL | MOD_WIN | MOD_SHIFT, 'Q'))
+        dbgLogLine("hotkey: Ctrl+Win+Q reserved by Windows (Quick Assist); emergency exit = Ctrl+Win+Shift+Q");
+    else
+        dbgLogLine("hotkey: emergency exit registration FAILED (both combos)");
 }
 
 // GET_X_LPARAM / GET_Y_LPARAM come from windowsx.h (included above)
