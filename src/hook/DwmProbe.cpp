@@ -400,6 +400,7 @@ static void probeActiveRT() {
 }
 
 static void dumpAllCaptures();
+static volatile LONG s_capDumped = 0;
 
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     InterlockedIncrement((volatile LONG*)&g_cntConfirm);
@@ -466,8 +467,6 @@ static ID3D11Device* g_dev = nullptr;
 // Copy every screen-size texture we enumerated out to C:\Windows\Temp\iwncap<N>.raw
 // (raw BGRA, pitch removed). The host compares each against PrintScreen: the
 // dump that CONTAINS WINDOWS is the final pre-present composition buffer.
-static volatile LONG s_capDumped = 0;
-
 static void writeRawDump(const wchar_t* path, const void* data, SIZE_T bytes) {
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
