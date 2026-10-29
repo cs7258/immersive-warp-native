@@ -462,6 +462,10 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
     // (proof-carrying) surface and the screen showed nothing, so now every
     // screen-size RT|SRV surface in dwm gets the same paint - if dwm rotates
     // composition buffers, at least one of them is the one on the wire.
+    // 16:18 run: the private composition face (misc=0) fails RTV with
+    // E_INVALIDARG when pDesc=nullptr while the SHARED face succeeds - the
+    // classic typeless-resource symptom. Retry with an explicit typed desc.
+    static BOOL s_rtvDiagDone = FALSE;
     for (int i = 0; i < n && g_tgtN < IWN_MAX_TGT; i++) {
         if (!list[i].tex) continue;
         if (!(list[i].desc.BindFlags & D3D11_BIND_RENDER_TARGET)) continue;
@@ -469,9 +473,38 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
         ID3D11RenderTargetView* rv = nullptr;
         HRESULT hr2 = g_dev->CreateRenderTargetView(list[i].tex, nullptr, &rv);
         if (FAILED(hr2) || !rv) {
-            wsprintfA(b, "dwm: warp RTV[%d] hr=0x%08X (skipped)", i, (unsigned)hr2);
+            // one-time diagnosis on the first failure + explicit-format retry
+            if (!s_rtvDiagDone) {
+                s_rtvDiagDone = TRUE;
+                D3D11_TEXTURE2D_DESC fresh = {};
+                __try { list[i].tex->GetDesc(&fresh); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                ID3D11ShaderResourceView* srvT = nullptr;
+                D3D11_SHADER_RESOURCE_VIEW_DESC sdT = {};
+                sdT.Format = fresh.Format;
+                sdT.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                sdT.Texture2D.MostDetailedMip = 0;
+                sdT.Texture2D.MipLevels = 1;
+                HRESULT hrS = g_dev->CreateShaderResourceView(list[i].tex, &sdT, &srvT);
+                wsprintfA(b, "dwm: warp RTV diag fresh %ux%u fmt=%u bind=0x%X misc=0x%X arr=%u srv(explicit)=0x%08X",
+                          (unsigned)fresh.Width, (unsigned)fresh.Height, (unsigned)fresh.Format,
+                          (unsigned)fresh.BindFlags, (unsigned)fresh.MiscFlags,
+                          (unsigned)fresh.ArraySize, (unsigned)hrS);
+                iwnHookLog(b);
+                if (srvT) srvT->Release();
+            }
+            D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+            rd.Format = list[i].desc.Format;
+            rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            rd.Texture2D.MipSlice = 0;
+            hr2 = g_dev->CreateRenderTargetView(list[i].tex, &rd, &rv);
+            if (FAILED(hr2) || !rv) {
+                wsprintfA(b, "dwm: warp RTV[%d] hr=0x%08X (skipped, explicit retry also failed)",
+                          i, (unsigned)hr2);
+                iwnHookLog(b);
+                continue;
+            }
+            wsprintfA(b, "dwm: warp RTV[%d] OK via explicit desc", i);
             iwnHookLog(b);
-            continue;
         }
         list[i].tex->AddRef();
         g_rtvA[g_tgtN] = rv;
