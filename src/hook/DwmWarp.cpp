@@ -32,6 +32,7 @@
 #include <tlhelp32.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <dxgi.h>
 #include "DwmWarp.h"
 
 extern void iwnHookLog(const char* line);
@@ -64,6 +65,14 @@ static ID3D11Texture2D*           g_target = nullptr;   // first candidate (twin
 static ID3D11Texture2D*           g_tgt[IWN_MAX_TGT];   // ALL screen-size RT candidates
 static ID3D11RenderTargetView*    g_rtvA[IWN_MAX_TGT];  // one RTV per candidate
 static int                        g_tgtN = 0;           // surfaces painted per frame
+// copy mode: RTV creation on a private composition face can fail with
+// E_INVALIDARG even with an explicit typed desc (16:33 run: SRV on the SAME
+// face succeeds). CopyResource into these faces is proven to work (the round
+// 65 dump read them back pixel-perfect). So: render the warp onto our OWN
+// render target, then CopyResource it into the face.
+static ID3D11Texture2D*           g_warpRT  = nullptr;  // own render target (copy mode)
+static ID3D11RenderTargetView*    g_warpRTV = nullptr;
+static BOOL                       g_copyMode[IWN_MAX_TGT];
 static ID3D11Texture2D*           g_twin = nullptr;     // clean copy buffer
 static ID3D11Texture2D*           g_stageTex = nullptr; // CPU-readable mirror (diagnostics)
 static ID3D11RenderTargetView*    g_rtv = nullptr;      // kept for releaseAll compat (unused)
@@ -365,12 +374,49 @@ static void releaseAll() {
     g_tgtN = 0;
     if (g_twin) { g_twin->Release(); g_twin = nullptr; }
     if (g_stageTex) { g_stageTex->Release(); g_stageTex = nullptr; }
+    if (g_warpRTV) { g_warpRTV->Release(); g_warpRTV = nullptr; }
+    if (g_warpRT)  { g_warpRT->Release();  g_warpRT  = nullptr; }
+    ZeroMemory(g_copyMode, sizeof(g_copyMode));
     if (g_rs) { g_rs->Release(); g_rs = nullptr; }
     if (g_bs) { g_bs->Release(); g_bs = nullptr; }
     if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
     // g_target is a borrowed alias of g_tgt[0] - its ref is owned by g_tgt[0]
     g_target = nullptr;
+}
+
+// Own render target for copy-mode faces. Created lazily on first need; kept
+// across re-attaches (dims never change). If THIS RTV also fails, the device
+// genuinely lacks RT support for the surface format and copy mode is
+// impossible - the log line tells us which world we are in.
+static BOOL ensureWarpRT() {
+    char b[192];
+    if (g_warpRTV) return TRUE;
+    if (!g_dev) return FALSE;
+    D3D11_TEXTURE2D_DESC td = g_desc;
+    td.BindFlags      = D3D11_BIND_RENDER_TARGET;
+    td.CPUAccessFlags = 0;
+    td.MiscFlags      = 0;
+    td.Usage          = D3D11_USAGE_DEFAULT;
+    td.MipLevels      = 1;
+    td.ArraySize      = 1;
+    HRESULT hr = g_dev->CreateTexture2D(&td, nullptr, &g_warpRT);
+    if (FAILED(hr) || !g_warpRT) {
+        wsprintfA(b, "dwm: warp copy-mode RT texture failed hr=0x%08X", (unsigned)hr);
+        iwnHookLog(b);
+        return FALSE;
+    }
+    hr = g_dev->CreateRenderTargetView(g_warpRT, nullptr, &g_warpRTV);
+    if (FAILED(hr) || !g_warpRTV) {
+        wsprintfA(b, "dwm: warp copy-mode RT VIEW failed hr=0x%08X (no RT support for fmt=%u on this device)",
+                  (unsigned)hr, (unsigned)td.Format);
+        iwnHookLog(b);
+        g_warpRT->Release();
+        g_warpRT = nullptr;
+        return FALSE;
+    }
+    iwnHookLog("dwm: warp copy-mode RT ready");
+    return TRUE;
 }
 
 bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
@@ -385,11 +431,21 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
             if (g_tgt[i])  { g_tgt[i]->Release();  g_tgt[i]  = nullptr; }
         }
         g_tgtN = 0;
+        ZeroMemory(g_copyMode, sizeof(g_copyMode));
         for (int i = 0; i < n && g_tgtN < IWN_MAX_TGT; i++) {
             if (!list[i].tex) continue;
             if (!(list[i].desc.BindFlags & D3D11_BIND_RENDER_TARGET)) continue;
             ID3D11RenderTargetView* rv = nullptr;
             HRESULT hr2 = g_dev->CreateRenderTargetView(list[i].tex, nullptr, &rv);
+            if ((FAILED(hr2) || !rv) && ensureWarpRT()) {
+                // copy-mode fallback: paint via own RT + CopyResource
+                g_copyMode[g_tgtN] = TRUE;
+                list[i].tex->AddRef();
+                g_rtvA[g_tgtN] = nullptr;
+                g_tgt[g_tgtN]  = list[i].tex;
+                g_tgtN++;
+                continue;
+            }
             if (FAILED(hr2) || !rv) continue;
             list[i].tex->AddRef();
             g_rtvA[g_tgtN] = rv;
@@ -466,6 +522,7 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
     // E_INVALIDARG when pDesc=nullptr while the SHARED face succeeds - the
     // classic typeless-resource symptom. Retry with an explicit typed desc.
     static BOOL s_rtvDiagDone = FALSE;
+    ZeroMemory(g_copyMode, sizeof(g_copyMode));
     for (int i = 0; i < n && g_tgtN < IWN_MAX_TGT; i++) {
         if (!list[i].tex) continue;
         if (!(list[i].desc.BindFlags & D3D11_BIND_RENDER_TARGET)) continue;
@@ -485,10 +542,33 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
                 sdT.Texture2D.MostDetailedMip = 0;
                 sdT.Texture2D.MipLevels = 1;
                 HRESULT hrS = g_dev->CreateShaderResourceView(list[i].tex, &sdT, &srvT);
-                wsprintfA(b, "dwm: warp RTV diag fresh %ux%u fmt=%u bind=0x%X misc=0x%X arr=%u srv(explicit)=0x%08X",
+                UINT fsup = 0;
+                HRESULT hrF = g_dev->CheckFormatSupport((DXGI_FORMAT)fresh.Format, &fsup);
+                IDXGIDevice* dxgiD = nullptr;
+                char adesc[64] = "?";
+                if (SUCCEEDED(g_dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiD)) && dxgiD) {
+                    IDXGIAdapter* adp = nullptr;
+                    if (SUCCEEDED(dxgiD->GetAdapter(&adp)) && adp) {
+                        DXGI_ADAPTER_DESC ad = {};
+                        if (SUCCEEDED(adp->GetDesc(&ad))) {
+                            // Description may be any locale - keep it ASCII-safe
+                            char t[64]; int k = 0;
+                            for (; k < 62 && ad.Description[k]; k++) {
+                                wchar_t c = ad.Description[k];
+                                t[k] = (c >= 32 && c < 127) ? (char)c : '?';
+                            }
+                            t[k] = 0;
+                            lstrcpynA(adesc, t, 64);
+                        }
+                        adp->Release();
+                    }
+                    dxgiD->Release();
+                }
+                wsprintfA(b, "dwm: warp RTV diag fresh %ux%u fmt=%u bind=0x%X misc=0x%X arr=%u srv(explicit)=0x%08X fmtsup hr=0x%08X flags=0x%X adpt=%s",
                           (unsigned)fresh.Width, (unsigned)fresh.Height, (unsigned)fresh.Format,
                           (unsigned)fresh.BindFlags, (unsigned)fresh.MiscFlags,
-                          (unsigned)fresh.ArraySize, (unsigned)hrS);
+                          (unsigned)fresh.ArraySize, (unsigned)hrS,
+                          (unsigned)hrF, fsup, adesc);
                 iwnHookLog(b);
                 if (srvT) srvT->Release();
             }
@@ -498,6 +578,17 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
             rd.Texture2D.MipSlice = 0;
             hr2 = g_dev->CreateRenderTargetView(list[i].tex, &rd, &rv);
             if (FAILED(hr2) || !rv) {
+                // copy-mode fallback: our own RT + CopyResource (proven path)
+                if (ensureWarpRT()) {
+                    g_copyMode[g_tgtN] = TRUE;
+                    list[i].tex->AddRef();
+                    g_rtvA[g_tgtN] = nullptr;
+                    g_tgt[g_tgtN]  = list[i].tex;
+                    g_tgtN++;
+                    wsprintfA(b, "dwm: warp tgt[%d] registered via COPY MODE (RTV refused)", i);
+                    iwnHookLog(b);
+                    continue;
+                }
                 wsprintfA(b, "dwm: warp RTV[%d] hr=0x%08X (skipped, explicit retry also failed)",
                           i, (unsigned)hr2);
                 iwnHookLog(b);
@@ -623,7 +714,21 @@ static void paintWarp() {
         g_ctx->PSSetShaderResources(0, 1, &g_srv);
         g_ctx->PSSetSamplers(0, 1, &g_smp);
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+        // copy-mode faces render through our own RT; clear it once per frame
+        if (g_warpRTV) {
+            const float blk[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            g_ctx->ClearRenderTargetView(g_warpRTV, blk);
+        }
         for (int i = 0; i < g_tgtN; i++) {
+            if (g_copyMode[i]) {
+                if (!g_warpRTV) continue;
+                g_ctx->OMSetRenderTargets(1, &g_warpRTV, nullptr);
+                g_ctx->Draw(g_vertCount, 0);
+                __try { g_ctx->CopyResource(g_tgt[i], g_warpRT); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+                InterlockedIncrement(&g_draws);
+                continue;
+            }
             if (!g_rtvA[i]) continue;
             g_ctx->OMSetRenderTargets(1, &g_rtvA[i], nullptr);
             g_ctx->Draw(g_vertCount, 0);
