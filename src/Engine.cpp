@@ -216,6 +216,18 @@ struct OOut { float4 pos : SV_Position; float4 col : COLOR; };
 float4 main(OOut i) : SV_Target { return i.col; }
 )";
 
+// Cursor: a textured quad, alpha blended, drawn warped on top of the warp surface.
+static const char* g_vsCurSrc = R"(
+struct CIn  { float2 pos : POSITION; float2 uv : TEXCOORD; };
+struct COut { float4 pos : SV_Position; float2 uv : TEXCOORD; };
+COut main(CIn i) { COut o; o.pos = float4(i.pos, 0, 1); o.uv = i.uv; return o; }
+)";
+static const char* g_psCurSrc = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+float4 main(COut i) : SV_Target { return tex.Sample(samp, i.uv); }
+)";
+
 bool Engine::init() {
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&m_factory))) return false;
     IDXGIAdapter1* adapter = nullptr;
@@ -289,6 +301,34 @@ bool Engine::compileShaders() {
         { if (err) err->Release(); return false; }
     m_dev->CreatePixelShader(pso->GetBufferPointer(), pso->GetBufferSize(), nullptr, &m_psOv);
     pso->Release();
+
+    // cursor: textured quad, alpha blended on top of the warp surface
+    ID3DBlob* vsc = nullptr;
+    if (FAILED(D3DCompile(g_vsCurSrc, strlen(g_vsCurSrc), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsc, &err)))
+        { if (err) err->Release(); return false; }
+    m_dev->CreateVertexShader(vsc->GetBufferPointer(), vsc->GetBufferSize(), nullptr, &m_vsCur);
+    D3D11_INPUT_ELEMENT_DESC ilc[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    m_dev->CreateInputLayout(ilc, 2, vsc->GetBufferPointer(), vsc->GetBufferSize(), &m_layoutCur);
+    vsc->Release();
+    ID3DBlob* psc = nullptr;
+    if (FAILED(D3DCompile(g_psCurSrc, strlen(g_psCurSrc), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psc, &err)))
+        { if (err) err->Release(); return false; }
+    m_dev->CreatePixelShader(psc->GetBufferPointer(), psc->GetBufferSize(), nullptr, &m_psCur);
+    psc->Release();
+    D3D11_BLEND_DESC bd2{};
+    bd2.RenderTarget[0].BlendEnable = TRUE;
+    bd2.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    bd2.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd2.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd2.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd2.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    bd2.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd2.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    m_dev->CreateBlendState(&bd2, &m_blendAlpha);
+
     return true;
 }
 
@@ -663,6 +703,9 @@ Engine::OutputCtx::~OutputCtx() {
     if (meshIB) meshIB->Release();
     if (frameCB) frameCB->Release();
     if (overlayVB) overlayVB->Release();
+    if (cursorTex) cursorTex->Release();
+    if (cursorSRV) cursorSRV->Release();
+    if (cursorVB) cursorVB->Release();
 }
 
 // wstring -> narrow, for log lines only (device names are ASCII)
@@ -727,6 +770,39 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     m_dev->CreateBuffer(&vb, nullptr, &oc->overlayVB);
 
     createDuplication(*oc);
+
+    // cursor vertex buffer: 6 verts of (pos.xy NDC, uv), updated each frame
+    {
+        D3D11_BUFFER_DESC vb{};
+        vb.ByteWidth = sizeof(float) * 6 * 4;
+        vb.Usage = D3D11_USAGE_DYNAMIC;
+        vb.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        vb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        m_dev->CreateBuffer(&vb, nullptr, &oc->cursorVB);
+    }
+
+    // Exclusive fullscreen: a real full-monitor output makes DWM yield that
+    // display so our warp swapchain IS the system scanout (the "desktop warped
+    // in place" case). A windowed 60%-size preview is detected by comparing the
+    // client rect to the monitor rect and stays windowed (no display takeover).
+    // In-place layered overlays never go exclusive (they sit on the live DWM
+    // desktop instead of replacing it).
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            bool full = (oc->w == (UINT)(mi.rcMonitor.right - mi.rcMonitor.left) &&
+                         oc->h == (UINT)(mi.rcMonitor.bottom - mi.rcMonitor.top));
+            if (full && !g_inplace.load()) {
+                m_factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                HRESULT fs = oc->swap->SetFullscreenState(TRUE, nullptr);
+                if (SUCCEEDED(fs)) { oc->exclusive = true; dbgLog("attach: exclusive fullscreen ON"); }
+                else dbgLog("attach: exclusive fullscreen FAILED hr=" + hresultHex(fs));
+            } else {
+                dbgLog("attach: windowed (preview/in-place)");
+            }
+        }
+    }
+
     dbgLog(std::string("attach res: swap=") + (oc->swap ? "ok" : "NULL") +
            " backBuf=" + (oc->backBuf ? "ok" : "NULL") +
            " rtv=" + (oc->rtv ? "ok" : "NULL") +
@@ -774,7 +850,7 @@ bool Engine::createDuplication(OutputCtx& oc) {
     if (!want->empty()) {
         for (auto& d : displays) {
             if (!sameDisplayName(d.deviceName, *want)) continue;
-            if (isOutputDisplay(d)) {
+            if (isOutputDisplay(d) && !oc.exclusive) {
                 dbgLog("dupl: requested source is an enabled output -> recursion guard");
                 break;
             }
@@ -799,7 +875,9 @@ bool Engine::createDuplication(OutputCtx& oc) {
     }
     for (auto& d : displays) {
         if (src) break;
-        if (!isOutputDisplay(d)) { src = &d; break; }
+        // an exclusive-fullscreen output is NOT in the DWM desktop, so capturing
+        // its own display cannot recurse (used for single-screen in-place warp)
+        if (!(isOutputDisplay(d) && !oc.exclusive)) { src = &d; break; }
     }
     if (!src) {
         dbgLog("dupl: no source display available (all displays are outputs)");
@@ -893,6 +971,10 @@ void Engine::shutdown() {
     if (m_samplers[2]) m_samplers[2]->Release();
     if (m_samplers[3]) m_samplers[3]->Release();
     if (m_blendOpaque) m_blendOpaque->Release();
+    if (m_blendAlpha) m_blendAlpha->Release();
+    if (m_vsCur) m_vsCur->Release();
+    if (m_psCur) m_psCur->Release();
+    if (m_layoutCur) m_layoutCur->Release();
     if (m_raster) m_raster->Release();
     if (m_ctx) m_ctx->Release();
     if (m_dev) m_dev->Release();
@@ -937,11 +1019,27 @@ void Engine::captureFrame(OutputCtx& oc) {
             if (!oc.frameTex) {
                 D3D11_TEXTURE2D_DESC d{}; tex->GetDesc(&d);
                 d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.MiscFlags = 0;
-                if (SUCCEEDED(m_dev->CreateTexture2D(&d, nullptr, &oc.frameTex)))
+                if (SUCCEEDED(m_dev->CreateTexture2D(&d, nullptr, &oc.frameTex))) {
                     m_dev->CreateShaderResourceView(oc.frameTex, nullptr, &oc.srv);
+                    oc.srcW = d.Width; oc.srcH = d.Height;
+                }
             }
             if (oc.frameTex) { m_ctx->CopyResource(oc.frameTex, tex); oc.frameValid = true; }
             tex->Release();
+        }
+    }
+    // ---- cursor (pointer) capture, alongside the desktop frame ----
+    oc.cursorVisible = !!info.PointerPosition.Visible;
+    oc.cursorX = (int)info.PointerPosition.Position.x;
+    oc.cursorY = (int)info.PointerPosition.Position.y;
+    if (info.LastMouseUpdateTime.QuadPart != 0) {
+        // shape changed this frame: (re)fetch the pointer bitmap
+        UINT need = 0;
+        HRESULT sh = oc.dupl->GetFramePointerShape(0, nullptr, &need, &oc.cursorShape);
+        if (sh == DXGI_ERROR_MORE_DATA && need > 0) {
+            std::vector<BYTE> buf(need);
+            if (SUCCEEDED(oc.dupl->GetFramePointerShape(need, buf.data(), &need, &oc.cursorShape)))
+                updateCursorTexture(m_dev, oc, buf.data(), oc.cursorShape);
         }
     }
     oc.dupl->ReleaseFrame();
@@ -1019,6 +1117,89 @@ static void computeMeshVtxInto(const OutputCfg& cfg, std::vector<MeshVtx>& vtx,
             v.ny = v.sy;
         }
     }
+}
+
+// Evaluate the warp at an arbitrary source UV (su,sv in [0,1]) using the exact
+// same interpolation as computeMeshVtxInto, so the cursor lands where the mesh
+// would put that desktop point. Output dx,dy in [0,1] normalized output space
+// (x right, y down) matching the desktop vertex shader's DEST convention.
+static void evalWarp(const OutputCfg& cfg, float su, float sv, float& dx, float& dy) {
+    int rows = cfg.rows, cols = cfg.cols, s = std::max(1, g_cfg.subdivide);
+    float gf = sv * (rows - 1), gc = su * (cols - 1);
+    int ri = std::min((int)gf, std::max(rows - 2, 0));
+    int ci = std::min((int)gc, std::max(cols - 2, 0));
+    float tr = (rows > 1) ? gf - ri : 0;
+    float tc = (cols > 1) ? gc - ci : 0;
+    if (g_cfg.curved && rows >= 4 && cols >= 4) {
+        float c0 = catmull(pt(cfg, ri-1, ci-1, 0), pt(cfg, ri-1, ci, 0), pt(cfg, ri-1, ci+1, 0), pt(cfg, ri-1, ci+2, 0), tc);
+        float c1 = catmull(pt(cfg, ri, ci-1, 0), pt(cfg, ri, ci, 0), pt(cfg, ri, ci+1, 0), pt(cfg, ri, ci+2, 0), tc);
+        float c2 = catmull(pt(cfg, ri+1, ci-1, 0), pt(cfg, ri+1, ci, 0), pt(cfg, ri+1, ci+1, 0), pt(cfg, ri+1, ci+2, 0), tc);
+        float c3 = catmull(pt(cfg, ri+2, ci-1, 0), pt(cfg, ri+2, ci, 0), pt(cfg, ri+2, ci+1, 0), pt(cfg, ri+2, ci+2, 0), tc);
+        dx = catmull(c0, c1, c2, c3, tr);
+        float r0 = catmull(pt(cfg, ri-1, ci-1, 1), pt(cfg, ri-1, ci, 1), pt(cfg, ri-1, ci+1, 1), pt(cfg, ri-1, ci+2, 1), tc);
+        float r1 = catmull(pt(cfg, ri, ci-1, 1), pt(cfg, ri, ci, 1), pt(cfg, ri, ci+1, 1), pt(cfg, ri, ci+2, 1), tc);
+        float r2 = catmull(pt(cfg, ri+1, ci-1, 1), pt(cfg, ri+1, ci, 1), pt(cfg, ri+1, ci+1, 1), pt(cfg, ri+1, ci+2, 1), tc);
+        float r3 = catmull(pt(cfg, ri+2, ci-1, 1), pt(cfg, ri+2, ci, 1), pt(cfg, ri+2, ci+1, 1), pt(cfg, ri+2, ci+2, 1), tc);
+        dy = catmull(r0, r1, r2, r3, tr);
+    } else {
+        float a = pt(cfg, ri, ci, 0), b = pt(cfg, ri, ci+1, 0);
+        float c = pt(cfg, ri+1, ci, 0), d = pt(cfg, ri+1, ci+1, 0);
+        dx = a + (b - a) * tc + (c - a) * tr + (a - b - c + d) * tc * tr;
+        float e = pt(cfg, ri, ci, 1), f = pt(cfg, ri, ci+1, 1);
+        float g2 = pt(cfg, ri+1, ci, 1), h = pt(cfg, ri+1, ci+1, 1);
+        dy = e + (f - e) * tc + (g2 - e) * tr + (e - f - g2 + h) * tc * tr;
+    }
+    dx = clampf(dx, -0.5f, 1.5f);
+    dy = clampf(dy, -0.5f, 1.5f);
+}
+
+// Decode a Desktop Duplication pointer shape into a BGRA texture for the warped
+// cursor pass. COLOR cursors are copied verbatim; MASKED/MONOCHROME (1bpp AND/
+// XOR masks) are approximated without the desktop background: AND=1 -> transparent,
+// XOR=1 -> white, else black. This is a first-pass best effort; exotic cursors
+// may need a proper mask+screen composite later.
+void Engine::updateCursorTexture(ID3D11Device* dev, OutputCtx& oc, const BYTE* buf, const DXGI_OUTDUPL_POINTER_SHAPE_INFO& info) {
+    if (oc.cursorSRV) { oc.cursorSRV->Release(); oc.cursorSRV = nullptr; }
+    if (oc.cursorTex) { oc.cursorTex->Release(); oc.cursorTex = nullptr; }
+    oc.cursorValid = false;
+    if (info.Width == 0 || info.Height == 0) return;
+    oc.cursorW = info.Width; oc.cursorH = info.Height;
+    oc.cursorHotX = (int)info.HotSpot.x; oc.cursorHotY = (int)info.HotSpot.y;
+    std::vector<BYTE> bgra((size_t)info.Width * info.Height * 4, 0);
+    if (info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
+        for (UINT y = 0; y < info.Height; y++) {
+            const BYTE* src = buf + (size_t)y * info.Pitch;
+            BYTE* dst = bgra.data() + (size_t)y * info.Width * 4;
+            memcpy(dst, src, (size_t)info.Width * 4);
+        }
+    } else {
+        UINT maskPitch = ((info.Width + 31) / 32) * 4;   // 1bpp scanline stride
+        for (UINT y = 0; y < info.Height; y++) {
+            const BYTE* andMask = buf + (size_t)y * maskPitch;
+            const BYTE* xorMask = buf + (size_t)y * maskPitch + (size_t)info.Height * maskPitch;
+            for (UINT x = 0; x < info.Width; x++) {
+                BYTE ab = (andMask[x >> 3] >> (7 - (x & 7))) & 1;
+                BYTE xb = (xorMask[x >> 3] >> (7 - (x & 7))) & 1;
+                BYTE* p = bgra.data() + ((size_t)y * info.Width + x) * 4;
+                if (ab) { p[0] = p[1] = p[2] = p[3] = 0; }
+                else if (xb) { p[0] = p[1] = p[2] = 255; p[3] = 255; }
+                else { p[0] = p[1] = p[2] = 0; p[3] = 255; }
+            }
+        }
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = info.Width; td.Height = info.Height;
+    td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(dev->CreateTexture2D(&td, nullptr, &tex))) return;
+    dev->CreateShaderResourceView(tex, nullptr, &oc.cursorSRV);
+    dev->UpdateSubresource(tex, 0, nullptr, bgra.data(), info.Width * 4, 0);
+    oc.cursorTex = tex;
+    oc.cursorValid = (oc.cursorSRV != nullptr);
 }
 
 // publish every enabled output's mesh to the hook IPC without touching the
@@ -1407,6 +1588,40 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
             m_ctx->Draw(oc.overlayTriVtx, oc.overlayLineVtx);
         }
     }
+    // ---- warped cursor on top of the warp surface ----
+    if (oc.cursorValid && oc.cursorSRV && oc.cursorVisible && oc.srcW && oc.srcH &&
+        m_vsCur && m_psCur && m_layoutCur) {
+        float su = (float)oc.cursorX / (float)oc.srcW;
+        float sv = (float)oc.cursorY / (float)oc.srcH;
+        float dx = 0, dy = 0;
+        evalWarp(cfg, su, sv, dx, dy);
+        float outX = dx * (float)oc.w, outY = dy * (float)oc.h;
+        float l = outX - (float)oc.cursorHotX, t = outY - (float)oc.cursorHotY;
+        float r = l + (float)oc.cursorW, b = t + (float)oc.cursorH;
+        float x0 = l * 2.0f / (float)oc.w - 1.0f, x1 = r * 2.0f / (float)oc.w - 1.0f;
+        float y0 = 1.0f - t * 2.0f / (float)oc.h, y1 = 1.0f - b * 2.0f / (float)oc.h;
+        float vtx[6 * 4] = {
+            x0, y0, 0, 0,  x1, y0, 1, 0,  x0, y1, 0, 1,
+            x1, y0, 1, 0,  x1, y1, 1, 1,  x0, y1, 0, 1,
+        };
+        D3D11_MAPPED_SUBRESOURCE mp{};
+        if (oc.cursorVB && SUCCEEDED(m_ctx->Map(oc.cursorVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+            memcpy(mp.pData, vtx, sizeof(vtx));
+            m_ctx->Unmap(oc.cursorVB, 0);
+            m_ctx->VSSetShader(m_vsCur, nullptr, 0);
+            m_ctx->PSSetShader(m_psCur, nullptr, 0);
+            m_ctx->IASetInputLayout(m_layoutCur);
+            m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            UINT stride = sizeof(float) * 4, off = 0;
+            ID3D11Buffer* vbs[] = { oc.cursorVB };
+            m_ctx->IASetVertexBuffers(0, 1, vbs, &stride, &off);
+            m_ctx->PSSetShaderResources(0, 1, &oc.cursorSRV);
+            m_ctx->PSSetSamplers(0, 1, &m_samplers[0]);
+            m_ctx->OMSetBlendState(m_blendAlpha, nullptr, 0xffffffff);
+            m_ctx->Draw(6, 0);
+            m_ctx->OMSetBlendState(m_blendOpaque, nullptr, 0xffffffff);
+        }
+    }
     // SyncInterval=0: vsync Present(1) latches into DXGI's occluded skip-mode
     // when the window is briefly not composited (e.g. during startup or a
     // transient overlay) and never recovers -> permanent black output. The
@@ -1418,6 +1633,10 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
         // briefly so the occluded retry does not spin hot
         Sleep(20);
         phr = oc.swap->Present(0, 0);
+    }
+    if (phr == DXGI_ERROR_DEVICE_REMOVED || phr == DXGI_ERROR_DEVICE_RESET) {
+        dbgLog("draw: DEVICE LOST (0x" + hresultHex(phr) + ") - stopping render; press Ctrl+Win+Q to recover");
+        m_deviceLost.store(true);
     }
     if ((++m_frameCount % 180) == 1) {
         void** swvt = oc.swap ? *(void***)oc.swap : nullptr;
@@ -1443,6 +1662,14 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
 }
 
 void Engine::renderAll() {
+    // device lost (GPU reset / driver crash): stop rendering so we never spin on
+    // a dead swapchain. The user recovers with the Ctrl+Win+Q emergency hotkey
+    // (tears down outputs, DWM regains the display). Once outputs are gone we
+    // clear the flag so a later re-enable can render again.
+    if (m_deviceLost.load()) {
+        if (m_outs.empty()) m_deviceLost.store(false);
+        else { Sleep(100); return; }
+    }
     // per-stage profiling: capture (desktop duplication) vs draw (mesh+CB+
     // present); config lookup and self-heal fall into neither and only show
     // up as the frame total being slightly larger than cap+draw

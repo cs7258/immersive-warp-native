@@ -51,6 +51,19 @@ private:
         IDXGIOutputDuplication* dupl = nullptr;
         ID3D11Texture2D* frameTex = nullptr;      // cached copy of last duplicated frame
         ID3D11ShaderResourceView* srv = nullptr;
+        // DD cursor (pointer): captured with the desktop frame, drawn warped on
+        // top of the warp surface so the mouse tracks the geometry.
+        UINT srcW = 0, srcH = 0;             // source desktop size (cursor UV)
+        ID3D11Texture2D* cursorTex = nullptr;
+        ID3D11ShaderResourceView* cursorSRV = nullptr;
+        ID3D11Buffer* cursorVB = nullptr;
+        UINT cursorW = 0, cursorH = 0;
+        int cursorHotX = 0, cursorHotY = 0;
+        int cursorX = 0, cursorY = 0;       // source-desktop pixel position
+        bool cursorVisible = false;
+        bool cursorValid = false;           // a cursor texture exists
+        DXGI_OUTDUPL_POINTER_SHAPE_INFO cursorShape{};
+        bool exclusive = false;             // took exclusive fullscreen
         bool frameValid = false;
         LONGLONG lastPresentQpc = 0;  // QPC of newest acquired desktop frame
                                       // (frame info LastPresentTime; 0 = none)
@@ -80,6 +93,7 @@ private:
     void buildOverlay(OutputCtx& oc, const OutputCfg& cfg);
     void updateFrameCB(OutputCtx& oc, const OutputCfg& cfg);
     void drawOutput(OutputCtx& oc, const OutputCfg& cfg);
+    static void updateCursorTexture(ID3D11Device* dev, OutputCtx& oc, const BYTE* buf, const DXGI_OUTDUPL_POINTER_SHAPE_INFO& info);
     void captureSnapshot(OutputCtx& oc);   // swapchain back buffer -> PNG (g_snapReq)
 
     ID3D11Device* m_dev = nullptr;
@@ -112,6 +126,11 @@ private:
     void clearImage();
     bool uploadImage(UINT w, UINT h, const std::vector<BYTE>& bgra, const char* tag);
     ID3D11BlendState* m_blendOpaque = nullptr;
+    ID3D11BlendState* m_blendAlpha = nullptr;   // cursor: SRC_ALPHA / INV_SRC_ALPHA
+    ID3D11VertexShader* m_vsCur = nullptr;
+    ID3D11PixelShader* m_psCur = nullptr;
+    ID3D11InputLayout* m_layoutCur = nullptr;
+    std::atomic<bool> m_deviceLost{ false };
     ID3D11RasterizerState* m_raster = nullptr;
 
     // shared_ptr + mutex: the render thread snapshots this list each frame,

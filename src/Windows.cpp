@@ -545,7 +545,7 @@ void createOutputWindows() {
     wc.lpfnWndProc = OutputWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = OUT_CLASS;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = nullptr;   // no system cursor over the warp window; we draw the warped cursor ourselves
     RegisterClassW(&wc);
     WNDCLASSW mc{};
     mc.lpfnWndProc = MagWndProc;
@@ -5033,6 +5033,7 @@ void registerAndCreateControlWindow(HINSTANCE hInst) {
     RegisterHotKey(nullptr, 9, MOD_CONTROL, VK_F4);   // desktop warping (in-place overlay)
     for (int i = 0; i < 8; i++)                       // Ctrl+Shift+1..8: presets by name order
         RegisterHotKey(nullptr, 10 + i, MOD_CONTROL | MOD_SHIFT, L'1' + i);
+    RegisterHotKey(nullptr, 18, MOD_CONTROL | MOD_WIN, 'Q');   // emergency exit from exclusive fullscreen
 }
 
 // GET_X_LPARAM / GET_Y_LPARAM come from windowsx.h (included above)

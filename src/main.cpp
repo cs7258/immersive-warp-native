@@ -137,6 +137,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             else if (msg.wParam == 9) toggleInplaceOverlay(); // Ctrl+F4: desktop warping (same switch)
             else if (msg.wParam >= 10 && msg.wParam <= 17)
                 loadPresetByIndex((int)msg.wParam - 10);      // Ctrl+Shift+1..8: presets
+            else if (msg.wParam == 18)
+                destroyOutputWindows();   // Ctrl+Win+Q: emergency exit from exclusive fullscreen
             continue;
         }
         TranslateMessage(&msg);
