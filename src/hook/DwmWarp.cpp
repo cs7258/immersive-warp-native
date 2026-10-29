@@ -99,6 +99,11 @@ static volatile LONG  g_unpaintDone = 0;   // clean baseline saved / probe colou
 static volatile LONG  g_gridDirty = 1;     // vertex buffer needs a refill
 static volatile LONG  g_proofWarp = 0;     // one readback after the first warped draw
 static volatile LONG  g_proofFlip = 0;     // one readback at the deferred post-flip restore
+static volatile LONG  g_flipCalls = 0;     // inner present calls seen (path A/B)
+static volatile LONG  g_flipInspec = 0;    // one-time flip-object inspection done
+static IDXGISwapChain* g_flipSC = nullptr; // dwm's own presenting swapchain (AddRef'd)
+static int            g_frontTgt = -1;     // wire face named by dwm's present object
+static ID3D11Texture2D* g_markerTex = nullptr; // 8x8 per-face wire marker source
 static DWORD          g_t0 = 0;
 static LONG           g_lastLoggedStage = -1;
 
@@ -377,6 +382,8 @@ static void releaseAll() {
     if (g_warpRTV) { g_warpRTV->Release(); g_warpRTV = nullptr; }
     if (g_warpRT)  { g_warpRT->Release();  g_warpRT  = nullptr; }
     ZeroMemory(g_copyMode, sizeof(g_copyMode));
+    if (g_markerTex) { g_markerTex->Release(); g_markerTex = nullptr; }
+    if (g_flipSC)   { g_flipSC->Release();   g_flipSC   = nullptr; }
     if (g_rs) { g_rs->Release(); g_rs = nullptr; }
     if (g_bs) { g_bs->Release(); g_bs = nullptr; }
     if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
@@ -670,6 +677,16 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
     g_stage = 1;
     g_t0 = GetTickCount();
     g_lastLoggedStage = -1;
+    // 8x8 solid marker source for the wire-identification experiment (round 68)
+    {
+        D3D11_TEXTURE2D_DESC md = {};
+        md.Width = 8; md.Height = 8; md.MipLevels = 1; md.ArraySize = 1;
+        md.Format = g_desc.Format; md.SampleDesc.Count = 1;
+        md.Usage = D3D11_USAGE_DEFAULT; md.BindFlags = 0;
+        HRESULT hmr = g_dev->CreateTexture2D(&md, nullptr, &g_markerTex);
+        wsprintfA(b, "dwm: marker tex 8x8 fmt=%u hr=0x%08X", (unsigned)g_desc.Format, (unsigned)hmr);
+        iwnHookLog(b);
+    }
     installCopyObserver();   // find dwm's composition->scanout copy (round 66)
     wsprintfA(b, "dwm: WARP READY %ux%u fmt=%u - staged rollout starting",
               (unsigned)g_rtW, (unsigned)g_rtH, (unsigned)g_desc.Format);
@@ -791,6 +808,38 @@ static void paintWarp() {
     }
 
     stateRestore(&st);
+}
+
+// ---- wire markers (round 68) -------------------------------------------------
+// An 8x8 solid square per registered face, each face at its own x position and
+// in its own colour, drawn in the same paint pass as the warp. Whichever square
+// the external CopyFromScreen screenshots show is the face dwm actually
+// presents - the front surf named by experiment instead of by guesswork.
+//   tgt0 RED @(4,4)  tgt1 LIME @(24,4)  tgt2 BLUE @(44,4)
+//   tgt3 YELLOW @(64,4)  tgt4 WHITE @(84,4)
+static const UINT kMarkCol[IWN_MAX_TGT] = {
+    0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFF00FFFFu, 0xFFFFFFFFu
+};
+static void drawWireMarkers() {
+    if (!g_markerTex || !g_ctx || g_tgtN == 0) return;
+    static BOOL s_mlegDone = FALSE;      // POD init - no TLS guard
+    if (!s_mlegDone) {
+        s_mlegDone = TRUE;
+        char b[160];
+        for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
+            wsprintfA(b, "dwm: MARKER tgt%d col=%08X @(%d,4)", i, (unsigned)kMarkCol[i], i * 20 + 4);
+            iwnHookLog(b);
+        }
+    }
+    D3D11_BOX bx = { 0, 0, 0, 8, 8, 1 };
+    for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
+        if (!g_tgt[i]) continue;
+        UINT px = kMarkCol[i];
+        g_ctx->UpdateSubresource(g_markerTex, 0, nullptr, &px, 32, 0);
+        __try {
+            g_ctx->CopySubresourceRegion(g_tgt[i], 0, i * 20 + 4, 4, 0, g_markerTex, 0, &bx);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
 }
 
 // ---------------------------------------------------------------- diagnostics
@@ -915,6 +964,101 @@ static HMODULE moduleFromPtr(const void* p) {
     return h;
 }
 
+// ---- flip-object inspection (round 68) ---------------------------------------
+// The front surf must be named by dwm's OWN present path, not guessed among
+// the scanned candidates. IWN_FlipWrapA/B run INSIDE dwm's inner present call;
+// `self` there is the object dwm actually presents through. QueryInterface for
+// IDXGISwapChain: GetDesc reveals the real buffer count and swap effect (blt
+// vs flip - the question that decides whether a user-mode front buffer even
+// exists), GetBuffer(i) enumerates the wire buffers in dwm's own terms.
+//   * wire buffer == registered face  -> g_frontTgt named, engine knows its target
+//   * screen-size wire buffer NOT registered -> registered on the spot (copy
+//     mode, the proven-safe path) so the next frames paint the real wire
+//   * QI fails -> memory-scan the presenting object for registered pointers
+static void IWN_FlipInspect(void* self) {
+    char b[280];
+    if (!self) { iwnHookLog("dwm: FLIPSC self=null"); return; }
+    IDXGISwapChain* sc = nullptr;
+    HRESULT hr = E_NOINTERFACE;
+    __try { hr = ((IUnknown*)self)->QueryInterface(__uuidof(IDXGISwapChain), (void**)&sc); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { sc = nullptr; hr = 0xE0000001; }
+    if (SUCCEEDED(hr) && sc) {
+        DXGI_SWAP_CHAIN_DESC dsc = {};
+        if (SUCCEEDED(sc->GetDesc(&dsc))) {
+            const char* se = dsc.SwapEffect == 0 ? "DISCARD(blt)" :
+                             dsc.SwapEffect == 1 ? "SEQUENTIAL(blt)" :
+                             dsc.SwapEffect == 3 ? "FLIP_SEQUENTIAL" :
+                             dsc.SwapEffect == 4 ? "FLIP_DISCARD" : "?";
+            wsprintfA(b, "dwm: FLIPSC %ux%u bufcnt=%u swap=%s windowed=%u fmt=%u flags=0x%X",
+                      (unsigned)dsc.BufferDesc.Width, (unsigned)dsc.BufferDesc.Height,
+                      (unsigned)dsc.BufferCount, se, (unsigned)dsc.Windowed,
+                      (unsigned)dsc.BufferDesc.Format, (unsigned)dsc.Flags);
+            iwnHookLog(b);
+        } else {
+            iwnHookLog("dwm: FLIPSC QI ok but GetDesc failed");
+        }
+        int found = 0;
+        for (UINT i = 0; i < (UINT)dsc.BufferCount + 1 && i < 4; i++) {
+            ID3D11Texture2D* t = nullptr;
+            HRESULT hb = sc->GetBuffer(i, __uuidof(ID3D11Texture2D), (void**)&t);
+            if (SUCCEEDED(hb) && t) {
+                D3D11_TEXTURE2D_DESC td = {};
+                t->GetDesc(&td);
+                int match = -1;
+                for (int j = 0; j < g_tgtN; j++) if (g_tgt[j] == (void*)t) match = j;
+                wsprintfA(b, "dwm: FLIPBUF[%u] %ux%u bind=0x%X misc=0x%X ptr=%p %s",
+                          (unsigned)i, (unsigned)td.Width, (unsigned)td.Height,
+                          (unsigned)td.BindFlags, (unsigned)td.MiscFlags, (void*)t,
+                          match >= 0 ? "= REGISTERED tgt" : "(new)");
+                iwnHookLog(b);
+                if (match >= 0) {
+                    if (g_frontTgt < 0) g_frontTgt = match;
+                    found++;
+                } else if (g_rtW && td.Width == g_rtW && td.Height == g_rtH &&
+                           (td.BindFlags & D3D11_BIND_RENDER_TARGET) && g_tgtN < IWN_MAX_TGT) {
+                    // a wire buffer we were NOT painting - register it now so
+                    // the next frames paint the real presentation face
+                    t->AddRef();
+                    g_tgt[g_tgtN]      = t;
+                    g_rtvA[g_tgtN]     = nullptr;
+                    g_copyMode[g_tgtN] = TRUE;   // copy mode: proven safe on foreign faces
+                    g_tgtN++;
+                    g_frontTgt = g_tgtN - 1;
+                    wsprintfA(b, "dwm: FRONT SURF candidate registered as tgt[%d] (copy mode, from dwm present object)",
+                              g_tgtN - 1);
+                    iwnHookLog(b);
+                    found++;
+                }
+                t->Release();
+            } else {
+                wsprintfA(b, "dwm: FLIPBUF[%u] get hr=0x%08X", (unsigned)i, (unsigned)hb);
+                iwnHookLog(b);
+            }
+        }
+        if (found > 0 && g_frontTgt >= 0)
+            wsprintfA(b, "dwm: FRONT SURF = tgt[%d] (named by dwm's own present object)", g_frontTgt);
+        else
+            wsprintfA(b, "dwm: FRONT SURF not among registered faces (wire is elsewhere)");
+        iwnHookLog(b);
+        g_flipSC = sc;   // keep the AddRef from QueryInterface
+        return;
+    }
+    wsprintfA(b, "dwm: FLIPSC QI hr=0x%08X - not a DXGI swapchain, scanning object", (unsigned)hr);
+    iwnHookLog(b);
+    for (UINT off = 0; off < 0x1C0; off += 8) {
+        if (IsBadReadPtr((char*)self + off, 8)) break;
+        void* p = *(void**)((char*)self + off);
+        if (!p) continue;
+        for (int j = 0; j < g_tgtN; j++) {
+            if (p == g_tgt[j]) {
+                if (g_frontTgt < 0) g_frontTgt = j;
+                wsprintfA(b, "dwm: FLIPOBJ tgt[%d] pointer at self+0x%X", j, (unsigned)off);
+                iwnHookLog(b);
+            }
+        }
+    }
+}
+
 // Shared paint body: fresh clean snapshot -> black clear -> keystone paint.
 // Returns TRUE when draws happened (caller then defers the restore).
 static BOOL flipPaint() {
@@ -935,6 +1079,7 @@ static BOOL flipPaint() {
     }
     int before = (int)g_draws;
     paintWarp();
+    if (g_flipCalls < 1800) drawWireMarkers();   // ~30s identification window
     if ((int)g_draws == before) {
         if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (flip)");
         return FALSE;
@@ -947,6 +1092,9 @@ static BOOL flipPaint() {
 }
 
 #define FLIP_BODY(TRAMP)                                                       \
+    InterlockedIncrement(&g_flipCalls);                                        \
+    if (InterlockedCompareExchange(&g_flipInspec, 1, 0) == 0)                  \
+        IWN_FlipInspect(self);                                                 \
     BOOL painted = FALSE;                                                      \
     if (g_ready && g_flipHooked && TRAMP) painted = flipPaint();               \
     HRESULT hr = TRAMP(self, a2, a3, a4, a5, a6, a7, a8, a9, a10);             \
