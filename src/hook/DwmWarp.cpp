@@ -1128,99 +1128,9 @@ static void paintAtConfirmFrame(LONG ph) {
     }
 }
 
-// ---- one-shot capture of EVERY candidate surface -----------------------------
-// User-directed experiment (2026-10-29): copy every capturable composed image
-// out of dwm to disk, then compare each against a host PrintScreen to decide
-// which surface holds the FINAL pre-present desktop (windows included). Raw
-// BGRA dumps land in C:\Windows\Temp\iwncap<N>.raw (SYSTEM-writable, no CRT
-// stdio needed). Must run on the dwm thread inside the CF hook.
-static volatile LONG g_capDone = 0;
-
-static void writeRawFile(const wchar_t* path, const void* data, SIZE_T bytes) {
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD wrote = 0;
-    WriteFile(h, data, (DWORD)bytes, &wrote, nullptr);
-    CloseHandle(h);
-}
-
-static void captureAllSurfaces() {
-    if (!g_ctx || !g_dev || g_tgtN <= 0) return;
-    char b[192];
-
-    D3D11_TEXTURE2D_DESC sd = g_desc;
-    sd.Usage          = D3D11_USAGE_STAGING;
-    sd.BindFlags      = 0;
-    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    sd.MiscFlags      = 0;
-    sd.MipLevels      = 1;
-    sd.ArraySize      = 1;
-    ID3D11Texture2D* staging = nullptr;
-    HRESULT hr = g_dev->CreateTexture2D(&sd, nullptr, &staging);
-    if (FAILED(hr) || !staging) {
-        wsprintfA(b, "dwm: CAPTURE staging failed hr=0x%08X", (unsigned)hr);
-        iwnHookLog(b);
-        return;
-    }
-
-    for (int i = 0; i < g_tgtN; i++) {
-        if (!g_tgt[i]) continue;
-        D3D11_TEXTURE2D_DESC td;
-        g_tgt[i]->GetDesc(&td);
-        g_ctx->CopyResource(staging, g_tgt[i]);
-        D3D11_MAPPED_SUBRESOURCE mp;
-        hr = g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mp);
-        if (FAILED(hr)) {
-            wsprintfA(b, "dwm: CAPTURE[%d] map failed hr=0x%08X", i, (unsigned)hr);
-            iwnHookLog(b);
-            continue;
-        }
-        wchar_t path[64];
-        // lstrcpyW-free safe build
-        const wchar_t* p1 = L"C:\\Windows\\Temp\\iwncap";
-        const wchar_t* p2 = L".raw";
-        wchar_t* o = path;
-        for (const wchar_t* q = p1; *q; ) *o++ = *q++;
-        if (i >= 10) *o++ = (wchar_t)(L'0' + i / 10);
-        *o++ = (wchar_t)(L'0' + i % 10);
-        for (const wchar_t* q = p2; *q; ) *o++ = *q++;
-        *o = 0;
-        // row-by-row copy to drop the staging pitch padding
-        SIZE_T rowBytes = (SIZE_T)td.Width * 4;
-        BYTE* flat = (BYTE*)HeapAlloc(GetProcessHeap(), 0, rowBytes * td.Height);
-        if (flat) {
-            for (UINT y = 0; y < td.Height; y++)
-                CopyMemory(flat + y * rowBytes, (BYTE*)mp.pData + y * mp.RowPitch, rowBytes);
-            writeRawFile(path, flat, rowBytes * td.Height);
-            HeapFree(GetProcessHeap(), 0, flat);
-            wsprintfA(b, "dwm: CAPTURE[%d] %ux%u fmt=%u bind=0x%X misc=0x%X rowpitch=%lu -> %S (%lu bytes)",
-                      i, (unsigned)td.Width, (unsigned)td.Height, (unsigned)td.Format,
-                      (unsigned)td.BindFlags, (unsigned)td.MiscFlags,
-                      (unsigned long)mp.RowPitch, path, (unsigned long)(rowBytes * td.Height));
-        } else {
-            wsprintfA(b, "dwm: CAPTURE[%d] heap failed", i);
-        }
-        iwnHookLog(b);
-        g_ctx->Unmap(staging, 0);
-    }
-    staging->Release();
-    wsprintfA(b, "dwm: CAPTURE done surfaces=%d tick=%lu", g_tgtN, (unsigned long)GetTickCount());
-    iwnHookLog(b);
-}
-
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
     DWORD el = GetTickCount() - g_t0;
-    // One-shot surface capture at T+20s: steady state reached, all candidates
-    // registered; the host's screenshot series provides the PrintScreen twin.
-    if (el > 20000 && InterlockedCompareExchange(&g_capDone, 1, 0) == 0) {
-        __try { captureAllSurfaces(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            iwnHookLog("dwm: CAPTURE EXCEPTION (suppressed)");
-        }
-        return;   // skip this frame's paint - one clean sample frame
-    }
     if (el > 75000) {
         g_ready = 0;
         g_stage = -1;

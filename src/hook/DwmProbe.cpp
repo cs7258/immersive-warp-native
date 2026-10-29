@@ -201,6 +201,14 @@ static D3D11_TEXTURE2D_DESC g_targetDesc;
 #define IWN_PROBE_MAX_TGT 5
 static ID3D11Texture2D*      g_targets[IWN_PROBE_MAX_TGT];
 static D3D11_TEXTURE2D_DESC  g_tdescs[IWN_PROBE_MAX_TGT];
+// capture list: EVERY screen-size texture, any bind/misc/usage. The 09:53
+// run dumped the only RT|SRV candidate and it held wallpaper + desktop icons
+// but NO windows and NO taskbar - the final composed buffer must live in a
+// differently-flagged texture. Dump them all, let PrintScreen decide.
+#define IWN_PROBE_MAX_CAP 8
+static ID3D11Texture2D*      g_caps[IWN_PROBE_MAX_CAP];
+static D3D11_TEXTURE2D_DESC  g_capsD[IWN_PROBE_MAX_CAP];
+static int                   g_capN = 0;
 static int                   g_targetN = 0;
 static volatile LONG g_proofDone = 0;
 
@@ -391,8 +399,103 @@ static void probeActiveRT() {
     rtv->Release();
 }
 
+// ---- capture-all dump (2026-10-29 user-directed experiment) ------------------
+// Copy every screen-size texture we enumerated out to C:\Windows\Temp\iwncap<N>.raw
+// (raw BGRA, pitch removed). The host compares each against PrintScreen: the
+// dump that CONTAINS WINDOWS is the final pre-present composition buffer.
+static volatile LONG s_capDumped = 0;
+
+static void writeRawDump(const wchar_t* path, const void* data, SIZE_T bytes) {
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, data, (DWORD)bytes, &wrote, nullptr);
+    CloseHandle(h);
+}
+
+static void dumpAllCaptures() {
+    if (!g_ctx || !g_dev || g_capN <= 0) return;
+    char b[256];
+    for (int i = 0; i < g_capN; i++) {
+        if (!g_caps[i]) continue;
+        D3D11_TEXTURE2D_DESC td;
+        __try { g_caps[i]->GetDesc(&td); } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        // only 32bpp formats get a meaningful flat dump
+        unsigned bpp = 0;
+        if (td.Format == 87 || td.Format == 28 || td.Format == 24 || td.Format == 2) bpp = 4;
+        else if (td.Format == 11 || td.Format == 10) bpp = 8;
+        if (bpp != 4) {
+            wsprintfA(b, "dwm: CAPTURE[%d] fmt=%u bpp=%u - SKIPPED (not 32bpp)",
+                      i, (unsigned)td.Format, bpp);
+            iwnHookLog(b);
+            continue;
+        }
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.Usage            = D3D11_USAGE_STAGING;
+        sd.BindFlags        = 0;
+        sd.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags        = 0;
+        sd.MipLevels        = 1;
+        sd.ArraySize        = 1;
+        sd.SampleDesc.Count = 1;
+        sd.SampleDesc.Quality = 0;
+        ID3D11Texture2D* stg = nullptr;
+        HRESULT hr = g_dev->CreateTexture2D(&sd, nullptr, &stg);
+        if (FAILED(hr) || !stg) {
+            wsprintfA(b, "dwm: CAPTURE[%d] staging hr=0x%08X", i, (unsigned)hr);
+            iwnHookLog(b);
+            continue;
+        }
+        g_ctx->CopyResource(stg, g_caps[i]);
+        D3D11_MAPPED_SUBRESOURCE mp;
+        hr = g_ctx->Map(stg, 0, D3D11_MAP_READ, 0, &mp);
+        if (FAILED(hr)) {
+            wsprintfA(b, "dwm: CAPTURE[%d] map hr=0x%08X", i, (unsigned)hr);
+            iwnHookLog(b);
+            stg->Release();
+            continue;
+        }
+        wchar_t path[64];
+        {
+            const wchar_t* p1 = L"C:\\Windows\\Temp\\iwncap";
+            const wchar_t* p2 = L".raw";
+            wchar_t* o = path;
+            for (const wchar_t* q = p1; *q; ) *o++ = *q++;
+            if (i >= 10) *o++ = (wchar_t)(L'0' + i / 10);
+            *o++ = (wchar_t)(L'0' + i % 10);
+            for (const wchar_t* q = p2; *q; ) *o++ = *q++;
+            *o = 0;
+        }
+        SIZE_T rowBytes = (SIZE_T)td.Width * 4;
+        BYTE* flat = (BYTE*)HeapAlloc(GetProcessHeap(), 0, rowBytes * td.Height);
+        if (flat) {
+            for (UINT y = 0; y < td.Height; y++)
+                CopyMemory(flat + y * rowBytes,
+                           (BYTE*)mp.pData + (SIZE_T)y * mp.RowPitch, rowBytes);
+            writeRawDump(path, flat, rowBytes * td.Height);
+            HeapFree(GetProcessHeap(), 0, flat);
+        }
+        g_ctx->Unmap(stg, 0);
+        stg->Release();
+        wsprintfA(b, "dwm: CAPTURE[%d] %ux%u fmt=%u bind=0x%X misc=0x%X usage=%u pitch=%lu -> %S",
+                  i, (unsigned)td.Width, (unsigned)td.Height, (unsigned)td.Format,
+                  (unsigned)td.BindFlags, (unsigned)td.MiscFlags, (unsigned)td.Usage,
+                  (unsigned long)mp.RowPitch, path);
+        iwnHookLog(b);
+    }
+    wsprintfA(b, "dwm: CAPTURE dumped=%d", g_capN);
+    iwnHookLog(b);
+}
+
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     InterlockedIncrement((volatile LONG*)&g_cntConfirm);
+    // capture-all: fire once well after texscan has run and steady state begun
+    if (g_capN > 0 && g_cntConfirm > 1500 &&
+        InterlockedCompareExchange(&s_capDumped, 1, 0) == 0) {
+        __try { dumpAllCaptures(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { iwnHookLog("dwm: CAPTURE EXCEPTION"); }
+    }
     probeActiveRT();
     // 纹理扫描已经登记了候选合成表面时，在提交边界做一次性像素读回。
     // 放在这里而不是扫描线程：immediate context 不是线程安全的，只有在
@@ -739,6 +842,17 @@ static void scanTextures() {
                           (unsigned)d.BindFlags, (unsigned)d.MiscFlags, (unsigned)d.Usage,
                           exact ? "  <== SCREEN SIZE" : "");
                 iwnHookLog(b);
+                if (exact && g_capN < IWN_PROBE_MAX_CAP && d.SampleDesc.Count == 1) {
+                    bool dupC = false;
+                    for (int i = 0; i < g_capN; i++)
+                        if (g_caps[i] == tex) { dupC = true; break; }
+                    if (!dupC) {
+                        __try { tex->AddRef(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                        g_capsD[g_capN] = d;
+                        g_caps[g_capN]  = tex;
+                        g_capN++;
+                    }
+                }
                 if (isRT) {
                     rtBig++;
                     // 收集所有"屏幕尺寸 + RT|SRV + 单采样"的候选。dwm 的合成
