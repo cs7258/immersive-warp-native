@@ -1221,6 +1221,22 @@ static void tryInstallFlipHook(void* self) {
 }
 // Paints the warp into all candidates while dwm is inside PresentInternal,
 // i.e. after its render is final and before the real present runs.
+// ---- round 71: dwm names its own buffers ------------------------------------
+// PDW (legacy PresentDWM) is hooked but gets ZERO calls on this machine - 1909
+// presents through CDWMSwapChain::PresentInternal, which we already wrap. The
+// wrap's `this` IS a CDWMSwapChain, and dwmcore.pdb gives its own buffer
+// accessors (disasm verified: both read this->[0x1A8] then vtable slot 31 of
+// that object; back takes an extra int in edx - pass 0):
+//   0xC1580 CDWMSwapChain::GetLogicalBackBufferIndex
+//   0xC6DD0 CDWMSwapChain::GetLogicalFrontBufferIndex
+// Calling them inside the wrapper makes dwm itself name the front surf every
+// frame - no offsets, no guessing. Paired with a one-shot scan of the object
+// for pointers to our registered faces (index -> texture mapping).
+typedef UINT (STDMETHODCALLTYPE* PFN_LBIDX1)(void*);
+typedef UINT (STDMETHODCALLTYPE* PFN_LBIDX2)(void*, UINT);
+static void* g_lbbiFn = nullptr;   // dwmcore + 0xC1580
+static void* g_lfbiFn = nullptr;   // dwmcore + 0xC6DD0
+
 static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3, void* a4, UINT64 a5) {
     // round 71: dwm names its own buffers (see LBIDX block comment)
     if (g_lfbiFn && self) {
@@ -1590,22 +1606,6 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_PDW10)(void*, void*, void*, void*, void*
 typedef ULONG   (STDMETHODCALLTYPE* PFN_SCBACKIDX)(void*);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_SCGETDEV)(void*, const IID&, void**);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_SCGETBUF)(void*, UINT, const IID&, void**);
-
-// ---- round 71: dwm names its own buffers ------------------------------------
-// PDW (legacy PresentDWM) is hooked but gets ZERO calls on this machine - 1909
-// presents through CDWMSwapChain::PresentInternal, which we already wrap. The
-// wrap's `this` IS a CDWMSwapChain, and dwmcore.pdb gives its own buffer
-// accessors (disasm verified: both read this->[0x1A8] then vtable slot 31 of
-// that object; back takes an extra int in edx - pass 0):
-//   0xC1580 CDWMSwapChain::GetLogicalBackBufferIndex
-//   0xC6DD0 CDWMSwapChain::GetLogicalFrontBufferIndex
-// Calling them inside the wrapper makes dwm itself name the front surf every
-// frame - no offsets, no guessing. Paired with a one-shot scan of the object
-// for pointers to our registered faces (index -> texture mapping).
-typedef UINT (STDMETHODCALLTYPE* PFN_LBIDX1)(void*);
-typedef UINT (STDMETHODCALLTYPE* PFN_LBIDX2)(void*, UINT);
-static void* g_lbbiFn = nullptr;   // dwmcore + 0xC1580
-static void* g_lfbiFn = nullptr;   // dwmcore + 0xC6DD0
 
 // One pixel sample out of the live back buffer: THE capture proof - the
 // composed desktop (windows, taskbar, clock) read from dwm's own present path.
