@@ -142,6 +142,8 @@ private:
     int m_recSelftest = 0;
     int m_recFrames = 0;
     int m_recTries = 0;
+    int m_recLastHits = 0;   // last selftest sample: marker px / black px (of 40000)
+    int m_recLastBlack = 0;
     bool m_recDetected = false;
     void recursionCheck(OutputCtx& oc);
 

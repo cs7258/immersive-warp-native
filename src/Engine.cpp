@@ -875,8 +875,14 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
 // pixels (our marker color). A hit means our own scanout is part of the
 // desktop image DD returns -> warp feedback loop.
 void Engine::recursionCheck(OutputCtx& oc) {
-    if (++m_recTries > 10) {
-        dbgLog("recursion selftest: CLEAN (" + std::to_string(m_recTries - 1) + " captures, no marker px)");
+    if (++m_recTries > 600) {
+        // ~5 s at 120 fps: long enough for the DD feedback loop to establish
+        // (the marker can re-enter the capture only after present -> DWM
+        // compose -> acquire latency). 1909 findings: a WDA_MONITOR-style
+        // blackout shows up as all-black here, real recursion as marker px.
+        dbgLog("recursion selftest: CLEAN (" + std::to_string(m_recTries - 1) +
+               " captures, last sample marker=" + std::to_string(m_recLastHits) +
+               " black=" + std::to_string(m_recLastBlack) + "/40000)");
         m_recSelftest = 3;
         return;
     }
@@ -908,8 +914,10 @@ void Engine::recursionCheck(OutputCtx& oc) {
         }
         m_ctx->Unmap(stg, 0);
         stg->Release();
-        dbgLog("recursion selftest try " + std::to_string(m_recTries) + ": marker=" +
-               std::to_string(hits) + " black=" + std::to_string(black) + "/40000");
+        m_recLastHits = hits; m_recLastBlack = black;
+        if (m_recTries == 1 || (m_recTries % 100) == 0)
+            dbgLog("recursion selftest try " + std::to_string(m_recTries) + ": marker=" +
+                   std::to_string(hits) + " black=" + std::to_string(black) + "/40000");
         if (hits > 24000) {   // >60% of 200x200: our marker leaked into the capture
             m_recDetected = true; m_recSelftest = 3;
             dbgLog("recursion selftest: DETECTED (" + std::to_string(hits) + "/40000 marker px) - own scanout leaks into DD capture");
