@@ -401,6 +401,13 @@ static void probeActiveRT() {
 
 static void dumpAllCaptures();
 static volatile LONG s_capDumped = 0;
+// 扫描批次 epoch：scanTextures 每登记一批目标就 +1；ConfirmFrame 侧挂载后
+// 记下 doneEpoch，两者不等即"有新目标待挂载"。周期重扫靠这个握手循环。
+static volatile LONG s_scanEpoch = 0;
+static volatile LONG s_doneEpoch = 0;
+static volatile LONG s_scanBusy  = 0;    // reporter 正在扫（禁止并发挂载）
+static DWORD         g_lastAttachTick = 0;
+static volatile LONG g_texScanDone = 0;  // hoisted: CF hook re-arms it
 static DWORD g_texScanTick = 0;   // set when texscan finishes; capture anchor
 
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
@@ -421,14 +428,20 @@ static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     //
     // 像素验证通过后，把这张表面交给扭曲引擎（Stage 1）。引擎自己 AddRef，
     // 我们随后释放自己这一份引用 —— 谁持有谁负责，不重复保留。
-    if (g_targetN > 0 && InterlockedCompareExchange(&g_proofDone, 1, 0) == 0) {
-        proveTextureIsDesktop(g_targets[0], g_tdescs[0]);
+    // 有新扫描批次 → 挂载给扭曲引擎（首次同时做像素验证）。私有合成面缓冲
+    // 存活期短，周期重扫（下方触发）会不断送来新批次，epoch 不等即挂载。
+    if (g_targetN > 0 && s_scanEpoch != s_doneEpoch && !s_scanBusy) {
+        // 像素验证只在首次挂载时做一次（immediate context 上跑读回，有开销）
+        if (InterlockedCompareExchange(&g_proofDone, 1, 0) == 0) {
+            proveTextureIsDesktop(g_targets[0], g_tdescs[0]);
+        }
         IWNWarpTarget list[IWN_PROBE_MAX_TGT];
-        for (int i = 0; i < g_targetN; i++) {
+        int n = g_targetN;
+        for (int i = 0; i < n; i++) {
             list[i].tex = g_targets[i];
             list[i].desc = g_tdescs[i];
         }
-        bool ok = DwmWarpAttachTargets(list, g_targetN);
+        bool ok = DwmWarpAttachTargets(list, n);
         iwnHookLog(ok ? "dwm: warp attach OK" : "dwm: warp attach FAILED");
         // NOTE: the PresentInternal detour is NOT installed here anymore. Both
         // 00:40 and 00:59 runs show dwm dying ~1s after install (WER event:
@@ -436,12 +449,23 @@ static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
         // fetched the 12-byte patch half-written and jumped to a torn garbage
         // address). It is now installed lazily at phase C entry, so phases A/B
         // (pure ConfirmFrame painting) get a clean 16s window first.
-        for (int i = 0; i < g_targetN; i++) {
+        for (int i = 0; i < n; i++) {
             __try { g_targets[i]->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
             g_targets[i] = nullptr;
         }
         g_targetN = 0;
         g_targetTex = nullptr;
+        s_doneEpoch = s_scanEpoch;
+        g_lastAttachTick = GetTickCount();
+    }
+    // 周期刷新：挂载后每 10s 把 g_texScanDone 归零，reporter 线程重扫一遍
+    // 地址空间，把轮换中活着的私有合成面重新登记（旧缓冲可能已被 dwm 释放
+    // 或复用）。扫描在 reporter 线程做，这里只触发；s_scanBusy 保证挂载不
+    // 会撞上正在写一半的扫描结果。
+    if (s_doneEpoch && !s_scanBusy &&
+        GetTickCount() - g_lastAttachTick > 10000) {
+        g_texScanDone = 0;               // re-arm the reporter scan
+        g_lastAttachTick = GetTickCount();
     }
 
     // 双侧结构：提交前存干净副本 + 画扭曲，提交后恢复。
@@ -723,7 +747,7 @@ static bool recoverDeviceByScan() {
 // 按 ID3D11Texture2D 的 vtable 指纹把 dwm 进程里所有纹理对象抓出来，用
 // GetDesc 读尺寸/格式/绑定标志 —— 桌面合成表面必然是 1920x1080 级且带
 // D3D11_BIND_RENDER_TARGET，这一步不需要任何猜测。
-static volatile LONG g_texScanDone = 0;
+// g_texScanDone 声明已上提到 HookConfirmFrame 之前（CF 侧会把它归零触发重扫）。
 
 static bool isDesktopSize(const D3D11_TEXTURE2D_DESC& d) {
     return d.Width >= 640 && d.Height >= 360;
@@ -848,7 +872,7 @@ static void scanTextures() {
                           (unsigned)d.BindFlags, (unsigned)d.MiscFlags, (unsigned)d.Usage,
                           exact ? "  <== SCREEN SIZE" : "");
                 iwnHookLog(b);
-                if (exact && g_capN < IWN_PROBE_MAX_CAP && d.SampleDesc.Count == 1) {
+                if (exact && !s_capDumped && g_capN < IWN_PROBE_MAX_CAP && d.SampleDesc.Count == 1) {
                     bool dupC = false;
                     for (int i = 0; i < g_capN; i++)
                         if (g_caps[i] == tex) { dupC = true; break; }
@@ -863,9 +887,12 @@ static void scanTextures() {
                     rtBig++;
                     // 收集所有"屏幕尺寸 + RT|SRV + 单采样"的候选。dwm 的合成
                     // 缓冲是轮换的（多缓冲），只画其中一张 = 画在没上屏的那张。
+                    // 轮 65 实锤：misc=0x2(SHARED) 是壁纸/图标缓存层（画它只有
+                    // 壁纸扭曲）；misc=0 私有面才是最终合成缓冲 → 只收私有面。
                     bool collect = exact &&
                                    (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 &&
-                                   d.SampleDesc.Count == 1;
+                                   d.SampleDesc.Count == 1 &&
+                                   (d.MiscFlags & 0x2) == 0;
                     if (collect) {
                         bool dup = false;
                         for (int i = 0; i < g_targetN; i++) {
@@ -891,6 +918,7 @@ static void scanTextures() {
               g_targetN > 0 ? "FOUND target surface(s)" : "no target surface");
     iwnHookLog(b);
     if (!g_texScanTick) g_texScanTick = GetTickCount();
+    if (g_targetN > 0) InterlockedIncrement(&s_scanEpoch);   // 新批次待挂载
 
     if (g_targetN > 0) {
         wsprintfA(b, "dwm: registered %d exact-size RT surfaces (engine paints ALL)",
@@ -1080,9 +1108,13 @@ static DWORD WINAPI reporter(LPVOID) {
         if (!g_dev && g_scanRounds < 3) {
             recoverDeviceByScan();
         }
-        // 设备到手后，立刻按纹理指纹把 dwm 的纹理清单抓出来（只做一次）
+        // 设备到手后，按纹理指纹把 dwm 的纹理清单抓出来。首次 + 周期重扫
+        // （CF 侧把 g_texScanDone 归零即触发一轮）。s_scanBusy 让 CF 侧的
+        // 挂载避开正在写一半的 g_targets 数组。
         if (g_dev && !g_texScanDone) {
+            InterlockedExchange(&s_scanBusy, 1);
             scanTextures();
+            InterlockedExchange(&s_scanBusy, 0);
         }
         LONG c = g_cntConfirm;
         iwnHookCounters(g_cntConfirm, g_cntRtset, g_cntCreate);
