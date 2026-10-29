@@ -386,6 +386,8 @@ static void releaseAll() {
 }
 
 // Own render target for copy-mode faces. Created lazily on first need; kept
+static void installCopyObserver();   // fwd: defined in the paint section below
+// Own render target for copy-mode faces. Created lazily on first need; kept
 // across re-attaches (dims never change). If THIS RTV also fails, the device
 // genuinely lacks RT support for the surface format and copy mode is
 // impossible - the log line tells us which world we are in.
