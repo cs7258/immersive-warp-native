@@ -699,14 +699,19 @@ static void restoreAllSurfaces(const char* why);   // defined below the wrapper
 // unwarped - PresentInternal composes the window dirty rects AFTER its entry
 // and before the real flip, so the window regions of our paint are redrawn
 // straight. The only point where the frame is final AND pre-scanout is the
-// inner swapchain Present itself (the same point the original product's
-// "robust DXGI hooking" uses). We reach it by walking CDWMSwapChain's member
-// chain for an object whose vtable lives in dxgi.dll and pointing vtable
-// slot 8 (Present) at IWN_FlipWrap.
-static HRESULT (STDMETHODCALLTYPE* g_flipTramp)(void*, UINT, UINT) = nullptr;
+// inner present call. Static disassembly of PresentInternal (0x6C6B0):
+//   rax=[self+0x10]; rcx=[rax+0x50]; rcx=[rcx+0xf0]        (inner object)
+//   rax=[rcx]; rax=[rax+0x68]                              (vtable SLOT 13)
+//   call [rip+0x20f399]                                    (CFG dispatch)
+// and the return is compared against 0x87A0001 (DXGI_STATUS_OCCLUDED) - this
+// IS the present. The class is dwmcore-internal (its vtable is NOT in
+// dxgi.dll, which is why the first dxgi-only probe found nothing).
+static HRESULT (STDMETHODCALLTYPE* g_flipTramp)(void*, void*, void*, void*, void*,
+                                                void*, void*, void*, void*, void*) = nullptr;
 static volatile LONG g_flipTry   = 0;
 static volatile LONG g_flipHooked = 0;
-static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, UINT si, UINT fl);
+static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, void* a2, void* a3, void* a4, void* a5,
+                                              void* a6, void* a7, void* a8, void* a9, void* a10);
 
 static HMODULE moduleFromPtr(const void* p) {
     HMODULE h = nullptr;
@@ -719,49 +724,64 @@ static HMODULE moduleFromPtr(const void* p) {
 
 static void tryInstallFlipHook(void* self) {
     if (InterlockedCompareExchange(&g_flipTry, 1, 0) != 0) return;
-    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
-    if (!dxgi) { iwnHookLog("dwm: flip hook skipped (no dxgi.dll)"); return; }
     char* s = (char*)self;
     void* c1 = nullptr;
     void* c2 = nullptr;
-    void* c3 = nullptr;
-    if (!IsBadReadPtr(s + 0x10, 8))                      c1 = *(void**)(s + 0x10);
-    if (c1 && !IsBadReadPtr((char*)c1 + 0x50, 8))        c2 = *(void**)((char*)c1 + 0x50);
-    if (c2 && !IsBadReadPtr((char*)c2 + 0xf0, 8))        c3 = *(void**)((char*)c2 + 0xf0);
-    void* objs[4] = { s, c1, c2, c3 };
-    for (int i = 0; i < 4; i++) {
-        if (!objs[i] || IsBadReadPtr(objs[i], 8)) continue;
-        void** vt = *(void***)objs[i];
-        if (!vt || IsBadReadPtr(vt, 9 * 8)) continue;
-        if (moduleFromPtr((const void*)vt) != dxgi) continue;
-        void* orig = vt[8];
-        DWORD op = 0;
-        if (!VirtualProtect(&vt[8], 8, PAGE_READWRITE, &op)) {
-            char b[128];
-            wsprintfA(b, "dwm: flip hook VP failed gle=%lu", GetLastError());
-            iwnHookLog(b);
-            continue;
-        }
-        vt[8] = (void*)&IWN_FlipWrap;
-        DWORD op2 = 0;
-        VirtualProtect(&vt[8], 8, op, &op2);
-        // CFG: the new target is manual-mapped RWX code, a non-image
-        // executable page, which is a valid indirect-call target by default
-        // (same situation as the IAT detours that already work every frame).
-        g_flipTramp = (HRESULT (STDMETHODCALLTYPE*)(void*, UINT, UINT))orig;
-        g_flipHooked = 1;
-        char b[160];
-        wsprintfA(b, "dwm: FLIP HOOK installed (obj[%d] vtable %p slot8 prev=%p)",
-                  i, (void*)vt, orig);
+    void* obj = nullptr;
+    if (!IsBadReadPtr(s + 0x10, 8))                       c1 = *(void**)(s + 0x10);
+    if (c1 && !IsBadReadPtr((char*)c1 + 0x50, 8))         c2 = *(void**)((char*)c1 + 0x50);
+    if (c2 && !IsBadReadPtr((char*)c2 + 0xf0, 8))         obj = *(void**)((char*)c2 + 0xf0);
+    if (!obj || IsBadReadPtr(obj, 8)) {
+        iwnHookLog("dwm: flip hook NOT found (member chain unreadable)");
+        return;
+    }
+    void** vt = *(void***)obj;
+    if (!vt || IsBadReadPtr(vt, 16 * 8)) {
+        iwnHookLog("dwm: flip hook NOT found (vtable unreadable)");
+        return;
+    }
+    // one-time map of the vtable so the log tells us exactly which class/slot
+    for (int i = 0; i < 16; i++) {
+        HMODULE m = moduleFromPtr(vt[i]);
+        char b[128];
+        if (m) wsprintfA(b, "dwm: flip vt[%d] = %p (mod %p rva 0x%lX)",
+                         i, vt[i], (void*)m, (unsigned long)((char*)vt[i] - (char*)m));
+        else   wsprintfA(b, "dwm: flip vt[%d] = %p (no module)", i, vt[i]);
+        iwnHookLog(b);
+    }
+    if (IsBadReadPtr(&vt[13], 8)) {
+        iwnHookLog("dwm: flip hook NOT found (slot 13 unreadable)");
+        return;
+    }
+    void* orig = vt[13];
+    HMODULE om = moduleFromPtr(orig);
+    DWORD op = 0;
+    if (!VirtualProtect(&vt[13], 8, PAGE_READWRITE, &op)) {
+        char b[128];
+        wsprintfA(b, "dwm: flip hook VP failed gle=%lu", GetLastError());
         iwnHookLog(b);
         return;
     }
-    iwnHookLog("dwm: flip hook NOT found (no dxgi vtable in member chain)");
+    vt[13] = (void*)&IWN_FlipWrap;
+    DWORD op2 = 0;
+    VirtualProtect(&vt[13], 8, op, &op2);
+    // CFG: the new target is manual-mapped RWX code, a non-image executable
+    // page, which is a valid indirect-call target by default (the IAT detours
+    // already rely on exactly that).
+    g_flipTramp = (HRESULT (STDMETHODCALLTYPE*)(void*, void*, void*, void*, void*,
+                                                void*, void*, void*, void*, void*))orig;
+    g_flipHooked = 1;
+    char b[160];
+    wsprintfA(b, "dwm: FLIP HOOK installed (vtable %p slot13 prev=%p mod=%p)",
+              (void*)vt, orig, (void*)om);
+    iwnHookLog(b);
 }
 
-// Paints the warp at the inner flip: the frame is final here (wallpaper AND
-// windows) and the flip consumes what we paint.
-static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, UINT si, UINT fl) {
+// Paints the warp at the inner present: the frame is final here (wallpaper AND
+// windows) and the present consumes what we paint. 10-arg forwarder - the
+// static call site passes 4 register args plus 6 stack args.
+static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, void* a2, void* a3, void* a4, void* a5,
+                                              void* a6, void* a7, void* a8, void* a9, void* a10) {
     BOOL painted = FALSE;
     if (g_ready && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && g_flipTramp) {
         DWORD t = GetTickCount();
@@ -791,7 +811,7 @@ static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, UINT si, UINT fl) {
             }
         }
     }
-    HRESULT hr = g_flipTramp(self, si, fl);
+    HRESULT hr = g_flipTramp(self, a2, a3, a4, a5, a6, a7, a8, a9, a10);
     if (painted) g_pendingRestore = 1;   // restore at next CF (proven policy)
     return hr;
 }
