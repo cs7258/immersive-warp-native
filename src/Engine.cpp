@@ -908,6 +908,8 @@ void Engine::recursionCheck(OutputCtx& oc) {
         }
         m_ctx->Unmap(stg, 0);
         stg->Release();
+        dbgLog("recursion selftest try " + std::to_string(m_recTries) + ": marker=" +
+               std::to_string(hits) + " black=" + std::to_string(black) + "/40000");
         if (hits > 24000) {   // >60% of 200x200: our marker leaked into the capture
             m_recDetected = true; m_recSelftest = 3;
             dbgLog("recursion selftest: DETECTED (" + std::to_string(hits) + "/40000 marker px) - own scanout leaks into DD capture");
@@ -989,6 +991,10 @@ bool Engine::createDuplication(OutputCtx& oc) {
         // fullscreen can still film its own display - the warp surface never
         // appears in the duplication feed.
         auto hwndExcluded = [](HWND h) {
+            // IWN_NO_WDA=1 (diagnostic): pretend the window is excluded so the
+            // self-capture path engages and the recursion becomes measurable
+            wchar_t nowda[4] = L"";
+            if (GetEnvironmentVariableW(L"IWN_NO_WDA", nowda, 4) > 0) return true;
             DWORD aff = 0;
             return h && GetWindowDisplayAffinity(h, &aff) && (aff & 0x11) != 0; // WDA_EXCLUDEFROMCAPTURE
         };

@@ -722,8 +722,18 @@ void createOutputWindows() {
         // output is NOT excluded -> recursion selftest will flag it.
         typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
         auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity");
-        BOOL ok = fn ? fn(hwnd, 0x11) : FALSE;
-        if (!ok && (preview || inplace) && fn) ok = fn(hwnd, 0x01);
+        // IWN_NO_WDA=1: diagnostic bypass - capture the warp window itself to
+        // prove what the DD feed looks like with vs without exclusion
+        // (2026-10-30: on Win10 1909 the 0x11 call "succeeds" but blacks the
+        // window region out of the capture like WDA_MONITOR).
+        BOOL ok = FALSE;
+        wchar_t nowda[4] = L"";
+        if (GetEnvironmentVariableW(L"IWN_NO_WDA", nowda, 4) > 0) {
+            dbgLogLine("output: capture exclusion SKIPPED (IWN_NO_WDA diagnostic)");
+        } else {
+            ok = fn ? fn(hwnd, 0x11) : FALSE;
+            if (!ok && (preview || inplace) && fn) ok = fn(hwnd, 0x01);
+        }
         if (preview || inplace) g_previewNoCapture.store(!ok);
         dbgLogLine(std::string("output: window ") +
                    (ok ? "excluded from capture" : "NOT excluded from capture (needs Win10 2004+ for WDA_EXCLUDEFROMCAPTURE)") +
