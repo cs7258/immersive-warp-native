@@ -1197,7 +1197,14 @@ void Engine::updateCursorTexture(ID3D11Device* dev, OutputCtx& oc, const BYTE* b
     ID3D11Texture2D* tex = nullptr;
     if (FAILED(dev->CreateTexture2D(&td, nullptr, &tex))) return;
     dev->CreateShaderResourceView(tex, nullptr, &oc.cursorSRV);
-    dev->UpdateSubresource(tex, 0, nullptr, bgra.data(), info.Width * 4, 0);
+    // Upload via the immediate context: ID3D11DeviceContext::UpdateSubresource is
+    // unambiguous here and matches the engine's m_ctx upload convention.
+    ID3D11DeviceContext* ctx = nullptr;
+    dev->GetImmediateContext(&ctx);
+    if (ctx) {
+        ctx->UpdateSubresource(tex, 0, nullptr, bgra.data(), info.Width * 4, 0);
+        ctx->Release();
+    }
     oc.cursorTex = tex;
     oc.cursorValid = (oc.cursorSRV != nullptr);
 }
