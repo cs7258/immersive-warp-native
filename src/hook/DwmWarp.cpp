@@ -1420,8 +1420,10 @@ static void DwmWarpSetMpoSuppressed(BOOL on) {
     }
 }
 
+static void scRelease();          // fwd: defined with the round-69 PDW block
 static void restoreBaseline(const char* why) {
     DwmWarpSetMpoSuppressed(FALSE);   // overlays back on, whatever brought us here
+    scRelease();                      // round 69: drop swapchain probe refs
     __try {
         for (int i = 0; i < g_tgtN; i++) {
             if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
@@ -1465,6 +1467,252 @@ static void paintAtConfirmFrame(LONG ph) {
     }
 }
 
+// ---- round 69: dxgi CDXGISwapChainDWMLegacy::PresentDWM hook ----------------
+// fanxiushu 2025-10 article method, ported to 1909. On 22H2 the composition
+// present is COverlayContext::Present (dwmcore) and IDXGISwapChain must be dug
+// out of IOverlaySwapChain at offset -280. That function does not exist on
+// 18363 (verified against dwmcore.pdb - no COverlayContext::Present symbol),
+// but dxgi.pdb (18363) has the legacy path the article also describes:
+//   0x1AE30  CDXGISwapChainDWMLegacy::PresentDWM
+//   0x20610  CDXGISwapChainDWMLegacy::GetCurrentBackBufferIndex
+// On the legacy blt path the wrapper's `this` IS the DXGI swapchain dwm
+// composes the desktop into: GetDevice (slot 7) and GetBuffer (slot 9) - same
+// positions as IDXGISwapChain, per the article - hand us the very image being
+// sent to the display. No offset guessing at all.
+// Install: the COM vtables of CDXGISwapChainDWMLegacy are static pointer
+// arrays in dxgi.dll's .rdata shared by every instance. Scan .rdata for qwords
+// equal to the PresentDWM VA and repoint each at our wrapper - one patch per
+// vtable hooks ALL swapchains. Aligned 8-byte store = atomic, same pattern as
+// the proven flip-hook vtable patches.
+#define IWN_SC_MAX 4
+struct IWN_ScInfo {                    // all POD - no dynamic static init
+    void*                 self;        // first presenting swapchain instance
+    ID3D11Device*         dev;         // owning device (AddRef via GetDevice)
+    ID3D11DeviceContext*  ctx;
+    ID3D11Texture2D*      tex[IWN_SC_MAX];
+    ID3D11Texture2D*      stage;       // CPU_READ readback target
+    ID3D11Texture2D*      marker;      // 8x8 marker source on the SC device
+    UINT                  w, h;
+    int                   n;
+};
+static IWN_ScInfo        g_sc;                 // zero-initialized
+static volatile LONG     g_scInited = 0;
+static volatile LONG     g_pdwCalls = 0;
+static volatile LONG     g_pdwMarks = 0;
+static volatile LONG     g_pdwHooked = 0;
+static void*             g_pdwTramp = nullptr; // original PresentDWM
+static void*             g_pdwBackIdxFn = nullptr; // dxgi+0x20610
+typedef HRESULT (STDMETHODCALLTYPE* PFN_PDW10)(void*, void*, void*, void*, void*,
+                                               void*, void*, void*, void*, void*);
+typedef ULONG   (STDMETHODCALLTYPE* PFN_SCBACKIDX)(void*);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_SCGETDEV)(void*, const IID&, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_SCGETBUF)(void*, UINT, const IID&, void**);
+
+// One pixel sample out of the live back buffer: THE capture proof - the
+// composed desktop (windows, taskbar, clock) read from dwm's own present path.
+static void scReadback(ULONG cur, const char* tag) {
+    if (!g_sc.stage || (int)cur >= g_sc.n || !g_sc.tex[cur] || !g_sc.ctx) return;
+    __try {
+        g_sc.ctx->CopyResource(g_sc.stage, g_sc.tex[cur]);
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (SUCCEEDED(g_sc.ctx->Map(g_sc.stage, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
+            BYTE* p = (BYTE*)m.pData;
+            unsigned tl  = *(const unsigned*)(p + 4);
+            unsigned mid = *(const unsigned*)(p + (size_t)(g_sc.h / 2) * m.RowPitch
+                                                + (size_t)(g_sc.w / 2) * 4);
+            unsigned br  = *(const unsigned*)(p + (size_t)(g_sc.h - 8) * m.RowPitch
+                                                + (size_t)(g_sc.w - 8) * 4);
+            char b[160];
+            wsprintfA(b, "PDW: %s back=%lu mid=%08X tl=%08X br=%08X", tag,
+                      (unsigned long)cur, mid, tl, br);
+            iwnHookLog(b);
+            g_sc.ctx->Unmap(g_sc.stage, 0);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+// One-time per process: identify the swapchain, its device and every buffer.
+static void scInspect(void* self) {
+    char b[192];
+    g_sc.self = self;
+    void** vt = *(void***)self;
+    if (!vt || IsBadReadPtr(vt, 16 * 8)) { iwnHookLog("PDW: inspect failed (bad vtable)"); return; }
+    for (int i = 0; i < 16; i++) {
+        HMODULE m = moduleFromPtr(vt[i]);
+        if (m) wsprintfA(b, "PDW: vt[%d]=%p mod=%p rva=0x%lX", i, vt[i], (void*)m,
+                         (unsigned long)((char*)vt[i] - (char*)m));
+        else   wsprintfA(b, "PDW: vt[%d]=%p (no module)", i, vt[i]);
+        iwnHookLog(b);
+    }
+    PFN_SCGETDEV getDev = (PFN_SCGETDEV)vt[7];
+    PFN_SCGETBUF getBuf = (PFN_SCGETBUF)vt[9];
+    HRESULT hr = getDev(self, __uuidof(ID3D11Device), (void**)&g_sc.dev);
+    if (FAILED(hr) || !g_sc.dev) {
+        wsprintfA(b, "PDW: GetDevice FAILED hr=0x%lX", (unsigned long)hr);
+        iwnHookLog(b);
+        return;
+    }
+    g_sc.dev->GetImmediateContext(&g_sc.ctx);
+    wsprintfA(b, "PDW: device=%p ctx=%p (g_dev=%p %s)", (void*)g_sc.dev, (void*)g_sc.ctx,
+              (void*)g_dev, g_sc.dev == g_dev ? "SAME" : "DIFFERENT");
+    iwnHookLog(b);
+    for (UINT i = 0; i < IWN_SC_MAX; i++) {
+        ID3D11Texture2D* t = nullptr;
+        hr = getBuf(self, i, __uuidof(ID3D11Texture2D), (void**)&t);
+        if (FAILED(hr) || !t) break;
+        D3D11_TEXTURE2D_DESC d;
+        t->GetDesc(&d);
+        g_sc.tex[i] = t;              // owned ref
+        g_sc.n++;
+        wsprintfA(b, "PDW: buf[%u] %ux%u fmt=%d bind=%X misc=%X",
+                  (unsigned)i, d.Width, d.Height, d.Format, d.BindFlags, d.MiscFlags);
+        iwnHookLog(b);
+        if (i == 0) { g_sc.w = d.Width; g_sc.h = d.Height; }
+    }
+    if (g_pdwBackIdxFn) {
+        __try {
+            ULONG bi = ((PFN_SCBACKIDX)g_pdwBackIdxFn)(self);
+            wsprintfA(b, "PDW: GetCurrentBackBufferIndex=%lu", (unsigned long)bi);
+            iwnHookLog(b);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            iwnHookLog("PDW: GetCurrentBackBufferIndex EXCEPTION");
+        }
+    }
+    // marker source + staging readback, both on the SC device
+    D3D11_TEXTURE2D_DESC md = {};
+    md.Width = 8; md.Height = 8; md.MipLevels = 1; md.ArraySize = 1;
+    md.Format = DXGI_FORMAT_B8G8R8A8_UNORM; md.SampleDesc.Count = 1;
+    md.Usage = D3D11_USAGE_DEFAULT;
+    if (SUCCEEDED(g_sc.dev->CreateTexture2D(&md, nullptr, &g_sc.marker))) {
+        D3D11_TEXTURE2D_DESC sd = md;
+        sd.Width  = g_sc.w;
+        sd.Height = g_sc.h;
+        sd.Usage  = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.BindFlags      = 0;
+        if (FAILED(g_sc.dev->CreateTexture2D(&sd, nullptr, &g_sc.stage))) {
+            iwnHookLog("PDW: staging create failed");
+        }
+    } else {
+        iwnHookLog("PDW: marker create failed");
+    }
+    ULONG cur = 0;
+    if (g_pdwBackIdxFn) {
+        __try { cur = ((PFN_SCBACKIDX)g_pdwBackIdxFn)(self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { cur = 0; }
+    }
+    if ((int)cur < g_sc.n) scReadback(cur, "READBACK");
+    wsprintfA(b, "PDW: inspect done n=%d %ux%u", g_sc.n, g_sc.w, g_sc.h);
+    iwnHookLog(b);
+}
+
+// 8x8 colour block onto the live back buffer. Colour names the buffer:
+// 0 RED / 1 LIME / 2 BLUE / 3 YELLOW. Whichever shows up in an external
+// screenshot is the buffer dwm really blts to the display. dwm redraws the
+// back buffer every present, so no restore is needed - the marker lives one
+// frame unless repainted.
+static void scMarkBack(ULONG cur) {
+    if (!g_sc.marker || !g_sc.ctx || (int)cur >= g_sc.n || !g_sc.tex[cur]) return;
+    static const UINT cols[4] = { 0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFF00FFFFu };
+    UINT px = cols[cur & 3];
+    g_sc.ctx->UpdateSubresource(g_sc.marker, 0, nullptr, &px, 32, 0);
+    D3D11_BOX bx = { 0, 0, 0, 8, 8, 1 };
+    __try {
+        g_sc.ctx->CopySubresourceRegion(g_sc.tex[cur], 0, 4, 4, 0, g_sc.marker, 0, &bx);
+        InterlockedIncrement(&g_pdwMarks);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+}
+
+static HRESULT STDMETHODCALLTYPE IWN_PresentDWMWrap(void* self, void* a2, void* a3, void* a4,
+                                                    void* a5, void* a6, void* a7, void* a8,
+                                                    void* a9, void* a10) {
+    LONG calls = InterlockedIncrement(&g_pdwCalls);
+    if (calls == 1) {
+        char b[96];
+        wsprintfA(b, "PDW: FIRST CALL self=%p tramp=%p", self, g_pdwTramp);
+        iwnHookLog(b);
+    }
+    if (self != g_sc.self && g_sc.self) {
+        static volatile LONG s_dupLogged = 0;
+        if (InterlockedCompareExchange(&s_dupLogged, 1, 0) == 0) {
+            char b[128];
+            wsprintfA(b, "PDW: second swapchain self=%p (first=%p) - probe keeps first",
+                      self, g_sc.self);
+            iwnHookLog(b);
+        }
+    }
+    if (InterlockedCompareExchange(&g_scInited, 1, 0) == 0) scInspect(self);
+    ULONG cur = 0;
+    if (g_pdwBackIdxFn && g_sc.self == self) {
+        __try { cur = ((PFN_SCBACKIDX)g_pdwBackIdxFn)(self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { cur = 0; }
+    }
+    // marker only while the warp session is actually running
+    if (g_ready && (LONG)g_stage >= IWN_PH_CF_DEF) scMarkBack(cur);
+    if ((calls & 255) == 0) scReadback(cur, "tick");
+    return ((PFN_PDW10)g_pdwTramp)(self, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+}
+
+static void scRelease() {
+    if (g_sc.marker) { g_sc.marker->Release(); g_sc.marker = nullptr; }
+    if (g_sc.stage)  { g_sc.stage->Release();  g_sc.stage  = nullptr; }
+    for (int i = 0; i < IWN_SC_MAX; i++) {
+        if (g_sc.tex[i]) { g_sc.tex[i]->Release(); g_sc.tex[i] = nullptr; }
+    }
+    if (g_sc.ctx) { g_sc.ctx->Release(); g_sc.ctx = nullptr; }
+    if (g_sc.dev) { g_sc.dev->Release(); g_sc.dev = nullptr; }
+    g_sc.n = 0; g_sc.self = nullptr;
+    g_scInited = 0;
+}
+
+static void installLegacyPresentHook() {
+    char b[160];
+    if (g_pdwHooked) return;
+    HMODULE h = GetModuleHandleW(L"dxgi.dll");
+    if (!h) { iwnHookLog("PDW: install skipped (no dxgi.dll)"); return; }
+    BYTE* fn = (BYTE*)h + 0x1AE30;                 // CDXGISwapChainDWMLegacy::PresentDWM
+    g_pdwBackIdxFn = (BYTE*)h + 0x20610;           // ..::GetCurrentBackBufferIndex
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)h;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)h + dos->e_lfanew);
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    BYTE* rs = nullptr; DWORD rsn = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(sec[i].Name, ".rdata", 6) == 0) {
+            rs = (BYTE*)h + sec[i].VirtualAddress;
+            rsn = sec[i].Misc.VirtualSize;
+            break;
+        }
+    }
+    if (!rs || !rsn) { iwnHookLog("PDW: install skipped (no .rdata)"); return; }
+    // patching a live vtable: suspend-free is fine (atomic aligned store), but
+    // do it with the same write-verify discipline as every other patch here.
+    int patched = 0;
+    for (DWORD off = 0; off + 8 <= rsn && patched < 4; off += 8) {
+        void** slot = (void**)(rs + off);
+        if (IsBadReadPtr(slot, 8) || *slot != (void*)fn) continue;
+        DWORD op = 0;
+        if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) continue;
+        *slot = (void*)&IWN_PresentDWMWrap;
+        DWORD op2 = 0;
+        VirtualProtect(slot, 8, op, &op2);
+        if (*(void* volatile*)slot == (void*)&IWN_PresentDWMWrap) {
+            wsprintfA(b, "PDW: vtable slot patched @dxgi+rdata+0x%lX (prev=%p)",
+                      (unsigned long)off, fn);
+            iwnHookLog(b);
+            patched++;
+        }
+    }
+    if (patched) {
+        g_pdwTramp = fn;
+        g_pdwHooked = 1;
+        wsprintfA(b, "PDW: LEGACY PRESENT HOOK LIVE (%d vtable slot%s)", patched,
+                  patched == 1 ? "" : "s");
+        iwnHookLog(b);
+    } else {
+        iwnHookLog("PDW: no .rdata slot pointed at PresentDWM - hook NOT installed");
+    }
+}
+
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
     DWORD el = GetTickCount() - g_t0;
@@ -1505,6 +1753,7 @@ void DwmWarpBeforeSubmit() {
         // surface we paint. Restored on every shutdown path via restoreBaseline.
         if (ph == IWN_PH_CF_DEF) {
             DwmWarpSetMpoSuppressed(TRUE);
+            installLegacyPresentHook();   // round 69: dxgi legacy PresentDWM hook
             if (DwmWarpInstallPresentHook()) {
                 g_stage = IWN_PH_PRESNT;
                 iwnHookLog("dwm: paint point moved to PresentInternal wrapper");
@@ -1530,6 +1779,19 @@ void DwmWarpBeforeSubmit() {
             restoreAllSurfaces("post-flip");
         }
         return;   // painted by the wrapper now
+    }
+
+    if (g_pdwHooked) {
+        // PDW watchdog: proves the hook sees (or does not see) traffic
+        static DWORD s_pdwLastTick = 0;    // POD static - no TLS guard
+        DWORD t = GetTickCount();
+        if (t - s_pdwLastTick > 10000) {
+            s_pdwLastTick = t;
+            char pb[128];
+            wsprintfA(pb, "PDW: watchdog calls=%ld marks=%ld", (long)g_pdwCalls,
+                      (long)g_pdwMarks);
+            iwnHookLog(pb);
+        }
     }
 
     InterlockedIncrement(&g_frames);
