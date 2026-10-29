@@ -694,9 +694,119 @@ static HRESULT (STDMETHODCALLTYPE* g_presentTramp)(void*, void*, void*, void*, U
 static LONG  g_detourInstalled = 0;
 static void restoreAllSurfaces(const char* why);   // defined below the wrapper
 
+// ---- inner flip hook --------------------------------------------------------
+// 08:01 run verdict: painting at PresentInternal ENTRY still leaves windows
+// unwarped - PresentInternal composes the window dirty rects AFTER its entry
+// and before the real flip, so the window regions of our paint are redrawn
+// straight. The only point where the frame is final AND pre-scanout is the
+// inner swapchain Present itself (the same point the original product's
+// "robust DXGI hooking" uses). We reach it by walking CDWMSwapChain's member
+// chain for an object whose vtable lives in dxgi.dll and pointing vtable
+// slot 8 (Present) at IWN_FlipWrap.
+static HRESULT (STDMETHODCALLTYPE* g_flipTramp)(void*, UINT, UINT) = nullptr;
+static volatile LONG g_flipTry   = 0;
+static volatile LONG g_flipHooked = 0;
+static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, UINT si, UINT fl);
+
+static HMODULE moduleFromPtr(const void* p) {
+    HMODULE h = nullptr;
+    if (!p) return nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)p, &h)) return nullptr;
+    return h;
+}
+
+static void tryInstallFlipHook(void* self) {
+    if (InterlockedCompareExchange(&g_flipTry, 1, 0) != 0) return;
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    if (!dxgi) { iwnHookLog("dwm: flip hook skipped (no dxgi.dll)"); return; }
+    char* s = (char*)self;
+    void* c1 = nullptr;
+    void* c2 = nullptr;
+    void* c3 = nullptr;
+    if (!IsBadReadPtr(s + 0x10, 8))                      c1 = *(void**)(s + 0x10);
+    if (c1 && !IsBadReadPtr((char*)c1 + 0x50, 8))        c2 = *(void**)((char*)c1 + 0x50);
+    if (c2 && !IsBadReadPtr((char*)c2 + 0xf0, 8))        c3 = *(void**)((char*)c2 + 0xf0);
+    void* objs[4] = { s, c1, c2, c3 };
+    for (int i = 0; i < 4; i++) {
+        if (!objs[i] || IsBadReadPtr(objs[i], 8)) continue;
+        void** vt = *(void***)objs[i];
+        if (!vt || IsBadReadPtr(vt, 9 * 8)) continue;
+        if (moduleFromPtr((const void*)vt) != dxgi) continue;
+        void* orig = vt[8];
+        DWORD op = 0;
+        if (!VirtualProtect(&vt[8], 8, PAGE_READWRITE, &op)) {
+            char b[128];
+            wsprintfA(b, "dwm: flip hook VP failed gle=%lu", GetLastError());
+            iwnHookLog(b);
+            continue;
+        }
+        vt[8] = (void*)&IWN_FlipWrap;
+        DWORD op2 = 0;
+        VirtualProtect(&vt[8], 8, op, &op2);
+        // CFG: the new target is manual-mapped RWX code, a non-image
+        // executable page, which is a valid indirect-call target by default
+        // (same situation as the IAT detours that already work every frame).
+        g_flipTramp = (HRESULT (STDMETHODCALLTYPE*)(void*, UINT, UINT))orig;
+        g_flipHooked = 1;
+        char b[160];
+        wsprintfA(b, "dwm: FLIP HOOK installed (obj[%d] vtable %p slot8 prev=%p)",
+                  i, (void*)vt, orig);
+        iwnHookLog(b);
+        return;
+    }
+    iwnHookLog("dwm: flip hook NOT found (no dxgi vtable in member chain)");
+}
+
+// Paints the warp at the inner flip: the frame is final here (wallpaper AND
+// windows) and the flip consumes what we paint.
+static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, UINT si, UINT fl) {
+    BOOL painted = FALSE;
+    if (g_ready && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && g_flipTramp) {
+        DWORD t = GetTickCount();
+        if (t != g_lastPaintTick) {            // one paint per compose
+            g_lastPaintTick = t;
+            InterlockedIncrement(&g_frames);
+            __try {
+                g_ctx->CopyResource(g_twin, g_target); // clean COMPLETE frame
+                const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                for (int i = 0; i < g_tgtN; i++) {
+                    if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                InterlockedIncrement(&g_fail);
+                iwnHookLog("dwm: warp save EXCEPTION (flip)");
+            }
+            int before = (int)g_draws;
+            paintWarp();
+            if ((int)g_draws == before) {
+                if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (flip)");
+            } else {
+                painted = TRUE;
+                if (!g_proofWarp) {
+                    g_proofWarp = 1;
+                    readbackPixel(0, "warp-flip");
+                }
+            }
+        }
+    }
+    HRESULT hr = g_flipTramp(self, si, fl);
+    if (painted) g_pendingRestore = 1;   // restore at next CF (proven policy)
+    return hr;
+}
+
 // Paints the warp into all candidates while dwm is inside PresentInternal,
 // i.e. after its render is final and before the real present runs.
 static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3, void* a4, UINT64 a5) {
+    // One-time: try to hook the inner swapchain Present. Success -> the paint
+    // moves to IWN_FlipWrap (after the window compose, before the flip).
+    // Failure -> keep the legacy entry paint below (wallpaper warp only; the
+    // window regions of it are dirty-redrawn straight inside the trampoline).
+    if (!g_flipHooked) tryInstallFlipHook(self);
+    if (g_flipHooked) {
+        return g_presentTramp(self, a2, a3, a4, a5);
+    }
     BOOL painted = FALSE;
     if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx) {
         DWORD t = GetTickCount();
@@ -727,14 +837,10 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
         }
     }
     HRESULT hr = g_presentTramp(self, a2, a3, a4, a5);
-    // 07:42 run: immediate post-present restore is INVISIBLE (same failure as
-    // the CF immediate-restore phase: the flip has not scanned out when Present
-    // returns, so the restore wipes the queued frame). The proven restore
-    // policy from phase B applies unchanged here: defer to the next
-    // ConfirmFrame. That is safe because dwm draws window content AFTER CF -
-    // the restore at CF(N+1) cannot clobber frame N+1 renders (they have not
-    // happened yet), and the twin snapshot at PresentInternal(N+1) is a
-    // complete fresh frame.
+    // Immediate post-present restore is INVISIBLE (07:42/08:01 runs: the flip
+    // has not scanned out when Present returns). Defer to the next
+    // ConfirmFrame, the proven policy: dwm draws window content AFTER CF, so
+    // the restore at CF(N+1) cannot clobber fresh renders.
     if (painted) g_pendingRestore = 1;
     return hr;
 }
