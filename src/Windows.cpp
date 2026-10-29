@@ -712,16 +712,18 @@ void createOutputWindows() {
             title.c_str(), WS_POPUP | WS_VISIBLE,
             r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
             GetModuleHandleW(nullptr), nullptr);
-        // capture-exclusion for ALL warp output windows (0x11 =
-        // WDA_EXCLUDEFROMCAPTURE, Win10 2004+; 0x01 = WDA_MONITOR legacy
-        // fallback shows black). Without it a fullscreen warp output leaks
-        // into its own Desktop Duplication capture -> recursion feedback
-        // loop. On pre-2004 Windows the 0x11 call fails (logged); single-
-        // screen warp then cannot be recursion-free in pure user mode.
+        // capture-exclusion for warp output windows. 0x11 =
+        // WDA_EXCLUDEFROMCAPTURE (Win10 2004+): window stays on screen but ALL
+        // capture (DD/WGC/PrtSc) sees the desktop beneath -> single-screen
+        // warp without recursion. 0x01 = WDA_MONITOR makes the capture BLACK
+        // in the window area - that black-holes the warp feed, so the 0x01
+        // fallback is only used for preview/inplace (privacy there, feed is
+        // not sourced from capture). On pre-2004 Windows the normal warp
+        // output is NOT excluded -> recursion selftest will flag it.
         typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
         auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity");
         BOOL ok = fn ? fn(hwnd, 0x11) : FALSE;
-        if (!ok && fn) ok = fn(hwnd, 0x01);
+        if (!ok && (preview || inplace) && fn) ok = fn(hwnd, 0x01);
         if (preview || inplace) g_previewNoCapture.store(!ok);
         dbgLogLine(std::string("output: window ") +
                    (ok ? "excluded from capture" : "NOT excluded from capture (needs Win10 2004+ for WDA_EXCLUDEFROMCAPTURE)") +

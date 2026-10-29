@@ -248,7 +248,7 @@ bool Engine::init() {
     adapter->Release();
     if (FAILED(hr)) { dbgLog("init: D3D11CreateDevice FAILED hr=0x" + [&]{ char b[16]; snprintf(b, sizeof b, "%08lX", (unsigned long)hr); return std::string(b); }()); return false; }
     dbgLog("init: device ok fl=0x" + std::to_string(fl));
-    m_dev->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&m_ctx1);
+    if (m_ctx) m_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&m_ctx1);
     if (!m_ctx1) dbgLog("init: no ID3D11DeviceContext1 - recursion selftest disabled");
     if (!compileShaders()) { dbgLog("init: compileShaders FAILED (see shader: lines)"); return false; }
     dbgLog("init: shaders ok");
@@ -876,18 +876,22 @@ void Engine::recursionCheck(OutputCtx& oc) {
     m_ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, oc.frameTex, 0, &box);
     D3D11_MAPPED_SUBRESOURCE mp{};
     if (SUCCEEDED(m_ctx->Map(stg, 0, D3D11_MAP_READ, 0, &mp))) {
-        int hits = 0;
+        int hits = 0, black = 0;
         const BYTE* row = (const BYTE*)mp.pData;
         for (int y = 0; y < 200; y++) {
             const BYTE* p = row + (size_t)y * mp.RowPitch;
-            for (int x = 0; x < 200; x++, p += 4)
+            for (int x = 0; x < 200; x++, p += 4) {
                 if (p[0] > 200 && p[2] > 200 && p[1] < 80) hits++;
+                else if (p[0] < 16 && p[1] < 16 && p[2] < 16) black++;
+            }
         }
         m_ctx->Unmap(stg, 0);
         stg->Release();
         if (hits > 24000) {   // >60% of 200x200: our marker leaked into the capture
             m_recDetected = true; m_recSelftest = 3;
             dbgLog("recursion selftest: DETECTED (" + std::to_string(hits) + "/40000 marker px) - own scanout leaks into DD capture");
+        } else if (black > 38000) {   // >95% black: capture is black-holed
+            dbgLog("recursion selftest: capture ALL BLACK (" + std::to_string(black) + "/40000) - capture exclusion or pipeline black-holes the feed");
         }
         return;
     }
