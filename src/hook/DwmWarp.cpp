@@ -101,6 +101,8 @@ static volatile LONG  g_proofWarp = 0;     // one readback after the first warpe
 static volatile LONG  g_proofFlip = 0;     // one readback at the deferred post-flip restore
 static volatile LONG  g_flipCalls = 0;     // inner present calls seen (path A/B)
 static volatile LONG  g_flipInspec = 0;    // one-time flip-object inspection done
+static volatile LONG  g_flipDead = 0;      // 1 = hooks installed but never called
+static DWORD          g_flipInstallTick = 0;
 static IDXGISwapChain* g_flipSC = nullptr; // dwm's own presenting swapchain (AddRef'd)
 static int            g_frontTgt = -1;     // wire face named by dwm's present object
 static ID3D11Texture2D* g_markerTex = nullptr; // 8x8 per-face wire marker source
@@ -967,7 +969,7 @@ static void writeFaceRaw(const wchar_t* path, ID3D11Texture2D* face) {
 // Three dump rounds at engine el 32/42/52s. Called from the CF boundary while
 // the quiet window suppresses every paint path (faces = dwm's own frames).
 static void dumpFacesTick(DWORD el) {
-    static const DWORD kRounds[3] = { 32000, 42000, 52000 };
+    static const DWORD kRounds[3] = { 122000, 132000, 142000 };
     static int s_next = 0;                       // POD static - no TLS guard
     if (s_next >= 3) return;
     if (el < kRounds[s_next]) return;
@@ -990,8 +992,11 @@ static void dumpFacesTick(DWORD el) {
         }
         __try { writeFaceRaw(path, g_tgt[i]); }
         __except (EXCEPTION_EXECUTE_HANDLER) { }
-        wsprintfA(b, "FACE DUMP r=%d tgt=%d -> %S front=%ld back=%ld",
-                  r, i, path, (long)g_lbFrontLast, (long)g_lbBackLast);
+        POINT cp = { -1, -1 };
+        GetCursorPos(&cp);
+        wsprintfA(b, "FACE DUMP r=%d tgt=%d -> %S front=%ld back=%ld cur=%ld,%ld",
+                  r, i, path, (long)g_lbFrontLast, (long)g_lbBackLast,
+                  (long)cp.x, (long)cp.y);
         iwnHookLog(b);
     }
     if (r == 3) {
@@ -1000,7 +1005,6 @@ static void dumpFacesTick(DWORD el) {
         iwnHookLog("FACE DUMP window closed - paint resumed");
     }
 }
-
 // ---------------------------------------------------------------- phase machine
 // 00:10 run (dest-keystone + black clear at the ConfirmFrame boundary) gave the
 // unifying fact: dwm renders DIRTY REGIONS only into the composite surfaces.
@@ -1293,6 +1297,7 @@ static void tryInstallFlipHook(void* self) {
         iwnHookLog("dwm: flip hook NOT found (neither branch object patched)");
         return;
     }
+    g_flipInstallTick = GetTickCount();
     // one-time map of path A's vtable so the log tells us which class it is
     if (objA && !IsBadReadPtr(objA, 8)) {
         void** vt = *(void***)objA;
@@ -1392,7 +1397,16 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
     // Failure -> keep the legacy entry paint below (wallpaper warp only; the
     // window regions of it are dirty-redrawn straight inside the trampoline).
     if (!g_flipHooked) tryInstallFlipHook(self);
-    if (g_flipHooked) {
+    // round 73 flip-dead detection: the A/B vtable slots were patched but get
+    // ZERO calls on this blt path (round 72: frames frozen at 390 for 60s while
+    // LBIDX ticked at 60/s). Once proven dead, fall back to the wrapper-entry
+    // paint - the round-63 proven visible-on-screen point.
+    if (g_flipHooked && !g_flipDead && g_flipCalls == 0 && g_flipInstallTick &&
+        GetTickCount() - g_flipInstallTick > 2000) {
+        g_flipDead = 1;
+        iwnHookLog("FLIP hooks DEAD (0 calls in 2s) - paint falls back to wrapper entry");
+    }
+    if (g_flipHooked && !g_flipDead) {
         return g_presentTramp(self, a2, a3, a4, a5);
     }
     BOOL painted = FALSE;
@@ -1417,9 +1431,14 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
                 if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (present)");
             } else {
                 painted = TRUE;
-                if (!g_proofWarp) {
-                    g_proofWarp = 1;
-                    readbackPixel(0, "warp-present");
+                // per-face proof: read the painted corner of EVERY face once,
+                // so the log shows which faces actually carry the warp
+                static BOOL s_proofDone[IWN_MAX_TGT];   // POD zero-init
+                for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
+                    if (!s_proofDone[i]) {
+                        s_proofDone[i] = TRUE;
+                        readbackPixel(i, "warp-present");
+                    }
                 }
             }
         }
@@ -1925,13 +1944,13 @@ static void installLegacyPresentHook() {
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
     DWORD el = GetTickCount() - g_t0;
-    if (el > 75000) {
+    if (el > 150000) {
         g_ready = 0;
         g_stage = -1;
         // Hand the desktop back: dwm only redraws dirty regions, so the last
         // warped frame would otherwise sit on screen until a manual refresh.
-        restoreBaseline("75s budget spent");
-        iwnHookLog("dwm: WARP auto-off (75s budget spent)");
+        restoreBaseline("150s budget spent");
+        iwnHookLog("dwm: WARP auto-off (150s budget spent)");
         return;
     }
     LONG ph;
@@ -1974,12 +1993,14 @@ void DwmWarpBeforeSubmit() {
 
     if (ph == IWN_PH_IDLE) return;
 
-    // round 72: quiet dump window (see the globals block comment). Opened once
-    // at el=30s; dumpFacesTick fires the three rounds and closes it at 52s.
-    if (g_dwin == 0 && el > 30000) {
+    // round 72: quiet dump window (see the globals block comment). Round 73:
+    // moved to the END of the run (el 120..142s) so the steady warp gets a
+    // 112s visibility window first; the dumps then double as the cursor-
+    // composition check while the script walks the cursor.
+    if (g_dwin == 0 && el > 120000) {
         g_dwin = 1;
         g_quiet = 1;
-        iwnHookLog("FACE DUMP window open (paint quiet until el=52s)");
+        iwnHookLog("FACE DUMP window open (paint quiet until el=142s)");
     }
     if (g_dwin == 1) dumpFacesTick(el);
 
@@ -1996,6 +2017,21 @@ void DwmWarpBeforeSubmit() {
                 readbackPixel(0, "post-flip");
             }
             restoreAllSurfaces("post-flip");
+        }
+        // round 73: periodic cursor position log - pairs the face dumps with
+        // the script's cursor walk (is the cursor composed into the surface?)
+        {
+            static DWORD s_curLog = 0;           // POD static - no TLS guard
+            DWORD tc = GetTickCount();
+            if (tc - s_curLog > 5000) {
+                s_curLog = tc;
+                POINT p;
+                GetCursorPos(&p);
+                char b[96];
+                wsprintfA(b, "CURSOR x=%ld y=%ld frames=%ld",
+                          (long)p.x, (long)p.y, (long)g_frames);
+                iwnHookLog(b);
+            }
         }
         return;   // painted by the wrapper now
     }
