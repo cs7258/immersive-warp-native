@@ -1222,6 +1222,45 @@ static void tryInstallFlipHook(void* self) {
 // Paints the warp into all candidates while dwm is inside PresentInternal,
 // i.e. after its render is final and before the real present runs.
 static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3, void* a4, UINT64 a5) {
+    // round 71: dwm names its own buffers (see LBIDX block comment)
+    if (g_lfbiFn && self) {
+        static volatile LONG s_lbCalls = 0;   // POD statics - no TLS guard
+        static volatile LONG s_lbScan = 0;
+        __try {
+            UINT front = ((PFN_LBIDX1)g_lfbiFn)(self);
+            UINT back  = 0xFFFFFFFFu;
+            if (g_lbbiFn) back = ((PFN_LBIDX2)g_lbbiFn)(self, 0);
+            LONG c = InterlockedIncrement(&s_lbCalls);
+            if (c == 1 || (c & 255) == 0) {
+                char b[128];
+                wsprintfA(b, "LBIDX: front=%lu back=%lu self=%p",
+                          (unsigned long)front, (unsigned long)back, self);
+                iwnHookLog(b);
+            }
+            if (InterlockedCompareExchange(&s_lbScan, 1, 0) == 0 && g_tgtN > 0) {
+                char b[160];
+                for (int t = 0; t < g_tgtN; t++) {
+                    if (!g_tgt[t]) continue;
+                    for (DWORD off = 0; off + 8 <= 0x400; off += 8) {
+                        if (!IsBadReadPtr((char*)self + off, 8) &&
+                            *(void* volatile*)((char*)self + off) == (void*)g_tgt[t]) {
+                            wsprintfA(b, "LBIDX: tgt%d texture found at self+0x%lX",
+                                      t, (unsigned long)off);
+                            iwnHookLog(b);
+                            break;
+                        }
+                    }
+                }
+                // also map the [0x1A8]/[0x1A0] pair the accessors use
+                void* oA = IsBadReadPtr((char*)self + 0x1a8, 8)
+                         ? nullptr : *(void**)((char*)self + 0x1a8);
+                UINT  vA = IsBadReadPtr((char*)self + 0x1a0, 4)
+                         ? 0 : *(UINT*)((char*)self + 0x1a0);
+                wsprintfA(b, "LBIDX: self+1A8=%p self+1A0=%08X", oA, vA);
+                iwnHookLog(b);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
     // One-time: try to hook the inner swapchain Present. Success -> the paint
     // moves to IWN_FlipWrap (after the window compose, before the flip).
     // Failure -> keep the legacy entry paint below (wallpaper warp only; the
@@ -1322,6 +1361,8 @@ BOOL DwmWarpInstallPresentHook() {
         return g_presentTramp != nullptr;
     HMODULE h = GetModuleHandleW(L"dwmcore.dll");
     if (!h) { iwnHookLog("dwm: present hook skipped (no dwmcore)"); return FALSE; }
+    g_lbbiFn = (BYTE*)h + 0xC1580;    // CDWMSwapChain::GetLogicalBackBufferIndex
+    g_lfbiFn = (BYTE*)h + 0xC6DD0;    // CDWMSwapChain::GetLogicalFrontBufferIndex
     BYTE* fn = (BYTE*)h + 0x6C6B0;
 
     // Trampoline = the 28 displaced prologue bytes + jmp back to fn+0x1C. It is
@@ -1549,6 +1590,22 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_PDW10)(void*, void*, void*, void*, void*
 typedef ULONG   (STDMETHODCALLTYPE* PFN_SCBACKIDX)(void*);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_SCGETDEV)(void*, const IID&, void**);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_SCGETBUF)(void*, UINT, const IID&, void**);
+
+// ---- round 71: dwm names its own buffers ------------------------------------
+// PDW (legacy PresentDWM) is hooked but gets ZERO calls on this machine - 1909
+// presents through CDWMSwapChain::PresentInternal, which we already wrap. The
+// wrap's `this` IS a CDWMSwapChain, and dwmcore.pdb gives its own buffer
+// accessors (disasm verified: both read this->[0x1A8] then vtable slot 31 of
+// that object; back takes an extra int in edx - pass 0):
+//   0xC1580 CDWMSwapChain::GetLogicalBackBufferIndex
+//   0xC6DD0 CDWMSwapChain::GetLogicalFrontBufferIndex
+// Calling them inside the wrapper makes dwm itself name the front surf every
+// frame - no offsets, no guessing. Paired with a one-shot scan of the object
+// for pointers to our registered faces (index -> texture mapping).
+typedef UINT (STDMETHODCALLTYPE* PFN_LBIDX1)(void*);
+typedef UINT (STDMETHODCALLTYPE* PFN_LBIDX2)(void*, UINT);
+static void* g_lbbiFn = nullptr;   // dwmcore + 0xC1580
+static void* g_lfbiFn = nullptr;   // dwmcore + 0xC6DD0
 
 // One pixel sample out of the live back buffer: THE capture proof - the
 // composed desktop (windows, taskbar, clock) read from dwm's own present path.
