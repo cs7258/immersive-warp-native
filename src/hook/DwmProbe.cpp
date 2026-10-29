@@ -509,6 +509,20 @@ static void dumpAllCaptures() {
     char b[256];
     for (int i = 0; i < g_capN; i++) {
         if (!g_caps[i]) continue;
+        // round 70: never CopyResource from a texture owned by another device -
+        // the prime suspect for the EFRE device-removed dwm deaths (03:25/03:44)
+        {
+            ID3D11Device* cdev = nullptr;
+            g_caps[i]->GetDevice(&cdev);
+            if (cdev != g_dev) {
+                wsprintfA(b, "dwm: CAPTURE[%d] SKIPPED (cross-device: tex dev=%p g_dev=%p)",
+                          i, (void*)cdev, (void*)g_dev);
+                iwnHookLog(b);
+                if (cdev) cdev->Release();
+                continue;
+            }
+            if (cdev) cdev->Release();
+        }
         D3D11_TEXTURE2D_DESC td;
         __try { g_caps[i]->GetDesc(&td); } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
         // only 32bpp formats get a meaningful flat dump

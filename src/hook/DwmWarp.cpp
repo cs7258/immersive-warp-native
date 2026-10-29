@@ -428,6 +428,37 @@ static BOOL ensureWarpRT() {
     return TRUE;
 }
 
+// ---- round 70: device discipline --------------------------------------------
+// The 03:25 and 03:44 dwm deaths were both DXGI EFRE device-removed crashes,
+// each landing within 20ms of the first capture attempt, with EVERY registered
+// target in copy mode (RTV refused) - i.e. textures our RTV/QI device does not
+// own. Cross-device CopyResource / CopySubresourceRegion is undefined behavior
+// and the prime suspect for the removal; the 17:00 round survived it only
+// because the original payload's resident device topology differed. Rule: any
+// texture not owned by g_dev is logged once and skipped everywhere.
+static BOOL g_tgtDevOk[IWN_MAX_TGT];          // POD zero-init
+
+static BOOL texOnOurDevice(ID3D11Texture2D* t, int slot) {
+    ID3D11Device* d = nullptr;
+    if (t) t->GetDevice(&d);
+    BOOL ok = (d == g_dev && d != nullptr);
+    char b[160];
+    wsprintfA(b, "dwm: DEVCHK tgt%d tex=%p dev=%p g_dev=%p -> %s", slot, (void*)t,
+              (void*)d, (void*)g_dev, ok ? "SAME" : "CROSS-SKIP");
+    iwnHookLog(b);
+    if (d) d->Release();
+    return ok;
+}
+
+static void logDeviceRemoved(const char* where) {
+    static volatile LONG s_rmLogged = 0;      // POD
+    if (!g_dev || InterlockedCompareExchange(&s_rmLogged, 1, 0) != 0) return;
+    HRESULT rr = g_dev->GetDeviceRemovedReason();
+    char b[128];
+    wsprintfA(b, "dwm: DEVICE REMOVED REASON at %s = 0x%08X", where, (unsigned)rr);
+    iwnHookLog(b);
+}
+
 bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
     if (!list || n <= 0) return false;
     char b[256];
@@ -441,14 +472,17 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
         }
         g_tgtN = 0;
         ZeroMemory(g_copyMode, sizeof(g_copyMode));
+        ZeroMemory(g_tgtDevOk, sizeof(g_tgtDevOk));
         for (int i = 0; i < n && g_tgtN < IWN_MAX_TGT; i++) {
             if (!list[i].tex) continue;
             if (!(list[i].desc.BindFlags & D3D11_BIND_RENDER_TARGET)) continue;
+            if (!texOnOurDevice(list[i].tex, g_tgtN)) continue;   // round 70
             ID3D11RenderTargetView* rv = nullptr;
             HRESULT hr2 = g_dev->CreateRenderTargetView(list[i].tex, nullptr, &rv);
             if ((FAILED(hr2) || !rv) && ensureWarpRT()) {
                 // copy-mode fallback: paint via own RT + CopyResource
                 g_copyMode[g_tgtN] = TRUE;
+                g_tgtDevOk[g_tgtN] = TRUE;
                 list[i].tex->AddRef();
                 g_rtvA[g_tgtN] = nullptr;
                 g_tgt[g_tgtN]  = list[i].tex;
@@ -532,10 +566,12 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
     // classic typeless-resource symptom. Retry with an explicit typed desc.
     static BOOL s_rtvDiagDone = FALSE;
     ZeroMemory(g_copyMode, sizeof(g_copyMode));
+    ZeroMemory(g_tgtDevOk, sizeof(g_tgtDevOk));
     for (int i = 0; i < n && g_tgtN < IWN_MAX_TGT; i++) {
         if (!list[i].tex) continue;
         if (!(list[i].desc.BindFlags & D3D11_BIND_RENDER_TARGET)) continue;
         if (list[i].desc.SampleDesc.Count != 1) continue;
+        if (!texOnOurDevice(list[i].tex, i)) continue;            // round 70
         ID3D11RenderTargetView* rv = nullptr;
         HRESULT hr2 = g_dev->CreateRenderTargetView(list[i].tex, nullptr, &rv);
         if (FAILED(hr2) || !rv) {
@@ -590,6 +626,7 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
                 // copy-mode fallback: our own RT + CopyResource (proven path)
                 if (ensureWarpRT()) {
                     g_copyMode[g_tgtN] = TRUE;
+                    g_tgtDevOk[g_tgtN] = TRUE;
                     list[i].tex->AddRef();
                     g_rtvA[g_tgtN] = nullptr;
                     g_tgt[g_tgtN]  = list[i].tex;
@@ -609,6 +646,7 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
         list[i].tex->AddRef();
         g_rtvA[g_tgtN] = rv;
         g_tgt[g_tgtN]  = list[i].tex;
+        g_tgtDevOk[g_tgtN] = TRUE;
         g_tgtN++;
     }
     wsprintfA(b, "dwm: warp RTV-on-composite n=%d", g_tgtN);
@@ -790,6 +828,7 @@ static void paintWarp() {
         for (int i = 0; i < g_tgtN; i++) {
             if (g_copyMode[i]) {
                 if (!g_warpRTV) continue;
+                if (!g_tgtDevOk[i]) continue;        // round 70: cross-device guard
                 g_ctx->OMSetRenderTargets(1, &g_warpRTV, nullptr);
                 g_ctx->Draw(g_vertCount, 0);
                 __try { g_ctx->CopyResource(g_tgt[i], g_warpRT); }
@@ -804,6 +843,7 @@ static void paintWarp() {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
+        logDeviceRemoved("paint");
         iwnHookLog("dwm: warp paint EXCEPTION");
     }
 
@@ -834,6 +874,7 @@ static void drawWireMarkers() {
     D3D11_BOX bx = { 0, 0, 0, 8, 8, 1 };
     for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
         if (!g_tgt[i]) continue;
+        if (!g_tgtDevOk[i]) continue;          // round 70: cross-device guard
         UINT px = kMarkCol[i];
         g_ctx->UpdateSubresource(g_markerTex, 0, nullptr, &px, 32, 0);
         __try {
@@ -847,6 +888,7 @@ static void drawWireMarkers() {
 // the reporter thread: the immediate context is not free-threaded.
 static void readbackPixel(int i, const char* tag) {
     if (!g_stageTex || !g_ctx || i < 0 || i >= g_tgtN || !g_tgt[i]) return;
+    if (!g_tgtDevOk[i]) return;            // round 70: cross-device guard
     __try {
         g_ctx->CopyResource(g_stageTex, g_tgt[i]);
         D3D11_MAPPED_SUBRESOURCE m = {};
@@ -1229,7 +1271,7 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
 static void restoreAllSurfaces(const char* why) {
     __try {
         for (int i = 0; i < g_tgtN; i++) {
-            if (g_tgt[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
+            if (g_tgt[i] && g_tgtDevOk[i]) g_ctx->CopyResource(g_tgt[i], g_twin);
         }
         // This runs once per frame in steady mode; logging every call produced
         // 454 near-identical lines in the 06:41 run. Log every 128th.
@@ -1791,6 +1833,24 @@ void DwmWarpBeforeSubmit() {
             wsprintfA(pb, "PDW: watchdog calls=%ld marks=%ld", (long)g_pdwCalls,
                       (long)g_pdwMarks);
             iwnHookLog(pb);
+        }
+    }
+
+    // round 70: catch device removal the moment it happens, with the reason
+    if (g_dev && g_ready) {
+        static DWORD s_rmLast = 0;         // POD statics - no TLS guard
+        static volatile LONG s_rmCnt = 0;
+        DWORD t2 = GetTickCount();
+        if (t2 - s_rmLast > 2000) {
+            s_rmLast = t2;
+            __try {
+                HRESULT rr = g_dev->GetDeviceRemovedReason();
+                if (FAILED(rr) && InterlockedCompareExchange(&s_rmCnt, 1, 0) == 0) {
+                    char rb[128];
+                    wsprintfA(rb, "dwm: g_dev REMOVED reason=0x%08X (watchdog)", (unsigned)rr);
+                    iwnHookLog(rb);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
         }
     }
 
