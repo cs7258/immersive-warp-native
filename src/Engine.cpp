@@ -815,10 +815,31 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
             bool full = (oc->w == (UINT)(mi.rcMonitor.right - mi.rcMonitor.left) &&
                          oc->h == (UINT)(mi.rcMonitor.bottom - mi.rcMonitor.top));
             if (full && !g_inplace.load()) {
-                m_factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-                HRESULT fs = oc->swap->SetFullscreenState(TRUE, nullptr);
-                if (SUCCEEDED(fs)) { oc->exclusive = true; dbgLog("attach: exclusive fullscreen ON"); }
-                else dbgLog("attach: exclusive fullscreen FAILED hr=" + hresultHex(fs));
+                // Single-screen: exclusive fullscreen makes DWM cull the desktop
+                // (wallpaper/icons/taskbar) from the composition of this display,
+                // so the DD capture of the SAME display goes black - there would
+                // be nothing left to warp (verified by backbuffer readback
+                // 2026-10-30). Stay windowed topmost instead: the WDA exclusion
+                // on the output window keeps the capture recursion-free while
+                // the real desktop stays in the composition. Multi-screen (an
+                // independent source display exists) keeps exclusive scanout.
+                bool solo = true;
+                {
+                    auto displays = enumerateDisplays();
+                    for (auto& d : displays)
+                        if (oc->displayIdx < 0 || oc->displayIdx >= (int)displays.size() ||
+                            !sameDisplayName(d.deviceName, displays[oc->displayIdx].deviceName)) { solo = false; break; }
+                }
+                if (!solo) {
+                    m_factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                    HRESULT fs = oc->swap->SetFullscreenState(TRUE, nullptr);
+                    if (SUCCEEDED(fs)) { oc->exclusive = true; dbgLog("attach: exclusive fullscreen ON"); }
+                    else dbgLog("attach: exclusive fullscreen FAILED hr=" + hresultHex(fs));
+                } else {
+                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+                    dbgLog("attach: single-screen -> windowed topmost (exclusive would cull the desktop source)");
+                }
             } else {
                 dbgLog("attach: windowed (preview/in-place)");
             }
@@ -963,8 +984,36 @@ bool Engine::createDuplication(OutputCtx& oc) {
         if (!(isOutputDisplay(d) && !oc.exclusive)) { src = &d; break; }
     }
     if (!src) {
-        dbgLog("dupl: no source display available (all displays are outputs)");
-        return false;
+        // every display is an output: a window that is invisible to DD capture
+        // (WDA_EXCLUDEFROMCAPTURE, single-screen warp path) or exclusive
+        // fullscreen can still film its own display - the warp surface never
+        // appears in the duplication feed.
+        auto hwndExcluded = [](HWND h) {
+            DWORD aff = 0;
+            return h && GetWindowDisplayAffinity(h, &aff) && (aff & 0x11) != 0; // WDA_EXCLUDEFROMCAPTURE
+        };
+        for (auto& d : displays) {
+            if (!isOutputDisplay(d)) continue;
+            bool self = (oc.displayIdx >= 0 && oc.displayIdx < (int)displays.size() &&
+                         sameDisplayName(d.deviceName, displays[oc.displayIdx].deviceName));
+            bool safe = self ? (oc.exclusive || hwndExcluded(oc.hwnd)) : false;
+            if (!safe) {
+                std::lock_guard<std::mutex> lk(m_outsMutex);
+                for (auto& o : m_outs) {
+                    if (!o || o->displayIdx < 0 || o->displayIdx >= (int)displays.size()) continue;
+                    if (!sameDisplayName(displays[o->displayIdx].deviceName, d.deviceName)) continue;
+                    safe = o->exclusive || hwndExcluded(o->hwnd);
+                    break;
+                }
+            }
+            if (safe) { src = &d; break; }
+        }
+        if (!src) {
+            dbgLog("dupl: no source display available (all displays are outputs)");
+            return false;
+        }
+        dbgLog(std::string("dupl: output display self-capture (capture-excluded window) -> ") +
+               narrow(src->deviceName));
     }
     // The source may sit on any adapter (multi-GPU laptops): walk all of them
     // instead of assuming adapter 0.
