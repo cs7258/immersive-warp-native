@@ -401,11 +401,15 @@ static void probeActiveRT() {
 
 static void dumpAllCaptures();
 static volatile LONG s_capDumped = 0;
+static DWORD g_texScanTick = 0;   // set when texscan finishes; capture anchor
 
 static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
     InterlockedIncrement((volatile LONG*)&g_cntConfirm);
-    // capture-all: fire once well after texscan has run and steady state begun
-    if (g_capN > 0 && g_cntConfirm > 1500 &&
+    // capture-all: fire 20s after texscan (time-anchored - confirm count is
+    // unreliable: dwm idles at ~6 CF/s when the desktop is static, so a count
+    // threshold may never be reached in an unattended run)
+    if (g_capN > 0 && g_texScanTick &&
+        GetTickCount() - g_texScanTick > 20000 &&
         InterlockedCompareExchange(&s_capDumped, 1, 0) == 0) {
         __try { dumpAllCaptures(); }
         __except (EXCEPTION_EXECUTE_HANDLER) { iwnHookLog("dwm: CAPTURE EXCEPTION"); }
@@ -886,6 +890,7 @@ static void scanTextures() {
               hits, big, rtBig, exactBig, g_scrW, g_scrH,
               g_targetN > 0 ? "FOUND target surface(s)" : "no target surface");
     iwnHookLog(b);
+    if (!g_texScanTick) g_texScanTick = GetTickCount();
 
     if (g_targetN > 0) {
         wsprintfA(b, "dwm: registered %d exact-size RT surfaces (engine paints ALL)",
