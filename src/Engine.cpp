@@ -791,8 +791,6 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
     vb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     m_dev->CreateBuffer(&vb, nullptr, &oc->overlayVB);
 
-    createDuplication(*oc);
-
     // cursor vertex buffer: 6 verts of (pos.xy NDC, uv), updated each frame
     {
         D3D11_BUFFER_DESC vb{};
@@ -824,6 +822,12 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
             }
         }
     }
+
+    // DD duplication MUST be created after the exclusive-fullscreen decision:
+    // oc->exclusive feeds the single-monitor recursion guard (the only display
+    // is both source and output when exclusive). Doing it earlier rejects the
+    // sole display -> "no source display available".
+    createDuplication(*oc);
 
     dbgLog(std::string("attach res: swap=") + (oc->swap ? "ok" : "NULL") +
            " backBuf=" + (oc->backBuf ? "ok" : "NULL") +
