@@ -107,6 +107,18 @@ static ID3D11Texture2D* g_markerTex = nullptr; // 8x8 per-face wire marker sourc
 static DWORD          g_t0 = 0;
 static LONG           g_lastLoggedStage = -1;
 
+// ---- round 72: clean-face dump + PrtSc comparison ---------------------------
+// Painting fully suppressed in a 30s quiet window (engine el 30..52s) so every
+// registered face holds dwm's OWN composed frame. Three dump rounds (el 32/42/
+// 52s) write each face to C:\Windows\Temp\iwnf<t>_<r>.raw; the host pairs each
+// dump with the CopyFromScreen shot nearest in time (PNG mtime). The face whose
+// pixels match the shot IS the composed-desktop surface - and LBIDX front/back
+// is logged with every round to bind dwm's own answer to the physical faces.
+static volatile LONG  g_quiet = 0;      // 1 = all painting suppressed
+static volatile LONG  g_dwin = 0;       // 0 none, 1 window active, 2 done
+static volatile LONG  g_lbFrontLast = -1; // updated every present by the wrapper
+static volatile LONG  g_lbBackLast  = -1;
+
 // warp corners as DESTINATION positions (uv fractions of the surface): TL, TR,
 // BL, BR. Default = visible keystone: the drawn desktop becomes a trapezoid
 // (top edge pulled toward the middle), the rest of the surface is cleared to
@@ -914,6 +926,81 @@ static void readbackPixel(int i, const char* tag) {
     }
 }
 
+// ---- round 72: full-face raw dump (engine device only - DEVCHK-proven) ------
+static void writeFaceRaw(const wchar_t* path, ID3D11Texture2D* face) {
+    D3D11_TEXTURE2D_DESC td = {};
+    __try { face->GetDesc(&td); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    D3D11_TEXTURE2D_DESC sd = td;
+    sd.Usage            = D3D11_USAGE_STAGING;
+    sd.BindFlags        = 0;
+    sd.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags        = 0;
+    sd.MipLevels        = 1;
+    sd.ArraySize        = 1;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    ID3D11Texture2D* stg = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &stg)) || !stg) return;
+    g_ctx->CopyResource(stg, face);
+    D3D11_MAPPED_SUBRESOURCE mp;
+    if (SUCCEEDED(g_ctx->Map(stg, 0, D3D11_MAP_READ, 0, &mp)) && mp.pData) {
+        SIZE_T rowBytes = (SIZE_T)td.Width * 4;
+        BYTE* flat = (BYTE*)HeapAlloc(GetProcessHeap(), 0, rowBytes * td.Height);
+        if (flat) {
+            for (UINT y = 0; y < td.Height; y++)
+                CopyMemory(flat + y * rowBytes,
+                           (BYTE*)mp.pData + (SIZE_T)y * mp.RowPitch, rowBytes);
+            HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                DWORD wrote = 0;
+                WriteFile(h, flat, (DWORD)(rowBytes * td.Height), &wrote, nullptr);
+                CloseHandle(h);
+            }
+            HeapFree(GetProcessHeap(), 0, flat);
+        }
+        g_ctx->Unmap(stg, 0);
+    }
+    stg->Release();
+}
+
+// Three dump rounds at engine el 32/42/52s. Called from the CF boundary while
+// the quiet window suppresses every paint path (faces = dwm's own frames).
+static void dumpFacesTick(DWORD el) {
+    static const DWORD kRounds[3] = { 32000, 42000, 52000 };
+    static int s_next = 0;                       // POD static - no TLS guard
+    if (s_next >= 3) return;
+    if (el < kRounds[s_next]) return;
+    int r = s_next + 1;
+    s_next++;
+    char b[192];
+    for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
+        if (!g_tgt[i] || !g_tgtDevOk[i]) continue;
+        wchar_t path[64];
+        {
+            const wchar_t* p1 = L"C:\\Windows\\Temp\\iwnf";
+            const wchar_t* p2 = L".raw";
+            wchar_t* o = path;
+            for (const wchar_t* q = p1; *q; ) *o++ = *q++;
+            *o++ = (wchar_t)(L'0' + i);
+            *o++ = L'_';
+            *o++ = (wchar_t)(L'0' + r);
+            for (const wchar_t* q = p2; *q; ) *o++ = *q++;
+            *o = 0;
+        }
+        __try { writeFaceRaw(path, g_tgt[i]); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+        wsprintfA(b, "FACE DUMP r=%d tgt=%d -> %S front=%ld back=%ld",
+                  r, i, path, (long)g_lbFrontLast, (long)g_lbBackLast);
+        iwnHookLog(b);
+    }
+    if (r == 3) {
+        g_quiet = 0;
+        g_dwin = 2;
+        iwnHookLog("FACE DUMP window closed - paint resumed");
+    }
+}
+
 // ---------------------------------------------------------------- phase machine
 // 00:10 run (dest-keystone + black clear at the ConfirmFrame boundary) gave the
 // unifying fact: dwm renders DIRTY REGIONS only into the composite surfaces.
@@ -1138,7 +1225,7 @@ static BOOL flipPaint() {
     if (InterlockedCompareExchange(&g_flipInspec, 1, 0) == 0)                  \
         IWN_FlipInspect(self);                                                 \
     BOOL painted = FALSE;                                                      \
-    if (g_ready && g_flipHooked && TRAMP) painted = flipPaint();               \
+    if (g_ready && g_flipHooked && TRAMP && !g_quiet) painted = flipPaint();   \
     HRESULT hr = TRAMP(self, a2, a3, a4, a5, a6, a7, a8, a9, a10);             \
     if (painted) g_pendingRestore = 1;   /* restore at next CF */              \
     return hr;
@@ -1241,39 +1328,62 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
     // round 71: dwm names its own buffers (see LBIDX block comment)
     if (g_lfbiFn && self) {
         static volatile LONG s_lbCalls = 0;   // POD statics - no TLS guard
-        static volatile LONG s_lbScan = 0;
+        static volatile LONG s_lbScanSeen = -1;
         __try {
             UINT front = ((PFN_LBIDX1)g_lfbiFn)(self);
             UINT back  = 0xFFFFFFFFu;
             if (g_lbbiFn) back = ((PFN_LBIDX2)g_lbbiFn)(self, 0);
+            g_lbFrontLast = (LONG)front;      // read by dumpFacesTick (benign race)
+            g_lbBackLast  = (LONG)back;
             LONG c = InterlockedIncrement(&s_lbCalls);
-            if (c == 1 || (c & 255) == 0) {
+            if (c == 1 || (c & 255) == 0 || (g_quiet && (c & 63) == 0)) {
                 char b[128];
                 wsprintfA(b, "LBIDX: front=%lu back=%lu self=%p",
                           (unsigned long)front, (unsigned long)back, self);
                 iwnHookLog(b);
             }
-            if (InterlockedCompareExchange(&s_lbScan, 1, 0) == 0 && g_tgtN > 0) {
+            // re-arming face-pointer scan: runs whenever the registered target
+            // count changes (the first call usually precedes engine attach).
+            // Scans self AND the [0x1A8] object (what the accessors index
+            // through) 0x800 bytes each, logging EVERY hit with its offset -
+            // buffer arrays would show the faces at fixed strides.
+            if (g_tgtN > 0 && s_lbScanSeen != g_tgtN) {
+                s_lbScanSeen = g_tgtN;
                 char b[160];
+                int hits = 0;
                 for (int t = 0; t < g_tgtN; t++) {
                     if (!g_tgt[t]) continue;
-                    for (DWORD off = 0; off + 8 <= 0x400; off += 8) {
+                    for (DWORD off = 0; off + 8 <= 0x800; off += 8) {
                         if (!IsBadReadPtr((char*)self + off, 8) &&
                             *(void* volatile*)((char*)self + off) == (void*)g_tgt[t]) {
-                            wsprintfA(b, "LBIDX: tgt%d texture found at self+0x%lX",
+                            wsprintfA(b, "LBIDX: tgt%d texture at self+0x%lX",
                                       t, (unsigned long)off);
                             iwnHookLog(b);
-                            break;
+                            hits++;
                         }
                     }
                 }
-                // also map the [0x1A8]/[0x1A0] pair the accessors use
                 void* oA = IsBadReadPtr((char*)self + 0x1a8, 8)
                          ? nullptr : *(void**)((char*)self + 0x1a8);
-                UINT  vA = IsBadReadPtr((char*)self + 0x1a0, 4)
-                         ? 0 : *(UINT*)((char*)self + 0x1a0);
+                UINT vA = IsBadReadPtr((char*)self + 0x1a0, 4)
+                        ? 0 : *(UINT*)((char*)self + 0x1a0);
                 wsprintfA(b, "LBIDX: self+1A8=%p self+1A0=%08X", oA, vA);
                 iwnHookLog(b);
+                if (oA && !IsBadReadPtr(oA, 8)) {
+                    for (int t = 0; t < g_tgtN; t++) {
+                        if (!g_tgt[t]) continue;
+                        for (DWORD off = 8; off + 8 <= 0x800; off += 8) {
+                            if (!IsBadReadPtr((char*)oA + off, 8) &&
+                                *(void* volatile*)((char*)oA + off) == (void*)g_tgt[t]) {
+                                wsprintfA(b, "LBIDX: tgt%d texture at objA+0x%lX",
+                                          t, (unsigned long)off);
+                                iwnHookLog(b);
+                                hits++;
+                            }
+                        }
+                    }
+                }
+                if (!hits) iwnHookLog("LBIDX: no tgt pointers in self/objA 0x800 window");
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { }
     }
@@ -1286,7 +1396,7 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
         return g_presentTramp(self, a2, a3, a4, a5);
     }
     BOOL painted = FALSE;
-    if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx) {
+    if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && !g_quiet) {
         DWORD t = GetTickCount();
         if (t != g_lastPaintTick) {            // one paint per compose
             g_lastPaintTick = t;
@@ -1863,6 +1973,16 @@ void DwmWarpBeforeSubmit() {
     }
 
     if (ph == IWN_PH_IDLE) return;
+
+    // round 72: quiet dump window (see the globals block comment). Opened once
+    // at el=30s; dumpFacesTick fires the three rounds and closes it at 52s.
+    if (g_dwin == 0 && el > 30000) {
+        g_dwin = 1;
+        g_quiet = 1;
+        iwnHookLog("FACE DUMP window open (paint quiet until el=52s)");
+    }
+    if (g_dwin == 1) dumpFacesTick(el);
+
     if ((LONG)g_stage == IWN_PH_PRESNT) {
         // Deferred restore from the previous present (mirrors phase B). Done
         // at CF because dwm draws window content after CF - nothing fresh is
@@ -1912,7 +2032,7 @@ void DwmWarpBeforeSubmit() {
     }
 
     InterlockedIncrement(&g_frames);
-    paintAtConfirmFrame(ph);
+    if (!g_quiet) paintAtConfirmFrame(ph);
 
     if (g_fail > 30) {
         g_ready = 0;
