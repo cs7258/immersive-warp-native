@@ -699,19 +699,23 @@ static void restoreAllSurfaces(const char* why);   // defined below the wrapper
 // unwarped - PresentInternal composes the window dirty rects AFTER its entry
 // and before the real flip, so the window regions of our paint are redrawn
 // straight. The only point where the frame is final AND pre-scanout is the
-// inner present call. Static disassembly of PresentInternal (0x6C6B0):
-//   rax=[self+0x10]; rcx=[rax+0x50]; rcx=[rcx+0xf0]        (inner object)
-//   rax=[rcx]; rax=[rax+0x68]                              (vtable SLOT 13)
-//   call [rip+0x20f399]                                    (CFG dispatch)
-// and the return is compared against 0x87A0001 (DXGI_STATUS_OCCLUDED) - this
-// IS the present. The class is dwmcore-internal (its vtable is NOT in
-// dxgi.dll, which is why the first dxgi-only probe found nothing).
-static HRESULT (STDMETHODCALLTYPE* g_flipTramp)(void*, void*, void*, void*, void*,
-                                                void*, void*, void*, void*, void*) = nullptr;
+// inner present call. Static disassembly of PresentInternal (0x6C6B0) shows
+// TWO mutually exclusive branches that both feed the same continuation, which
+// compares the return against 0x87A0001 (DXGI_STATUS_OCCLUDED):
+//   path A: r15=[self+0x1a8]; rax=[r15]; rax=[rax+0x80]   -> SLOT 16 of [self+0x1a8]
+//   path B: c=[[[self+0x10]+0x50]+0xf0]; rax=[c]; [rax+0x68] -> SLOT 13 of the chain
+// 08:53 run: patching only slot 13 froze the paint (frames stuck at 18) - the
+// live desktop took path A. Both slots are now patched with the same paint.
+static HRESULT (STDMETHODCALLTYPE* g_flipTrampA)(void*, void*, void*, void*, void*,
+                                                 void*, void*, void*, void*, void*) = nullptr;
+static HRESULT (STDMETHODCALLTYPE* g_flipTrampB)(void*, void*, void*, void*, void*,
+                                                 void*, void*, void*, void*, void*) = nullptr;
 static volatile LONG g_flipTry   = 0;
 static volatile LONG g_flipHooked = 0;
-static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, void* a2, void* a3, void* a4, void* a5,
-                                              void* a6, void* a7, void* a8, void* a9, void* a10);
+static HRESULT STDMETHODCALLTYPE IWN_FlipWrapA(void* self, void* a2, void* a3, void* a4, void* a5,
+                                               void* a6, void* a7, void* a8, void* a9, void* a10);
+static HRESULT STDMETHODCALLTYPE IWN_FlipWrapB(void* self, void* a2, void* a3, void* a4, void* a5,
+                                               void* a6, void* a7, void* a8, void* a9, void* a10);
 
 static HMODULE moduleFromPtr(const void* p) {
     HMODULE h = nullptr;
@@ -722,100 +726,120 @@ static HMODULE moduleFromPtr(const void* p) {
     return h;
 }
 
+// Shared paint body: fresh clean snapshot -> black clear -> keystone paint.
+// Returns TRUE when draws happened (caller then defers the restore).
+static BOOL flipPaint() {
+    if (!(g_ready && (LONG)g_stage == IWN_PH_PRESNT && g_ctx)) return FALSE;
+    DWORD t = GetTickCount();
+    if (t == g_lastPaintTick) return FALSE;      // one paint per compose
+    g_lastPaintTick = t;
+    InterlockedIncrement(&g_frames);
+    __try {
+        g_ctx->CopyResource(g_twin, g_target);   // clean COMPLETE frame
+        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        for (int i = 0; i < g_tgtN; i++) {
+            if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: warp save EXCEPTION (flip)");
+    }
+    int before = (int)g_draws;
+    paintWarp();
+    if ((int)g_draws == before) {
+        if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (flip)");
+        return FALSE;
+    }
+    if (!g_proofWarp) {
+        g_proofWarp = 1;
+        readbackPixel(0, "warp-flip");
+    }
+    return TRUE;
+}
+
+#define FLIP_BODY(TRAMP)                                                       \
+    BOOL painted = FALSE;                                                      \
+    if (g_ready && g_flipHooked && TRAMP) painted = flipPaint();               \
+    HRESULT hr = TRAMP(self, a2, a3, a4, a5, a6, a7, a8, a9, a10);             \
+    if (painted) g_pendingRestore = 1;   /* restore at next CF */              \
+    return hr;
+
+static HRESULT STDMETHODCALLTYPE IWN_FlipWrapA(void* self, void* a2, void* a3, void* a4, void* a5,
+                                               void* a6, void* a7, void* a8, void* a9, void* a10) {
+    FLIP_BODY(g_flipTrampA)
+}
+
+static HRESULT STDMETHODCALLTYPE IWN_FlipWrapB(void* self, void* a2, void* a3, void* a4, void* a5,
+                                               void* a6, void* a7, void* a8, void* a9, void* a10) {
+    FLIP_BODY(g_flipTrampB)
+}
+
+// patch one vtable slot; returns the original target or nullptr
+static void* patchVtableSlot(void* obj, int slot, void* hook, const char* tag) {
+    if (!obj || IsBadReadPtr(obj, 8)) return nullptr;
+    void** vt = *(void***)obj;
+    if (!vt || IsBadReadPtr(vt, (slot + 1) * 8)) return nullptr;
+    void* orig = vt[slot];
+    HMODULE om = moduleFromPtr(orig);
+    DWORD op = 0;
+    if (!VirtualProtect(&vt[slot], 8, PAGE_READWRITE, &op)) {
+        char b[128];
+        wsprintfA(b, "dwm: flip hook VP failed (%s) gle=%lu", tag, GetLastError());
+        iwnHookLog(b);
+        return nullptr;
+    }
+    vt[slot] = hook;
+    DWORD op2 = 0;
+    VirtualProtect(&vt[slot], 8, op, &op2);
+    char b[160];
+    wsprintfA(b, "dwm: FLIP HOOK %s installed (vtable %p slot%d prev=%p mod=%p)",
+              tag, (void*)vt, slot, orig, (void*)om);
+    iwnHookLog(b);
+    return orig;
+}
+
 static void tryInstallFlipHook(void* self) {
     if (InterlockedCompareExchange(&g_flipTry, 1, 0) != 0) return;
     char* s = (char*)self;
+    // path A object: direct member
+    void* objA = nullptr;
+    if (!IsBadReadPtr(s + 0x1a8, 8)) objA = *(void**)(s + 0x1a8);
+    void* oA = patchVtableSlot(objA, 16, (void*)&IWN_FlipWrapA, "A[slot16]");
+    if (oA) {
+        g_flipTrampA = (HRESULT (STDMETHODCALLTYPE*)(void*, void*, void*, void*, void*,
+                                                     void*, void*, void*, void*, void*))oA;
+        g_flipHooked = 1;
+    }
+    // path B object: three-hop member chain
     void* c1 = nullptr;
     void* c2 = nullptr;
-    void* obj = nullptr;
+    void* objB = nullptr;
     if (!IsBadReadPtr(s + 0x10, 8))                       c1 = *(void**)(s + 0x10);
     if (c1 && !IsBadReadPtr((char*)c1 + 0x50, 8))         c2 = *(void**)((char*)c1 + 0x50);
-    if (c2 && !IsBadReadPtr((char*)c2 + 0xf0, 8))         obj = *(void**)((char*)c2 + 0xf0);
-    if (!obj || IsBadReadPtr(obj, 8)) {
-        iwnHookLog("dwm: flip hook NOT found (member chain unreadable)");
+    if (c2 && !IsBadReadPtr((char*)c2 + 0xf0, 8))         objB = *(void**)((char*)c2 + 0xf0);
+    void* oB = patchVtableSlot(objB, 13, (void*)&IWN_FlipWrapB, "B[slot13]");
+    if (oB) {
+        g_flipTrampB = (HRESULT (STDMETHODCALLTYPE*)(void*, void*, void*, void*, void*,
+                                                     void*, void*, void*, void*, void*))oB;
+        g_flipHooked = 1;
+    }
+    if (!g_flipHooked) {
+        iwnHookLog("dwm: flip hook NOT found (neither branch object patched)");
         return;
     }
-    void** vt = *(void***)obj;
-    if (!vt || IsBadReadPtr(vt, 16 * 8)) {
-        iwnHookLog("dwm: flip hook NOT found (vtable unreadable)");
-        return;
-    }
-    // one-time map of the vtable so the log tells us exactly which class/slot
-    for (int i = 0; i < 16; i++) {
-        HMODULE m = moduleFromPtr(vt[i]);
-        char b[128];
-        if (m) wsprintfA(b, "dwm: flip vt[%d] = %p (mod %p rva 0x%lX)",
-                         i, vt[i], (void*)m, (unsigned long)((char*)vt[i] - (char*)m));
-        else   wsprintfA(b, "dwm: flip vt[%d] = %p (no module)", i, vt[i]);
-        iwnHookLog(b);
-    }
-    if (IsBadReadPtr(&vt[13], 8)) {
-        iwnHookLog("dwm: flip hook NOT found (slot 13 unreadable)");
-        return;
-    }
-    void* orig = vt[13];
-    HMODULE om = moduleFromPtr(orig);
-    DWORD op = 0;
-    if (!VirtualProtect(&vt[13], 8, PAGE_READWRITE, &op)) {
-        char b[128];
-        wsprintfA(b, "dwm: flip hook VP failed gle=%lu", GetLastError());
-        iwnHookLog(b);
-        return;
-    }
-    vt[13] = (void*)&IWN_FlipWrap;
-    DWORD op2 = 0;
-    VirtualProtect(&vt[13], 8, op, &op2);
-    // CFG: the new target is manual-mapped RWX code, a non-image executable
-    // page, which is a valid indirect-call target by default (the IAT detours
-    // already rely on exactly that).
-    g_flipTramp = (HRESULT (STDMETHODCALLTYPE*)(void*, void*, void*, void*, void*,
-                                                void*, void*, void*, void*, void*))orig;
-    g_flipHooked = 1;
-    char b[160];
-    wsprintfA(b, "dwm: FLIP HOOK installed (vtable %p slot13 prev=%p mod=%p)",
-              (void*)vt, orig, (void*)om);
-    iwnHookLog(b);
-}
-
-// Paints the warp at the inner present: the frame is final here (wallpaper AND
-// windows) and the present consumes what we paint. 10-arg forwarder - the
-// static call site passes 4 register args plus 6 stack args.
-static HRESULT STDMETHODCALLTYPE IWN_FlipWrap(void* self, void* a2, void* a3, void* a4, void* a5,
-                                              void* a6, void* a7, void* a8, void* a9, void* a10) {
-    BOOL painted = FALSE;
-    if (g_ready && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && g_flipTramp) {
-        DWORD t = GetTickCount();
-        if (t != g_lastPaintTick) {            // one paint per compose
-            g_lastPaintTick = t;
-            InterlockedIncrement(&g_frames);
-            __try {
-                g_ctx->CopyResource(g_twin, g_target); // clean COMPLETE frame
-                const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-                for (int i = 0; i < g_tgtN; i++) {
-                    if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                InterlockedIncrement(&g_fail);
-                iwnHookLog("dwm: warp save EXCEPTION (flip)");
-            }
-            int before = (int)g_draws;
-            paintWarp();
-            if ((int)g_draws == before) {
-                if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (flip)");
-            } else {
-                painted = TRUE;
-                if (!g_proofWarp) {
-                    g_proofWarp = 1;
-                    readbackPixel(0, "warp-flip");
-                }
-            }
+    // one-time map of path A's vtable so the log tells us which class it is
+    if (objA && !IsBadReadPtr(objA, 8)) {
+        void** vt = *(void***)objA;
+        for (int i = 0; vt && !IsBadReadPtr(vt, 18 * 8) && i < 18; i++) {
+            HMODULE m = moduleFromPtr(vt[i]);
+            char b[128];
+            if (m) wsprintfA(b, "dwm: flipA vt[%d] = %p (mod %p rva 0x%lX)",
+                             i, vt[i], (void*)m, (unsigned long)((char*)vt[i] - (char*)m));
+            else   wsprintfA(b, "dwm: flipA vt[%d] = %p (no module)", i, vt[i]);
+            iwnHookLog(b);
         }
     }
-    HRESULT hr = g_flipTramp(self, a2, a3, a4, a5, a6, a7, a8, a9, a10);
-    if (painted) g_pendingRestore = 1;   // restore at next CF (proven policy)
-    return hr;
 }
-
 // Paints the warp into all candidates while dwm is inside PresentInternal,
 // i.e. after its render is final and before the real present runs.
 static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3, void* a4, UINT64 a5) {
