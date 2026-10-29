@@ -228,16 +228,27 @@ SamplerState samp : register(s0);
 float4 main(COut i) : SV_Target { return tex.Sample(samp, i.uv); }
 )";
 
+static void dbgLog(const std::string& line);   // defined below (used by init paths)
+
 bool Engine::init() {
-    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&m_factory))) return false;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&m_factory)))
+        { dbgLog("init: CreateDXGIFactory1 FAILED"); return false; }
     IDXGIAdapter1* adapter = nullptr;
-    if (FAILED(m_factory->EnumAdapters1(0, &adapter))) return false;
+    if (FAILED(m_factory->EnumAdapters1(0, &adapter)))
+        { dbgLog("init: EnumAdapters1(0) FAILED"); return false; }
+    DXGI_ADAPTER_DESC1 ad{};
+    if (adapter->GetDesc1(&ad) == S_OK) {
+        char nb[129] = {}; WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, nb, 128, nullptr, nullptr);
+        dbgLog(std::string("init: adapter0='") + nb + "' dedMB=" + std::to_string(ad.DedicatedVideoMemory / (1024 * 1024)));
+    }
     D3D_FEATURE_LEVEL fl{};
     HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION, &m_dev, &fl, &m_ctx);
     adapter->Release();
-    if (FAILED(hr)) return false;
-    if (!compileShaders()) return false;
+    if (FAILED(hr)) { dbgLog("init: D3D11CreateDevice FAILED hr=0x" + [&]{ char b[16]; snprintf(b, sizeof b, "%08lX", (unsigned long)hr); return std::string(b); }()); return false; }
+    dbgLog("init: device ok fl=0x" + std::to_string(fl));
+    if (!compileShaders()) { dbgLog("init: compileShaders FAILED (see shader: lines)"); return false; }
+    dbgLog("init: shaders ok");
 
     D3D11_SAMPLER_DESC sd{};
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -246,77 +257,87 @@ bool Engine::init() {
     // anisotropy keeps projected grid lines crisp), 3 = bi-cubic (same linear
     // hardware sampler - the shader does 16 catmull-rom taps itself)
     sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-    m_dev->CreateSamplerState(&sd, &m_samplers[0]);
+    if (FAILED(m_dev->CreateSamplerState(&sd, &m_samplers[0]))) dbgLog("init: sampler0 FAILED");
     sd.Filter = D3D11_FILTER_ANISOTROPIC; sd.MaxAnisotropy = 4;
-    m_dev->CreateSamplerState(&sd, &m_samplers[1]);
+    if (FAILED(m_dev->CreateSamplerState(&sd, &m_samplers[1]))) dbgLog("init: sampler1 FAILED");
     sd.MaxAnisotropy = 8;
-    m_dev->CreateSamplerState(&sd, &m_samplers[2]);
+    if (FAILED(m_dev->CreateSamplerState(&sd, &m_samplers[2]))) dbgLog("init: sampler2 FAILED");
     sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-    m_dev->CreateSamplerState(&sd, &m_samplers[3]);
+    if (FAILED(m_dev->CreateSamplerState(&sd, &m_samplers[3]))) dbgLog("init: sampler3 FAILED");
     m_sampIdx.store(0);
 
     D3D11_RASTERIZER_DESC rd{};
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
-    m_dev->CreateRasterizerState(&rd, &m_raster);
+    if (FAILED(m_dev->CreateRasterizerState(&rd, &m_raster))) dbgLog("init: rasterizer FAILED");
 
     D3D11_BLEND_DESC bd{};
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    m_dev->CreateBlendState(&bd, &m_blendOpaque);
+    if (FAILED(m_dev->CreateBlendState(&bd, &m_blendOpaque))) dbgLog("init: blendOpaque FAILED");
+    dbgLog("init: done");
     return true;
 }
 
 bool Engine::compileShaders() {
     ID3DBlob* vs = nullptr; ID3DBlob* err = nullptr;
     if (FAILED(D3DCompile(g_vsSrc, strlen(g_vsSrc), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vs, &err)))
-        { if (err) err->Release(); return false; }
-    m_dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &m_vs);
+        { if (err) { dbgLog(std::string("shader: vs main FAILED: ") + (const char*)err->GetBufferPointer()); err->Release(); } return false; }
+    if (FAILED(m_dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &m_vs)))
+        dbgLog("shader: CreateVertexShader(main) FAILED");
     D3D11_INPUT_ELEMENT_DESC il[] = {
         { "SRC",  0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "DEST", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "NOM",  0, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
-    m_dev->CreateInputLayout(il, 3, vs->GetBufferPointer(), vs->GetBufferSize(), &m_layout);
+    if (FAILED(m_dev->CreateInputLayout(il, 3, vs->GetBufferPointer(), vs->GetBufferSize(), &m_layout)))
+        dbgLog("shader: CreateInputLayout(main) FAILED");
     vs->Release();
 
     ID3DBlob* ps = nullptr;
     if (FAILED(D3DCompile(g_psSrc, strlen(g_psSrc), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &ps, &err)))
-        { if (err) err->Release(); return false; }
-    m_dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &m_ps);
+        { if (err) { dbgLog(std::string("shader: ps main FAILED: ") + (const char*)err->GetBufferPointer()); err->Release(); } return false; }
+    if (FAILED(m_dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &m_ps)))
+        dbgLog("shader: CreatePixelShader(main) FAILED");
     ps->Release();
 
     ID3DBlob* vso = nullptr;
     if (FAILED(D3DCompile(g_vsOvSrc, strlen(g_vsOvSrc), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vso, &err)))
-        { if (err) err->Release(); return false; }
-    m_dev->CreateVertexShader(vso->GetBufferPointer(), vso->GetBufferSize(), nullptr, &m_vsOv);
+        { if (err) { dbgLog(std::string("shader: vs overlay FAILED: ") + (const char*)err->GetBufferPointer()); err->Release(); } return false; }
+    if (FAILED(m_dev->CreateVertexShader(vso->GetBufferPointer(), vso->GetBufferSize(), nullptr, &m_vsOv)))
+        dbgLog("shader: CreateVertexShader(overlay) FAILED");
     D3D11_INPUT_ELEMENT_DESC ilo[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
-    m_dev->CreateInputLayout(ilo, 2, vso->GetBufferPointer(), vso->GetBufferSize(), &m_layoutOv);
+    if (FAILED(m_dev->CreateInputLayout(ilo, 2, vso->GetBufferPointer(), vso->GetBufferSize(), &m_layoutOv)))
+        dbgLog("shader: CreateInputLayout(overlay) FAILED");
     vso->Release();
 
     ID3DBlob* pso = nullptr;
     if (FAILED(D3DCompile(g_psOvSrc, strlen(g_psOvSrc), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &pso, &err)))
-        { if (err) err->Release(); return false; }
-    m_dev->CreatePixelShader(pso->GetBufferPointer(), pso->GetBufferSize(), nullptr, &m_psOv);
+        { if (err) { dbgLog(std::string("shader: ps overlay FAILED: ") + (const char*)err->GetBufferPointer()); err->Release(); } return false; }
+    if (FAILED(m_dev->CreatePixelShader(pso->GetBufferPointer(), pso->GetBufferSize(), nullptr, &m_psOv)))
+        dbgLog("shader: CreatePixelShader(overlay) FAILED");
     pso->Release();
 
     // cursor: textured quad, alpha blended on top of the warp surface
     ID3DBlob* vsc = nullptr;
     if (FAILED(D3DCompile(g_vsCurSrc, strlen(g_vsCurSrc), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsc, &err)))
-        { if (err) err->Release(); return false; }
-    m_dev->CreateVertexShader(vsc->GetBufferPointer(), vsc->GetBufferSize(), nullptr, &m_vsCur);
+        { if (err) { dbgLog(std::string("shader: vs cursor FAILED: ") + (const char*)err->GetBufferPointer()); err->Release(); } return false; }
+    if (FAILED(m_dev->CreateVertexShader(vsc->GetBufferPointer(), vsc->GetBufferSize(), nullptr, &m_vsCur)))
+        dbgLog("shader: CreateVertexShader(cursor) FAILED");
     D3D11_INPUT_ELEMENT_DESC ilc[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
-    m_dev->CreateInputLayout(ilc, 2, vsc->GetBufferPointer(), vsc->GetBufferSize(), &m_layoutCur);
+    if (FAILED(m_dev->CreateInputLayout(ilc, 2, vsc->GetBufferPointer(), vsc->GetBufferSize(), &m_layoutCur)))
+        dbgLog("shader: CreateInputLayout(cursor) FAILED");
     vsc->Release();
     ID3DBlob* psc = nullptr;
     if (FAILED(D3DCompile(g_psCurSrc, strlen(g_psCurSrc), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psc, &err)))
-        { if (err) err->Release(); return false; }
-    m_dev->CreatePixelShader(psc->GetBufferPointer(), psc->GetBufferSize(), nullptr, &m_psCur);
+        { if (err) { dbgLog(std::string("shader: ps cursor FAILED: ") + (const char*)err->GetBufferPointer()); err->Release(); } return false; }
+    if (FAILED(m_dev->CreatePixelShader(psc->GetBufferPointer(), psc->GetBufferSize(), nullptr, &m_psCur)))
+        dbgLog("shader: CreatePixelShader(cursor) FAILED");
     psc->Release();
     D3D11_BLEND_DESC bd2{};
     bd2.RenderTarget[0].BlendEnable = TRUE;
