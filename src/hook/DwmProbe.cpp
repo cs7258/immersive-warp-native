@@ -399,6 +399,69 @@ static void probeActiveRT() {
     rtv->Release();
 }
 
+static void dumpAllCaptures();
+
+static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
+    InterlockedIncrement((volatile LONG*)&g_cntConfirm);
+    // capture-all: fire once well after texscan has run and steady state begun
+    if (g_capN > 0 && g_cntConfirm > 1500 &&
+        InterlockedCompareExchange(&s_capDumped, 1, 0) == 0) {
+        __try { dumpAllCaptures(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { iwnHookLog("dwm: CAPTURE EXCEPTION"); }
+    }
+    probeActiveRT();
+    // 纹理扫描已经登记了候选合成表面时，在提交边界做一次性像素读回。
+    // 放在这里而不是扫描线程：immediate context 不是线程安全的，只有在
+    // dwm 自己把这一帧推出去的这一刻用它才安全。
+    //
+    // 像素验证通过后，把这张表面交给扭曲引擎（Stage 1）。引擎自己 AddRef，
+    // 我们随后释放自己这一份引用 —— 谁持有谁负责，不重复保留。
+    if (g_targetN > 0 && InterlockedCompareExchange(&g_proofDone, 1, 0) == 0) {
+        proveTextureIsDesktop(g_targets[0], g_tdescs[0]);
+        IWNWarpTarget list[IWN_PROBE_MAX_TGT];
+        for (int i = 0; i < g_targetN; i++) {
+            list[i].tex = g_targets[i];
+            list[i].desc = g_tdescs[i];
+        }
+        bool ok = DwmWarpAttachTargets(list, g_targetN);
+        iwnHookLog(ok ? "dwm: warp attach OK" : "dwm: warp attach FAILED");
+        // NOTE: the PresentInternal detour is NOT installed here anymore. Both
+        // 00:40 and 00:59 runs show dwm dying ~1s after install (WER event:
+        // 0xC0000005 with faulting IP in UNKNOWN/private memory = a live thread
+        // fetched the 12-byte patch half-written and jumped to a torn garbage
+        // address). It is now installed lazily at phase C entry, so phases A/B
+        // (pure ConfirmFrame painting) get a clean 16s window first.
+        for (int i = 0; i < g_targetN; i++) {
+            __try { g_targets[i]->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            g_targets[i] = nullptr;
+        }
+        g_targetN = 0;
+        g_targetTex = nullptr;
+    }
+
+    // 双侧结构：提交前存干净副本 + 画扭曲，提交后恢复。
+    // 与原版 forcePreserveBB 同构，也是"屏幕扭曲、截图矩形"的唯一分离点。
+    DwmWarpBeforeSubmit();
+    typedef LONG(WINAPI* PF)(void*, void*, void*, void*);
+    LONG r = g_origConfirm ? ((PF)g_origConfirm)(a1, a2, a3, a4) : 0;
+    DwmWarpAfterSubmit();
+    return r;
+}
+
+static LONG WINAPI HookRetireFrame(void* a1, void* a2, void* a3, void* a4) {
+    InterlockedIncrement((volatile LONG*)&g_cntRetire);
+    typedef LONG(WINAPI* PF)(void*, void*, void*, void*);
+    return g_origRetire ? ((PF)g_origRetire)(a1, a2, a3, a4) : 0;
+}
+
+// ------------------------------------------------- 晚注入：从内存里找回 dwm 的 D3D11 设备
+// 本 DLL 通常是在 dwm 已经建好 D3D11 设备之后才注入的，D3D11CreateDevice 不会再来
+// 第二次 —— 于是拿不到设备、也就拿不到合成 RT（实测 rtset=0 / rt=0x0 / fl=0）。
+// 但 dwm 进程里必然存在活的 ID3D11Device / ID3D11DeviceContext 对象，用下面的
+// vtable 指纹法把它们找出来（不调用任何未验证的指针）。
+static HMODULE g_coreMod = nullptr;
+static ID3D11Device* g_dev = nullptr;
+
 // ---- capture-all dump (2026-10-29 user-directed experiment) ------------------
 // Copy every screen-size texture we enumerated out to C:\Windows\Temp\iwncap<N>.raw
 // (raw BGRA, pitch removed). The host compares each against PrintScreen: the
@@ -488,66 +551,6 @@ static void dumpAllCaptures() {
     iwnHookLog(b);
 }
 
-static LONG WINAPI HookConfirmFrame(void* a1, void* a2, void* a3, void* a4) {
-    InterlockedIncrement((volatile LONG*)&g_cntConfirm);
-    // capture-all: fire once well after texscan has run and steady state begun
-    if (g_capN > 0 && g_cntConfirm > 1500 &&
-        InterlockedCompareExchange(&s_capDumped, 1, 0) == 0) {
-        __try { dumpAllCaptures(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { iwnHookLog("dwm: CAPTURE EXCEPTION"); }
-    }
-    probeActiveRT();
-    // 纹理扫描已经登记了候选合成表面时，在提交边界做一次性像素读回。
-    // 放在这里而不是扫描线程：immediate context 不是线程安全的，只有在
-    // dwm 自己把这一帧推出去的这一刻用它才安全。
-    //
-    // 像素验证通过后，把这张表面交给扭曲引擎（Stage 1）。引擎自己 AddRef，
-    // 我们随后释放自己这一份引用 —— 谁持有谁负责，不重复保留。
-    if (g_targetN > 0 && InterlockedCompareExchange(&g_proofDone, 1, 0) == 0) {
-        proveTextureIsDesktop(g_targets[0], g_tdescs[0]);
-        IWNWarpTarget list[IWN_PROBE_MAX_TGT];
-        for (int i = 0; i < g_targetN; i++) {
-            list[i].tex = g_targets[i];
-            list[i].desc = g_tdescs[i];
-        }
-        bool ok = DwmWarpAttachTargets(list, g_targetN);
-        iwnHookLog(ok ? "dwm: warp attach OK" : "dwm: warp attach FAILED");
-        // NOTE: the PresentInternal detour is NOT installed here anymore. Both
-        // 00:40 and 00:59 runs show dwm dying ~1s after install (WER event:
-        // 0xC0000005 with faulting IP in UNKNOWN/private memory = a live thread
-        // fetched the 12-byte patch half-written and jumped to a torn garbage
-        // address). It is now installed lazily at phase C entry, so phases A/B
-        // (pure ConfirmFrame painting) get a clean 16s window first.
-        for (int i = 0; i < g_targetN; i++) {
-            __try { g_targets[i]->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { }
-            g_targets[i] = nullptr;
-        }
-        g_targetN = 0;
-        g_targetTex = nullptr;
-    }
-
-    // 双侧结构：提交前存干净副本 + 画扭曲，提交后恢复。
-    // 与原版 forcePreserveBB 同构，也是"屏幕扭曲、截图矩形"的唯一分离点。
-    DwmWarpBeforeSubmit();
-    typedef LONG(WINAPI* PF)(void*, void*, void*, void*);
-    LONG r = g_origConfirm ? ((PF)g_origConfirm)(a1, a2, a3, a4) : 0;
-    DwmWarpAfterSubmit();
-    return r;
-}
-
-static LONG WINAPI HookRetireFrame(void* a1, void* a2, void* a3, void* a4) {
-    InterlockedIncrement((volatile LONG*)&g_cntRetire);
-    typedef LONG(WINAPI* PF)(void*, void*, void*, void*);
-    return g_origRetire ? ((PF)g_origRetire)(a1, a2, a3, a4) : 0;
-}
-
-// ------------------------------------------------- 晚注入：从内存里找回 dwm 的 D3D11 设备
-// 本 DLL 通常是在 dwm 已经建好 D3D11 设备之后才注入的，D3D11CreateDevice 不会再来
-// 第二次 —— 于是拿不到设备、也就拿不到合成 RT（实测 rtset=0 / rt=0x0 / fl=0）。
-// 但 dwm 进程里必然存在活的 ID3D11Device / ID3D11DeviceContext 对象，用下面的
-// vtable 指纹法把它们找出来（不调用任何未验证的指针）。
-static HMODULE g_coreMod = nullptr;
-static ID3D11Device* g_dev = nullptr;
 static volatile LONG g_scanRounds = 0;
 
 // ------------------------------------------------ 设备定位（不做任何盲虚调用）
