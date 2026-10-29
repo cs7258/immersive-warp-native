@@ -248,6 +248,8 @@ bool Engine::init() {
     adapter->Release();
     if (FAILED(hr)) { dbgLog("init: D3D11CreateDevice FAILED hr=0x" + [&]{ char b[16]; snprintf(b, sizeof b, "%08lX", (unsigned long)hr); return std::string(b); }()); return false; }
     dbgLog("init: device ok fl=0x" + std::to_string(fl));
+    m_dev->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&m_ctx1);
+    if (!m_ctx1) dbgLog("init: no ID3D11DeviceContext1 - recursion selftest disabled");
     if (!compileShaders()) { dbgLog("init: compileShaders FAILED (see shader: lines)"); return false; }
     dbgLog("init: shaders ok");
 
@@ -834,11 +836,62 @@ bool Engine::attachOutput(int displayIdx, HWND hwnd) {
            " rtv=" + (oc->rtv ? "ok" : "NULL") +
            " frameCB=" + (oc->frameCB ? "ok" : "NULL") +
            " overlayVB=" + (oc->overlayVB ? "ok" : "NULL"));
+    // arm the recursion selftest for this attach: 5 marker frames, then the
+    // capture readback decides DETECTED/CLEAN (see recursionCheck)
+    if (m_ctx1) {
+        m_recSelftest = 1; m_recFrames = 0; m_recTries = 0; m_recDetected = false;
+        dbgLog("recursion selftest: armed (marker -> capture readback)");
+    }
     {
         std::lock_guard<std::mutex> lk(m_outsMutex);
         m_outs.push_back(oc);
     }
     return true;
+}
+
+// One-shot recursion selftest readback: copy the bottom-right 200x200 of the
+// captured desktop frame into a small staging texture and count magenta
+// pixels (our marker color). A hit means our own scanout is part of the
+// desktop image DD returns -> warp feedback loop.
+void Engine::recursionCheck(OutputCtx& oc) {
+    if (++m_recTries > 10) {
+        dbgLog("recursion selftest: CLEAN (" + std::to_string(m_recTries - 1) + " captures, no marker px)");
+        m_recSelftest = 3;
+        return;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = 200; td.Height = 200; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* stg = nullptr;
+    if (FAILED(m_dev->CreateTexture2D(&td, nullptr, &stg))) {
+        m_recSelftest = 3;
+        dbgLog("recursion selftest: staging create FAILED");
+        return;
+    }
+    int sx = (oc.srcW > 200) ? oc.srcW - 200 : 0;
+    int sy = (oc.srcH > 200) ? oc.srcH - 200 : 0;
+    D3D11_BOX box{ (UINT)sx, (UINT)sy, 0, (UINT)sx + 200, (UINT)sy + 200, 1 };
+    m_ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, oc.frameTex, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE mp{};
+    if (SUCCEEDED(m_ctx->Map(stg, 0, D3D11_MAP_READ, 0, &mp))) {
+        int hits = 0;
+        const BYTE* row = (const BYTE*)mp.pData;
+        for (int y = 0; y < 200; y++) {
+            const BYTE* p = row + (size_t)y * mp.RowPitch;
+            for (int x = 0; x < 200; x++, p += 4)
+                if (p[0] > 200 && p[2] > 200 && p[1] < 80) hits++;
+        }
+        m_ctx->Unmap(stg, 0);
+        stg->Release();
+        if (hits > 24000) {   // >60% of 200x200: our marker leaked into the capture
+            m_recDetected = true; m_recSelftest = 3;
+            dbgLog("recursion selftest: DETECTED (" + std::to_string(hits) + "/40000 marker px) - own scanout leaks into DD capture");
+        }
+        return;
+    }
+    stg->Release();
 }
 
 // Duplicate the desktop of the first display that is NOT itself an enabled
@@ -1002,6 +1055,7 @@ void Engine::shutdown() {
     if (m_psCur) m_psCur->Release();
     if (m_layoutCur) m_layoutCur->Release();
     if (m_raster) m_raster->Release();
+    if (m_ctx1) m_ctx1->Release();
     if (m_ctx) m_ctx->Release();
     if (m_dev) m_dev->Release();
     if (m_factory) m_factory->Release();
@@ -1051,6 +1105,7 @@ void Engine::captureFrame(OutputCtx& oc) {
                 }
             }
             if (oc.frameTex) { m_ctx->CopyResource(oc.frameTex, tex); oc.frameValid = true; }
+            if (m_recSelftest == 2 && oc.frameTex) recursionCheck(oc);
             tex->Release();
         }
     }
@@ -1653,6 +1708,16 @@ void Engine::drawOutput(OutputCtx& oc, const OutputCfg& cfg) {
             m_ctx->OMSetBlendState(m_blendAlpha, nullptr, 0xffffffff);
             m_ctx->Draw(6, 0);
             m_ctx->OMSetBlendState(m_blendOpaque, nullptr, 0xffffffff);
+        }
+    }
+    // ---- recursion selftest: magenta marker into our own scanout ----
+    if (m_recSelftest == 1 && m_ctx1 && oc.rtv) {
+        D3D11_RECT rc{ (int)oc.w - 200, (int)oc.h - 200, (int)oc.w, (int)oc.h };
+        float mag[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+        m_ctx1->ClearView(oc.rtv, mag, &rc, 1);
+        if (++m_recFrames >= 5) {
+            m_recSelftest = 2;
+            dbgLog("recursion selftest: marker presented x5, awaiting capture readback");
         }
     }
     // SyncInterval=0: vsync Present(1) latches into DXGI's occluded skip-mode

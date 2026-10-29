@@ -712,18 +712,21 @@ void createOutputWindows() {
             title.c_str(), WS_POPUP | WS_VISIBLE,
             r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
             GetModuleHandleW(nullptr), nullptr);
-        if (preview || inplace) {
-            // 0x11 = WDA_EXCLUDEFROMCAPTURE (Win10 2004+), 0x01 = WDA_MONITOR
-            typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
-            auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity");
-            BOOL ok = fn ? fn(hwnd, 0x11) : FALSE;
-            if (!ok && fn) ok = fn(hwnd, 0x01);
-            g_previewNoCapture.store(!ok);
-            dbgLogLine(std::string(preview ? "preview" : "inplace") + std::string(": window ") +
-                       (ok ? "excluded" : "NOT excluded") +
-                       " from capture, rect=" + std::to_string(r.left) + "," + std::to_string(r.top) +
-                       " " + std::to_string(r.right - r.left) + "x" + std::to_string(r.bottom - r.top));
-        }
+        // capture-exclusion for ALL warp output windows (0x11 =
+        // WDA_EXCLUDEFROMCAPTURE, Win10 2004+; 0x01 = WDA_MONITOR legacy
+        // fallback shows black). Without it a fullscreen warp output leaks
+        // into its own Desktop Duplication capture -> recursion feedback
+        // loop. On pre-2004 Windows the 0x11 call fails (logged); single-
+        // screen warp then cannot be recursion-free in pure user mode.
+        typedef BOOL (WINAPI *SetAffFn)(HWND, DWORD);
+        auto fn = (SetAffFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity");
+        BOOL ok = fn ? fn(hwnd, 0x11) : FALSE;
+        if (!ok && fn) ok = fn(hwnd, 0x01);
+        if (preview || inplace) g_previewNoCapture.store(!ok);
+        dbgLogLine(std::string("output: window ") +
+                   (ok ? "excluded from capture" : "NOT excluded from capture (needs Win10 2004+ for WDA_EXCLUDEFROMCAPTURE)") +
+                   ", rect=" + std::to_string(r.left) + "," + std::to_string(r.top) +
+                   " " + std::to_string(r.right - r.left) + "x" + std::to_string(r.bottom - r.top));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
         g_outWins.push_back({ hwnd, st });
         Engine::inst().attachOutput((int)i, hwnd);

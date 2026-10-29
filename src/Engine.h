@@ -133,6 +133,17 @@ private:
     std::atomic<bool> m_deviceLost{ false };
     ID3D11RasterizerState* m_raster = nullptr;
 
+    // recursion selftest: paint a magenta marker into our own scanout, then
+    // read back the Desktop Duplication capture - if the marker shows up in
+    // the captured desktop frame, our own output leaked into the capture
+    // (warp feedback loop). 0=off 1=marker frames 2=readback attempts 3=done
+    ID3D11DeviceContext1* m_ctx1 = nullptr;   // ClearView (marker rect)
+    int m_recSelftest = 0;
+    int m_recFrames = 0;
+    int m_recTries = 0;
+    bool m_recDetected = false;
+    void recursionCheck(OutputCtx& oc);
+
     // shared_ptr + mutex: the render thread snapshots this list each frame,
     // while the UI thread may destroy/rebuild outputs at any moment (preview
     // checkbox, Toggle, Start/Stop). Refcounting guarantees a ctx outlives the
