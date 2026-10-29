@@ -1,5 +1,6 @@
 #pragma once
 #include "Common.h"
+#include <d3d11_1.h>   // ID3D11DeviceContext1 (ClearView, recursion selftest)
 #include <memory>
 #include <mutex>
 
