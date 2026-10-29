@@ -225,6 +225,7 @@ COut main(CIn i) { COut o; o.pos = float4(i.pos, 0, 1); o.uv = i.uv; return o; }
 static const char* g_psCurSrc = R"(
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
+struct COut { float4 pos : SV_Position; float2 uv : TEXCOORD; };
 float4 main(COut i) : SV_Target { return tex.Sample(samp, i.uv); }
 )";
 
