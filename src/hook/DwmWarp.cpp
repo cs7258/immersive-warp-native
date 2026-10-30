@@ -2054,6 +2054,206 @@ static BOOL DwmWarpInstallMpoHook() {
     return TRUE;
 }
 
+// ---- r93: the per-frame present chain ---------------------------------------
+// r92d proved PresentInternal and BOTH of its submit branches (vt[13] and
+// ConvertPresentToMultiplaneOverlay) are NOT the per-frame path: all LIVE,
+// 0 calls in 150s, while the wrapper fires ~3/s. The disassembly gives the
+// real per-frame chain (dwminst #1, the copy whose PresentInternal runs):
+//   CComposition::Present 0x77538
+//     -> CRenderTargetManager::Present 0x7782C  (per-RT loop)
+//        -> [rt+0x40]->vt[8] = CHwndRenderTarget::Present 0x5B2A0
+//           -> InternalPresent 0x5B328          (the actual flip/submit)
+// r93 hooks all four, counts calls (heartbeat CHAIN line), and paints
+// (phase-B flash / phase-C warp via wirePaintCore) inside InternalPresent -
+// the deepest per-RT submit point. All four prologues are plain mov/push
+// sequences (no rip-relative), so a copy-whole-prologue trampoline is safe.
+// Stack-arg check: RTM::Present's [rsp+0x78]/[rsp+0x80] reads are its own
+// spilled rdx/r8 (prologue stores), not stack parameters - 4-register
+// forwarding is correct for all four.
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CHAIN4)(void*, void*, void*, void*);
+static volatile LONG g_compCalls = 0, g_rtmCalls = 0, g_hwndCalls = 0,
+                     g_intCalls = 0, g_intPaints = 0;
+static volatile LONG g_chainLive = 0;      // bitmask bit0..bit3
+static PFN_CHAIN4 g_compTramp = nullptr, g_rtmTramp = nullptr,
+                  g_hwndTramp = nullptr, g_intTramp = nullptr;
+static void* g_compTrampMem = nullptr, *g_rtmTrampMem = nullptr,
+            *g_hwndTrampMem = nullptr, *g_intTrampMem = nullptr;
+
+static HRESULT STDMETHODCALLTYPE IWN_CompWrap(void* a, void* b, void* c, void* d) {
+    InterlockedIncrement(&g_compCalls);
+    return g_compTramp(a, b, c, d);
+}
+static HRESULT STDMETHODCALLTYPE IWN_RtmWrap(void* a, void* b, void* c, void* d) {
+    InterlockedIncrement(&g_rtmCalls);
+    return g_rtmTramp(a, b, c, d);
+}
+static HRESULT STDMETHODCALLTYPE IWN_HwndWrap(void* a, void* b, void* c, void* d) {
+    InterlockedIncrement(&g_hwndCalls);
+    return g_hwndTramp(a, b, c, d);
+}
+static HRESULT STDMETHODCALLTYPE IWN_IntWrap(void* a, void* b, void* c, void* d) {
+    InterlockedIncrement(&g_intCalls);
+    BOOL painted = FALSE;
+    if (g_ready && g_intTramp && !g_quiet && (LONG)g_stage == IWN_PH_PRESNT) {
+        DWORD t = GetTickCount();
+        if (t != g_lastPaintTick) {
+            g_lastPaintTick = t;
+            InterlockedIncrement(&g_frames);
+            __try { painted = wirePaintCore(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+        }
+    }
+    HRESULT hr = g_intTramp(a, b, c, d);
+    if (painted) InterlockedIncrement(&g_intPaints);
+    return hr;
+}
+
+// one generic whole-prologue detour. `exp`/`disp` describe the DISK prologue;
+// the live image is verified against it first (r92d: the loaded build can
+// differ by REX prefixes - on mismatch we log the live bytes and SKIP instead
+// of patching blind). Trampoline = original disp bytes + jmp back fn+disp.
+static BOOL iwnChainDetour(BYTE* fn, const BYTE* exp, int disp,
+                           void* hookFn, PFN_CHAIN4* tramp, void** trampMem,
+                           const char* tag) {
+    char b[192];
+    if (!fn || IsBadReadPtr(fn, 32)) {
+        wsprintfA(b, "dwm: %s skipped (bad fn ptr)", tag);
+        iwnHookLog(b);
+        return FALSE;
+    }
+    BYTE cur[32];
+    CopyMemory(cur, fn, 32);
+    if (memcmp(cur, exp, disp) != 0) {
+        wsprintfA(b, "dwm: %s skipped (live prologue "
+                  "%02X %02X %02X %02X %02X %02X %02X %02X)", tag,
+                  cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7]);
+        iwnHookLog(b);
+        return FALSE;
+    }
+    BYTE* blk = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_EXECUTE_READWRITE);
+    if (!blk) {
+        wsprintfA(b, "dwm: %s skipped (no RWX mem)", tag);
+        iwnHookLog(b);
+        return FALSE;
+    }
+    BYTE* p = blk;
+    CopyMemory(p, fn, (SIZE_T)disp); p += disp;
+    *p++ = 0x48; *p++ = 0xB8;
+    UINT64 back = (UINT64)(fn + disp);
+    CopyMemory(p, &back, 8); p += 8;
+    *p++ = 0xFF; *p++ = 0xE0;
+    if (!(blk[disp] == 0x48 && blk[disp + 1] == 0xB8 &&
+          *(UINT64*)(blk + disp + 2) == back &&
+          blk[disp + 10] == 0xFF && blk[disp + 11] == 0xE0)) {
+        wsprintfA(b, "dwm: %s skipped (trampoline bytes bad)", tag);
+        iwnHookLog(b);
+        VirtualFree(blk, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    *tramp = (PFN_CHAIN4)blk;
+    *trampMem = blk;
+    FlushInstructionCache(GetCurrentProcess(), blk, disp + 12);
+
+    HANDLE th[128]; int ns = 0;
+    suspendOtherThreads(&ns, th, 128);
+    DWORD old = 0;
+    BOOL ok = VirtualProtect(fn, 32, PAGE_EXECUTE_READWRITE, &old) != 0;
+    BYTE patch[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
+    UINT64 sa = (UINT64)hookFn;
+    CopyMemory(patch + 2, &sa, 8);
+    if (ok) {
+        CopyMemory(fn, patch, 12);
+        VirtualProtect(fn, 32, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), fn, 12);
+    }
+    BYTE nowb[12];
+    CopyMemory(nowb, fn, 12);
+    BOOL good = ok && memcmp(nowb, patch, 12) == 0;
+    for (int i = ns - 1; i >= 0; i--) { ResumeThread(th[i]); CloseHandle(th[i]); }
+    if (!good) {
+        *tramp = nullptr;
+        wsprintfA(b, "dwm: %s FAILED (patch did not verify)", tag);
+        iwnHookLog(b);
+        return FALSE;
+    }
+    // CFG: keep every 16-aligned entry on the patched page a valid target
+    typedef struct { ULONG Offset; ULONG Flags; } IWN_CFG_T4;
+    typedef BOOL (WINAPI *PFN_SVCT4)(HANDLE, PVOID, SIZE_T, ULONG, IWN_CFG_T4*);
+    PFN_SVCT4 svct = (PFN_SVCT4)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                               "SetProcessValidCallTargets");
+    if (svct) {
+        uintptr_t page = (uintptr_t)fn & ~(uintptr_t)0xFFF;
+        IWN_CFG_T4 info[256];
+        for (int i = 0; i < 256; i++) { info[i].Offset = (ULONG)(i * 16); info[i].Flags = 1; }
+        svct(GetCurrentProcess(), (PVOID)page, 0x1000, 256, info);
+    }
+    wsprintfA(b, "dwm: %s LIVE", tag);
+    iwnHookLog(b);
+    return TRUE;
+}
+
+static void installChainHooks() {
+    HMODULE m1 = GetModuleHandleW(L"dwmcore.dll");
+    if (!m1) { iwnHookLog("dwm: CHAIN skipped (no dwmcore)"); return; }
+    // reference only: the second dwmcore instance's live bytes at the same
+    // RVAs (read-only - its layout differs, e.g. 0x52784 is SIMD there).
+    HMODULE m2 = nullptr;
+    if (g_submitC && !IsBadReadPtr(g_submitC, 8)) {
+        void** cvt = *(void***)g_submitC;
+        if (cvt) m2 = moduleFromPtr((void*)cvt);
+    }
+    char b[160];
+    wsprintfA(b, "dwm: CHAIN target m1=%p m2=%p", (void*)m1, (void*)m2);
+    iwnHookLog(b);
+    static const BYTE expComp[19] = {
+        0x4C, 0x8B, 0xD4,                                   // mov r11, rsp
+        0x48, 0x89, 0x5C, 0x24, 0x10,                       // mov [r11+10h],rbx
+        0x48, 0x89, 0x6C, 0x24, 0x18,                       // mov [r11+18h],rbp
+        0x48, 0x89, 0x74, 0x24, 0x20, 0x57 };               // mov [r11+20h],rsi; push rdi
+    static const BYTE expRtm[13] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08,                       // mov [rsp+8],rbx
+        0x4C, 0x89, 0x44, 0x24, 0x18,                       // mov [rsp+18h],r8
+        0x89, 0x54, 0x24, 0x10 };                           // mov [rsp+10h],edx
+    static const BYTE expHwnd[12] = {
+        0x48, 0x89, 0x5C, 0x24, 0x20,                       // mov [rsp+20h],rbx
+        0x55, 0x56, 0x57,                                   // push rbp,rsi,rdi
+        0x48, 0x83, 0xEC, 0x60 };                           // sub rsp,60h
+    static const BYTE expInt[25] = {
+        0x48, 0x8B, 0xC4,                                   // mov rax, rsp
+        0x48, 0x89, 0x58, 0x08,                             // mov [rax+8],rbx
+        0x48, 0x89, 0x68, 0x10,                             // mov [rax+10h],rbp
+        0x48, 0x89, 0x70, 0x18,                             // mov [rax+18h],rsi
+        0x48, 0x89, 0x78, 0x20,                             // mov [rax+20h],rdi
+        0x41, 0x56 };                                       // push r14
+    struct CHAIN_ENT { ULONG rva; const BYTE* exp; int disp;
+                       void* hook; PFN_CHAIN4* tramp; void** mem;
+                       const char* tag; };
+    const CHAIN_ENT ents[4] = {
+        { 0x77538, expComp, 19, (void*)&IWN_CompWrap,  &g_compTramp,  &g_compTrampMem,  "CHAIN[comp]" },
+        { 0x7782C, expRtm,  13, (void*)&IWN_RtmWrap,   &g_rtmTramp,   &g_rtmTrampMem,   "CHAIN[rtm]" },
+        { 0x5B2A0, expHwnd, 12, (void*)&IWN_HwndWrap,  &g_hwndTramp,  &g_hwndTrampMem,  "CHAIN[hwnd]" },
+        { 0x5B328, expInt,  25, (void*)&IWN_IntWrap,   &g_intTramp,   &g_intTrampMem,   "CHAIN[int]" },
+    };
+    for (int i = 0; i < 4; i++) {
+        if (g_chainLive & (1 << i)) continue;
+        if (iwnChainDetour((BYTE*)m1 + ents[i].rva, ents[i].exp, ents[i].disp,
+                           ents[i].hook, ents[i].tramp, ents[i].mem, ents[i].tag))
+            InterlockedOr(&g_chainLive, (1 << i));
+    }
+    if (m2 && m2 != m1) {
+        // read-only fingerprint of instance #2 at the comp RVA (diagnostics
+        // for a possible follow-up hook there)
+        BYTE c2[8];
+        if (!IsBadReadPtr((BYTE*)m2 + 0x77538, 8)) {
+            CopyMemory(c2, (BYTE*)m2 + 0x77538, 8);
+            wsprintfA(b, "dwm: m2 prologue@0x77538 %02X %02X %02X %02X %02X %02X %02X %02X",
+                      c2[0], c2[1], c2[2], c2[3], c2[4], c2[5], c2[6], c2[7]);
+            iwnHookLog(b);
+        }
+    }
+}
+
 static void readbackPixel(int i, const char* tag) {
     if (i < 0 || i >= g_tgtN || !g_tgt[i]) return;
     readbackTex(g_tgt[i], tag);
@@ -3349,6 +3549,9 @@ void DwmWarpBeforeSubmit() {
             // ConvertPresentToMultiplaneOverlay when [self+0x24C]==2 - hook it
             // alongside the wrapper (same dwmcore instance).
             DwmWarpInstallMpoHook();
+            // r93: the real per-frame chain (comp -> rtm -> hwnd -> int).
+            // Counters decide which link runs at 60fps; InternalPresent paints.
+            installChainHooks();
         }
         if (ph == IWN_PH_CF_DEF && g_presntTried) {
             iwnHookLog("dwm: mode C - back to CF paint (wrapper passive)");
@@ -3397,6 +3600,15 @@ void DwmWarpBeforeSubmit() {
                           (long)g_submitCalls, (long)g_submitPaints,
                           (long)g_mpoCalls, (long)g_mpoPaints);
                 iwnHookLog(b2);
+            }
+            {
+                char b3[160];
+                wsprintfA(b3, "CHAIN comp=%ld rtm=%ld hwnd=%ld int=%ld "
+                          "intpaints=%ld live=0x%lX",
+                          (long)g_compCalls, (long)g_rtmCalls,
+                          (long)g_hwndCalls, (long)g_intCalls,
+                          (long)g_intPaints, (unsigned long)g_chainLive);
+                iwnHookLog(b3);
             }
         }
     }
