@@ -104,10 +104,13 @@ static volatile LONG  g_flipInspec = 0;    // one-time flip-object inspection do
 static volatile LONG  g_flipDead = 0;      // 1 = hooks installed but never called
 static DWORD          g_flipInstallTick = 0;
 static volatile LONG  g_presntTried = 0;   // round 74: mode B entered once
+static volatile LONG  g_scHooked = 0;      // round 76: wire swapchain Present hooked
+static volatile LONG  g_scCalls = 0;       // wire Present calls seen
 
 // round 75: wire-buffer registration (defined below IWN_FlipInspect, also used
 // by DwmWarpAttachTargets to survive probe re-attach cycles)
 static void applyWireFromSC(IDXGISwapChain* sc);
+static void installSCPresentHook();        // round 76 (defined near PDW hook)
 static IDXGISwapChain* g_flipSC = nullptr; // dwm's own presenting swapchain (AddRef'd)
 static int            g_frontTgt = -1;     // wire face named by dwm's present object
 static ID3D11Texture2D* g_markerTex = nullptr; // 8x8 per-face wire marker source
@@ -1475,6 +1478,9 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
         if (InterlockedCompareExchange(&g_flipInspec, 1, 0) == 0)
             IWN_FlipInspect(self);
     }
+    // round 76: once the wire swapchain is in hand, hook its Present - the
+    // paint point AFTER dwm's internal compose->backbuffer copy
+    if (g_flipSC && !g_scHooked && g_detourInstalled) installSCPresentHook();
     if (!g_flipHooked) tryInstallFlipHook(self);
     // round 73 flip-dead detection: the A/B vtable slots were patched but get
     // ZERO calls on this blt path (round 72: frames frozen at 390 for 60s while
@@ -1489,7 +1495,7 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
         return g_presentTramp(self, a2, a3, a4, a5);
     }
     BOOL painted = FALSE;
-    if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && !g_quiet) {
+    if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && !g_quiet && !g_scHooked) {
         DWORD t = GetTickCount();
         if (t != g_lastPaintTick) {            // one paint per compose
             g_lastPaintTick = t;
@@ -2032,6 +2038,63 @@ static void installLegacyPresentHook() {
     }
 }
 
+// ---- round 76: wire swapchain Present hook ----------------------------------
+// Round 75 proved the wire back buffers are BLACK at PresentInternal entry,
+// which means dwm's compose->backbuffer copy happens INSIDE the trampoline.
+// The only paint point after that copy and before the back->front blit is
+// IDXGISwapChain::Present itself (vtable slot 8) - the fanxiushu article's
+// exact paint point, and we already hold the wire COM object (g_flipSC).
+typedef HRESULT (STDMETHODCALLTYPE* PFN_SCPRESENT)(void*, UINT, UINT);
+static PFN_SCPRESENT g_scPresentTramp = nullptr;
+
+static HRESULT STDMETHODCALLTYPE IWN_SCPresentWrap(void* self, UINT sync, UINT flags) {
+    InterlockedIncrement(&g_scCalls);
+    BOOL painted = FALSE;
+    if (g_ready && (LONG)g_stage >= IWN_PH_CF_DEF && g_ctx && !g_quiet) {
+        DWORD t = GetTickCount();
+        if (t != g_lastPaintTick) {           // one paint per compose
+            g_lastPaintTick = t;
+            InterlockedIncrement(&g_frames);
+            __try {
+                g_ctx->CopyResource(g_twin, g_target); // frame BEFORE our paint
+                const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                for (int i = 0; i < g_tgtN; i++) {
+                    if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                InterlockedIncrement(&g_fail);
+                iwnHookLog("dwm: warp save EXCEPTION (sc-present)");
+            }
+            int before = (int)g_draws;
+            paintWarp();
+            if ((int)g_draws != before) {
+                painted = TRUE;
+                static BOOL s_proofC = FALSE;     // POD static - no TLS guard
+                if (!s_proofC) {
+                    s_proofC = TRUE;
+                    readbackTex(g_twin,   "TWIN-C");
+                    readbackTex(g_warpRT, "WARPRT-C");
+                    readbackPixel(0, "warp-sc");
+                }
+            }
+        }
+    }
+    HRESULT hr = g_scPresentTramp(self, sync, flags);
+    if (painted) g_pendingRestore = 1;   // restore at next CF
+    return hr;
+}
+
+static void installSCPresentHook() {
+    if (g_scHooked) return;
+    if (!g_flipSC) { iwnHookLog("dwm: SC hook skipped (no wire swapchain)"); return; }
+    void* o = patchVtableSlot((void*)g_flipSC, 8, (void*)&IWN_SCPresentWrap, "SC[slot8]");
+    if (o) {
+        g_scPresentTramp = (PFN_SCPRESENT)o;
+        g_scHooked = 1;
+        iwnHookLog("dwm: WIRE PRESENT HOOK LIVE - paint point = back buffer at Present");
+    }
+}
+
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
     DWORD el = GetTickCount() - g_t0;
@@ -2128,8 +2191,8 @@ void DwmWarpBeforeSubmit() {
                 POINT p;
                 GetCursorPos(&p);
                 char b[96];
-                wsprintfA(b, "CURSOR x=%ld y=%ld frames=%ld",
-                          (long)p.x, (long)p.y, (long)g_frames);
+                wsprintfA(b, "CURSOR x=%ld y=%ld frames=%ld sc=%ld",
+                          (long)p.x, (long)p.y, (long)g_frames, (long)g_scCalls);
                 iwnHookLog(b);
             }
         }
