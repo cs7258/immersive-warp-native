@@ -1219,17 +1219,24 @@ static void iwnIdentifySubmit(void* self) {
 // user-mode swapchain buffers are only staging.
 static volatile LONG g_bindBlits = 0;
 static volatile LONG g_bindFails = 0;
+static void* g_bindInfoC = nullptr;    // CBindInfo object, cached from present
 
 static void iwnBlitToBindInfo(void* self) {
-    if (!self || !g_target || !g_ctx) return;
-    char* A = nullptr; char* B = nullptr; char* C = nullptr;
-    __try {
-        A = *(char**)((char*)self + 0x10);
-        if (!A || IsBadReadPtr(A + 0x50, 8)) return;
-        B = *(char**)(A + 0x50);
-        if (!B || IsBadReadPtr(B + 0xf0, 8)) return;
-        C = *(char**)(B + 0xf0);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!g_target || !g_ctx) return;
+    char* C = nullptr;
+    if (self) {
+        char* A = nullptr; char* B = nullptr;
+        __try {
+            A = *(char**)((char*)self + 0x10);
+            if (!A || IsBadReadPtr(A + 0x50, 8)) return;
+            B = *(char**)(A + 0x50);
+            if (!B || IsBadReadPtr(B + 0xf0, 8)) return;
+            C = *(char**)(B + 0xf0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+        if (C) g_bindInfoC = C;
+    } else {
+        C = (char*)g_bindInfoC;          // CF-side: reuse the cached object
+    }
     if (!C || IsBadReadPtr(C + 0xE0, 4)) return;
 
     UINT n = 0; void** arr = nullptr; void** arr2 = nullptr;
@@ -1252,7 +1259,7 @@ static void iwnBlitToBindInfo(void* self) {
     __try { g_target->GetDesc(&td); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
 
     static volatile LONG s_dumped = 0;         // POD static - no TLS guard
-    BOOL dump = (InterlockedCompareExchange(&s_dumped, 1, 0) == 0);
+    BOOL dump = (InterlockedIncrement(&s_dumped) <= 8);
     UINT done = 0;
     for (int which = 0; which < 2; which++) {
         void** list = which ? arr2 : arr;
@@ -2324,6 +2331,10 @@ static void paintAtConfirmFrame(LONG ph) {
     }
     int before = (int)g_draws;
     paintWarp();
+    // round 89: the bind-info resources are only populated during the render
+    // phase (PinResources); at present time UnpinResources has already cleared
+    // them (r88: n=0). So sample them HERE, before the submit.
+    iwnBlitToBindInfo(nullptr);
     if ((int)g_draws == before) {
         if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw");
     } else {
