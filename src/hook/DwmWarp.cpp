@@ -1445,21 +1445,27 @@ static void iwnCacheRealTex(ID3D11Texture2D* tex) {
 
 // Inspect one realization: vtable RVA, QI, and a bounded field walk looking
 // for any D3D11 texture hidden inside (the CDxHandle realization holds the
-// shared-handle resource the kernel compositor consumes).
-static void iwnInspectRealization(void* real) {
+// shared-handle resource the kernel compositor consumes). force=TRUE skips
+// the rate limit (used by the periodic CBindInfo scan); logging stays gated
+// by the first-60 counter so repeated scans do not flood the log.
+static void iwnInspectRealization(void* real, BOOL force) {
     LONG n = InterlockedIncrement(&g_realSeen);
     static volatile LONG s_lastMs = 0;       // POD static - no TLS guard
     DWORD now = GetTickCount();
-    BOOL full = (n <= 60) || (now - (DWORD)s_lastMs > 1000);
-    if (!full) return;
-    s_lastMs = (LONG)now;
+    BOOL logLine = (n <= 60) && (force || (now - (DWORD)s_lastMs > 1000));
+    BOOL walk = force || (n <= 60) || (now - (DWORD)s_lastMs > 1000);
+    if (force) s_lastMs = (LONG)now;
+    else if (walk) s_lastMs = (LONG)now;
+    if (!walk) return;
     __try {
         void** vt = *(void***)real;
         HMODULE m = vt ? moduleFromPtr((void*)vt) : nullptr;
         char b[160];
-        wsprintfA(b, "REAL #%ld obj=%p vt=mod+0x%05lX", (long)n, real,
-                  m ? (unsigned long)((char*)vt - (char*)m) : 0);
-        iwnHookLog(b);
+        if (logLine) {
+            wsprintfA(b, "REAL #%ld obj=%p vt=mod+0x%05lX", (long)n, real,
+                      m ? (unsigned long)((char*)vt - (char*)m) : 0);
+            iwnHookLog(b);
+        }
         ID3D11Texture2D* tex = nullptr;
         if (SUCCEEDED(((IUnknown*)real)->QueryInterface(kIIDTex2D, (void**)&tex)) && tex) {
             iwnCacheRealTex(tex);
@@ -1475,11 +1481,13 @@ static void iwnInspectRealization(void* real) {
             if (SUCCEEDED(((IUnknown*)q)->QueryInterface(kIIDTex2D, (void**)&tex)) && tex) {
                 D3D11_TEXTURE2D_DESC d = {};
                 tex->GetDesc(&d);
-                wsprintfA(b, "REAL #%ld field+0x%02lX tex %lux%lu bind=0x%X misc=0x%X",
-                          (long)n, (unsigned long)off, (unsigned long)d.Width,
-                          (unsigned long)d.Height, (unsigned)d.BindFlags,
-                          (unsigned)d.MiscFlags);
-                iwnHookLog(b);
+                if (logLine) {
+                    wsprintfA(b, "REAL #%ld field+0x%02lX tex %lux%lu bind=0x%X misc=0x%X",
+                              (long)n, (unsigned long)off, (unsigned long)d.Width,
+                              (unsigned long)d.Height, (unsigned)d.BindFlags,
+                              (unsigned)d.MiscFlags);
+                    iwnHookLog(b);
+                }
                 iwnCacheRealTex(tex);
                 tex->Release();
             }
@@ -1489,32 +1497,64 @@ static void iwnInspectRealization(void* real) {
     }
 }
 
+// r91: read the CURRENT realization list straight out of the cached CBindInfo.
+// AddRealization (disassembly 0x52784) appends each realization to the array
+// at [C+0x20] with the count at [C+0x38] - so the realizations that existed
+// BEFORE injection (the desktop's own) are readable without any detour.
+static void iwnScanBindInfoRealizations(const char* tag) {
+    if (!g_bindInfoC) return;
+    char* C = (char*)g_bindInfoC;
+    __try {
+        if (IsBadReadPtr(C + 0x38, 4) || IsBadReadPtr(C + 0x20, 8)) return;
+        UINT n = *(UINT*)(C + 0x38);
+        void** arr = *(void***)(C + 0x20);
+        static DWORD s_last = 0;             // POD static - no TLS guard
+        DWORD t = GetTickCount();
+        BOOL log = (t - s_last > 5000);
+        if (log) s_last = t;
+        if (log) {
+            char b[128];
+            wsprintfA(b, "REALSCAN(%s) C=%p n=%u arr=%p cachedReal=%ld",
+                      tag, C, n, arr, (long)g_realN);
+            iwnHookLog(b);
+        }
+        if (!arr || n == 0 || n > 16) return;
+        if (IsBadReadPtr(arr, (size_t)n * 8)) return;
+        for (UINT i = 0; i < n; i++) {
+            void* r = arr[i];
+            if (r && !IsBadReadPtr(r, 8)) iwnInspectRealization(r, TRUE);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
 static HRESULT STDMETHODCALLTYPE IWN_AddRealWrap(void* self, void* real) {
     HRESULT hr = g_addRealTramp(self, real);
-    if (real && g_ready && !g_quiet) iwnInspectRealization(real);
+    if (real && g_ready && !g_quiet) iwnInspectRealization(real, FALSE);
     return hr;
 }
 
 static void suspendOtherThreads(int* suspended, HANDLE* handles, int cap);   // fwd
 
 // Detour CBindInfo::AddRealization (dwmcore+0x52784). Prologue is exactly
-// 12 bytes: two 5-byte rsp stores + push rbp + push rdi - verified against
-// the live image before patching. Same suspended-thread + CFG recipe as the
-// PresentInternal wrapper install.
+// 15 bytes of three rsp stores (the realization pointer in rdx lands at
+// [rsp+0x10]) - verified against the live image before patching; the 12-byte
+// detour overwrites the first 12 and jumps back to fn+15. Same
+// suspended-thread + CFG recipe as the PresentInternal wrapper install.
 static BOOL DwmWarpInstallRealizationHook() {
     if (InterlockedCompareExchange(&g_realHookState, 1, 0) != 0)
         return g_addRealTramp != nullptr;
     HMODULE h = GetModuleHandleW(L"dwmcore.dll");
     if (!h) { iwnHookLog("dwm: REAL hook skipped (no dwmcore)"); return FALSE; }
     BYTE* fn = (BYTE*)h + 0x52784;
-    const BYTE exp[12] = { 0x48, 0x89, 0x5C, 0x24, 0x08,
-                           0x48, 0x89, 0x74, 0x24, 0x10, 0x55, 0x57 };
-    BYTE cur[12];
-    CopyMemory(cur, fn, 12);
-    if (memcmp(cur, exp, 12) != 0) {
-        char b[160];
-        wsprintfA(b, "dwm: REAL hook skipped (prologue %02X %02X %02X %02X)",
-                  cur[0], cur[1], cur[2], cur[3]);
+    const BYTE exp[15] = { 0x48, 0x89, 0x5C, 0x24, 0x18,   // mov [rsp+18h],rbx
+                           0x48, 0x89, 0x74, 0x24, 0x20,   // mov [rsp+20h],rsi
+                           0x48, 0x89, 0x54, 0x24, 0x10 }; // mov [rsp+10h],rdx
+    BYTE cur[15];
+    CopyMemory(cur, fn, 15);
+    if (memcmp(cur, exp, 15) != 0) {
+        char b[192];
+        wsprintfA(b, "dwm: REAL hook skipped (prologue %02X %02X %02X %02X %02X %02X %02X %02X)",
+                  cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7]);
         iwnHookLog(b);
         return FALSE;
     }
@@ -1522,13 +1562,13 @@ static BOOL DwmWarpInstallRealizationHook() {
                                     PAGE_EXECUTE_READWRITE);
     if (!blk) { iwnHookLog("dwm: REAL hook skipped (no RWX mem)"); return FALSE; }
     BYTE* p = blk;
-    CopyMemory(p, fn, 12); p += 12;
+    CopyMemory(p, fn, 15); p += 15;
     *p++ = 0x48; *p++ = 0xB8;
-    UINT64 back = (UINT64)(fn + 12);
+    UINT64 back = (UINT64)(fn + 15);
     CopyMemory(p, &back, 8); p += 8;
     *p++ = 0xFF; *p++ = 0xE0;
-    if (!(blk[12] == 0x48 && blk[13] == 0xB8 &&
-          *(UINT64*)(blk + 14) == back && blk[22] == 0xFF && blk[23] == 0xE0)) {
+    if (!(blk[15] == 0x48 && blk[16] == 0xB8 &&
+          *(UINT64*)(blk + 17) == back && blk[25] == 0xFF && blk[26] == 0xE0)) {
         iwnHookLog("dwm: REAL hook skipped (trampoline bytes bad)");
         return FALSE;
     }
@@ -1583,6 +1623,9 @@ static void paintSolidFlash(void* self) {
     if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
     else                    { col[0] = 0.0f; col[1] = 1.0f; col[2] = 0.0f; col[3] = 1.0f; }
     __try {
+        // r91: refresh the realization capture right before flashing, so any
+        // texture the CBindInfo holds joins THIS flash
+        iwnScanBindInfoRealizations("flash");
         if (!g_flashTex) {
             D3D11_TEXTURE2D_DESC td = {};
             g_target->GetDesc(&td);
@@ -3046,6 +3089,10 @@ void DwmWarpBeforeSubmit() {
             wsprintfA(b, "CURSOR x=%ld y=%ld frames=%ld draws=%ld",
                       (long)p.x, (long)p.y, (long)g_frames, (long)g_draws);
             iwnHookLog(b);
+            // r91: periodic realization capture from the cached CBindInfo -
+            // the desktop's own realizations exist before we injected, and
+            // AddRealization may never fire again for them.
+            iwnScanBindInfoRealizations("tick");
         }
     }
 
