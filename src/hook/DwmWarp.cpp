@@ -112,7 +112,7 @@ static volatile LONG  g_scCalls = 0;       // wire Present calls seen
 // method PresentInternal's trampoline actually calls (COM slot 8: zero calls).
 // That is the last paint point before the back->front blt.
 typedef HRESULT (STDMETHODCALLTYPE* PFN_PRES10)(void*, void*, void*, void*, void*,
-                                                void*, void*, void*, void*, void*, void*);
+                                                void*, void*, void*, void*, void*);
 static PFN_PRES10     g_dwmPresentTramp = nullptr; // 0x6BAA0 trampoline
 static volatile LONG  g_dwmPresHooked = 0;  // 0x6BAA0 hook installed (paint owner)
 static volatile LONG  g_dwmPresCalls = 0;   // calls seen through the paint hook
