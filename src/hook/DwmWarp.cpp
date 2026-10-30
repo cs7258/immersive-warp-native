@@ -1816,25 +1816,14 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
         if (InterlockedCompareExchange(&g_flipInspec, 1, 0) == 0)
             IWN_FlipInspect(self);
     }
-    // round 76: once the wire swapchain is in hand, hook its Present - the
-    // paint point AFTER dwm's internal compose->backbuffer copy. Round 78: the
-    // COM slot-8 hook is obsolete when the slot54 legacy-present hook is live.
-    if (g_flipSC && !g_scHooked && !g_dwmPresHooked && g_detourInstalled) installSCPresentHook();
-    if (!g_flipHooked) tryInstallFlipHook(self);
-    // round 73 flip-dead detection: the A/B vtable slots were patched but get
-    // ZERO calls on this blt path (round 72: frames frozen at 390 for 60s while
-    // LBIDX ticked at 60/s). Once proven dead, fall back to the wrapper-entry
-    // paint - the round-63 proven visible-on-screen point.
-    if (g_flipHooked && !g_flipDead && g_flipCalls == 0 && g_flipInstallTick &&
-        GetTickCount() - g_flipInstallTick > 2000) {
-        g_flipDead = 1;
-        iwnHookLog("FLIP hooks DEAD (0 calls in 2s) - paint falls back to wrapper entry");
-    }
-    if (g_flipHooked && !g_flipDead) {
-        return g_presentTramp(self, a2, a3, a4, a5);
-    }
+    // round 83: the r76/r78 dxgi vtable hooks are PROVEN dead on this blt
+    // path (slot8 / slot54 / PresentDWM: zero calls over 10 minutes each) and
+    // worse, installing them sets g_scHooked which SILENTLY DISABLED the
+    // wrapper-entry paint for the whole run (r82: frames=0 draws=0 all 150s).
+    // They are no longer installed; PresentInternal entry is the only point
+    // dwm actually executes before submitting to scanout.
     BOOL painted = FALSE;
-    if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && !g_quiet && !g_scHooked && !g_dwmPresHooked) {
+    if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && !g_quiet) {
         DWORD t = GetTickCount();
         if (t != g_lastPaintTick) {            // one paint per compose
             g_lastPaintTick = t;
