@@ -1378,25 +1378,11 @@ static void enumWireVtableAndHook(void* obj) {
         if (m) {
             unsigned long rva = (unsigned long)((char*)fp - (char*)m);
             if (m == dxgi && rva == 0x6BAA0 && !g_dwmPresHooked) {
-                void* prev = patchVtableSlot(obj, s, (void*)&IWN_DWMPresentWrap, "DWMP");
-                if (prev) {
-                    g_dwmPresentTramp = (PFN_PRES10)prev;
-                    g_dwmPresSlot = s;
-                    g_dwmPresHooked = 1;
-                    mark = "  <== Legacy::Present PAINT HOOK LIVE";
-                } else {
-                    mark = "  <== Legacy::Present (patch FAILED)";
-                }
+                // round 81: hook install DISABLED (strategic retreat to the
+                // round-63 recipe). r78 proved this slot gets zero calls.
+                mark = "  <== Legacy::Present (hook skipped r81)";
             } else if (m == dxgi && rva == 0x1AE30 && !g_pdwmObsHooked) {
-                void* prev = patchVtableSlot(obj, s, (void*)&IWN_LegacyObsWrap, "OBS");
-                if (prev) {
-                    g_pdwmObsTramp = (PFN_PRES10)prev;
-                    g_pdwmObsSlot = s;
-                    g_pdwmObsHooked = 1;
-                    mark = "  <== PresentDWM observe hook LIVE";
-                } else {
-                    mark = "  <== PresentDWM (patch FAILED)";
-                }
+                mark = "  <== PresentDWM (hook skipped r81)";
             } else if (m == dxgi && (rva == 0x1AE30 || rva == 0x9CA0 || rva == 0x6BAA0)) {
                 mark = "  <== PresentDWM";
             }
@@ -1419,7 +1405,10 @@ static void IWN_FlipInspect(void* self) {
         iwnHookLog("dwm: FLIPSC QI OK on self - enumerating wire buffers");
         // round 77/78: full vtable walk + RVA-fingerprint auto-hook
         enumWireVtableAndHook(sc);
-        applyWireFromSC(sc);
+        // round 81: applyWireFromSC DISABLED - it replaced the texscan composed
+        // faces (round-63 visible recipe) with the wire back buffers (black at
+        // wrapper entry), which is what killed all paint modes since r75.
+        iwnHookLog("dwm: WIREDIS applyWireFromSC skipped (round 81 - keep composed faces)");
         g_flipSC = sc;   // keep the AddRef from QueryInterface
         return;
     }
@@ -1433,7 +1422,7 @@ static void IWN_FlipInspect(void* self) {
         if (SUCCEEDED(hr) && sc) {
             iwnHookLog("dwm: FLIPSC QI OK on self+1A8 - enumerating wire buffers");
             enumWireVtableAndHook(sc);
-            applyWireFromSC(sc);
+            iwnHookLog("dwm: WIREDIS applyWireFromSC skipped (round 81 - keep composed faces)");
             g_flipSC = sc;
             return;
         }
@@ -2367,7 +2356,18 @@ void DwmWarpBeforeSubmit() {
     if (el < 1500)       ph = IWN_PH_IDLE;
     else if (el < 8000)  ph = IWN_PH_CF_IMM;
     else if (el < 30000) ph = IWN_PH_CF_DEF;
-    else if (el < 60000) ph = IWN_PH_PRESNT;
+    // round 81: STRATEGIC RETREAT to the round-63 recipe. Evidence chain:
+    //   - r63: wrapper-entry paint + CF deferred restore WAS visible on screen
+    //     (corner wedge + PNG -40%) painting the texscan composed faces.
+    //   - r75+: applyWireFromSC REPLACED the paint targets with the wire back
+    //     buffers (black at wrapper entry) - every mode since then painted a
+    //     dead buffer, explaining the r74 "invisible in all modes" verdict.
+    //   - r78: dxgi COM Present slots (8/54/PresentDWM) - zero calls.
+    //   - r80: ctx Draw/Copy methods - zero calls even in self-heal windows,
+    //     AND the ctx vtable patch is force-reverted page-wide every ~2s.
+    // So: keep the texscan composed faces as paint targets, stay on CF paint
+    // with deferred restore all 150s, and re-judge visibility externally.
+    else if (el < 60000) ph = IWN_PH_CF_DEF;   // r81: was PRESNT (mode B)
     else                 ph = IWN_PH_CF_DEF;
 
     if (ph != g_lastLoggedStage) {
@@ -2413,6 +2413,23 @@ void DwmWarpBeforeSubmit() {
     // stage branch below returns early).
     cpyObserverHeartbeat();
 
+    // round 73/81: periodic cursor position log - pairs the face dumps with
+    // the script's cursor walk (is the cursor composed into the surface?)
+    // r81: moved to the common path (PRESNT stage no longer entered).
+    {
+        static DWORD s_curLog = 0;           // POD static - no TLS guard
+        DWORD tc = GetTickCount();
+        if (tc - s_curLog > 5000) {
+            s_curLog = tc;
+            POINT p;
+            GetCursorPos(&p);
+            char b[96];
+            wsprintfA(b, "CURSOR x=%ld y=%ld frames=%ld draws=%ld",
+                      (long)p.x, (long)p.y, (long)g_frames, (long)g_draws);
+            iwnHookLog(b);
+        }
+    }
+
     // round 72: quiet dump window. Round 74: opens at el=120s (after the mode
     // comparison); dumpFacesTick itself is scheduled independently so rounds
     // r1/r2 fire inside modes A/B while the warp is live.
@@ -2436,22 +2453,6 @@ void DwmWarpBeforeSubmit() {
                 readbackPixel(0, "post-flip");
             }
             restoreAllSurfaces("post-flip");
-        }
-        // round 73: periodic cursor position log - pairs the face dumps with
-        // the script's cursor walk (is the cursor composed into the surface?)
-        {
-            static DWORD s_curLog = 0;           // POD static - no TLS guard
-            DWORD tc = GetTickCount();
-            if (tc - s_curLog > 5000) {
-                s_curLog = tc;
-                POINT p;
-                GetCursorPos(&p);
-                char b[96];
-                wsprintfA(b, "CURSOR x=%ld y=%ld frames=%ld sc=%ld dwm=%ld obs=%ld",
-                          (long)p.x, (long)p.y, (long)g_frames, (long)g_scCalls,
-                          (long)g_dwmPresCalls, (long)g_pdwmObsCalls);
-                iwnHookLog(b);
-            }
         }
         return;   // painted by the wrapper now
     }
