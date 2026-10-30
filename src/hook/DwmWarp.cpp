@@ -2442,6 +2442,202 @@ static void installNtbHooks() {
     }
 }
 
+// ---- r95: dxgi-side present (fanxiushu's route 2) --------------------------
+// Route 1 (COverlayContext::Present) does not exist in this build at all, so
+// the scanout buffer has to be the DXGI swapchain back buffer. Hooking dxgi's
+// DWM present entries gives us `this` == the swapchain object itself: no -280
+// offset reconstruction, just GetDevice + GetBuffer + draw.
+// r78 only ever counted the vtable slot (dxgi+0x6BAA0 = Legacy::Present, zero
+// calls over 130s) and its PresentDWM observer never installed - the direct
+// entry points were never actually measured. This round counts all of them.
+typedef LONG_PTR (*PFN_DXGI10)(void*, void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*);
+#define IWN_DXGI_N 5
+static volatile LONG g_dxCalls[IWN_DXGI_N];
+static volatile LONG g_dxLive = 0, g_dxPaints = 0, g_dxTick = 0,
+                     g_dxNoLayout = 0, g_dxProbe = 0;
+static void* g_dxTramps[IWN_DXGI_N];
+static void* g_dxMem[IWN_DXGI_N];
+static ID3D11Device*           g_dxDev = nullptr;
+static ID3D11DeviceContext*    g_dxCtx = nullptr;
+static ID3D11Texture2D*        g_dxTex = nullptr;
+static ID3D11RenderTargetView* g_dxRtv = nullptr;
+
+// A swapchain layout test that cannot crash: GetDevice is vtable slot 7 and
+// GetBuffer slot 9 of IDXGISwapChain. Only call through the object if BOTH
+// land inside the same module (dxgi) - otherwise it is some other object.
+static IDXGISwapChain* dxgiAsSwapChain(void* self) {
+    if (!self || IsBadReadPtr(self, 0x60)) return nullptr;
+    void** vt = *(void***)self;
+    if (!vt || IsBadReadPtr(vt, 24 * 8)) return nullptr;
+    HMODULE mg = moduleFromPtr((void*)vt[7]);
+    HMODULE mb = moduleFromPtr((void*)vt[9]);
+    if (!mg || mg != mb) { InterlockedIncrement(&g_dxNoLayout); return nullptr; }
+    return (IDXGISwapChain*)self;
+}
+
+static BOOL dxgiEnsureDev(IDXGISwapChain* sc) {
+    if (g_dxDev) return TRUE;
+    ID3D11Device* dev = nullptr;
+    __try {
+        if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&dev)))
+            dev = nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { dev = nullptr; }
+    if (!dev) return FALSE;
+    ID3D11DeviceContext* ctx = nullptr;
+    __try { dev->GetImmediateContext(&ctx); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ctx = nullptr; }
+    if (!ctx) { dev->Release(); return FALSE; }
+    g_dxDev = dev;
+    g_dxCtx = ctx;
+    char b[144];
+    wsprintfA(b, "DXGI: swapchain device OK dev=%p ctx=%p (self == IDXGISwapChain)",
+              (void*)dev, (void*)ctx);
+    iwnHookLog(b);
+    return TRUE;
+}
+
+// Clear the back buffer that is about to be presented. Runs at the dxgi
+// present entry, i.e. after dwm finished compositing and before scanout.
+static BOOL dxgiFlash(void* self, int which) {
+    if (!g_dxDev) return FALSE;
+    IDXGISwapChain* sc = dxgiAsSwapChain(self);
+    if (!sc) return FALSE;
+    ID3D11Texture2D* bb = nullptr;
+    __try {
+        if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)))
+            bb = nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { bb = nullptr; }
+    if (!bb) return FALSE;
+    if (bb != g_dxTex) {
+        if (g_dxRtv) { g_dxRtv->Release(); g_dxRtv = nullptr; }
+        if (g_dxTex) { g_dxTex->Release(); g_dxTex = nullptr; }
+        ID3D11RenderTargetView* rv = nullptr;
+        HRESULT hr = E_FAIL;
+        __try { hr = g_dxDev->CreateRenderTargetView(bb, nullptr, &rv); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { hr = E_FAIL; }
+        D3D11_TEXTURE2D_DESC d = {};
+        __try { bb->GetDesc(&d); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        char b[176];
+        if (FAILED(hr) || !rv) {
+            wsprintfA(b, "DXGI: back buffer RTV refused hr=0x%08lX fmt=%d %ux%u w%d",
+                      (unsigned long)hr, (int)d.Format, d.Width, d.Height, which);
+            iwnHookLog(b);
+            bb->Release();
+            return FALSE;
+        }
+        g_dxTex = bb;                       // keeps the GetBuffer reference
+        g_dxRtv = rv;
+        wsprintfA(b, "DXGI: back buffer RTV OK fmt=%d %ux%u bufcount=%u w%d",
+                  (int)d.Format, d.Width, d.Height, d.ArraySize, which);
+        iwnHookLog(b);
+    } else {
+        bb->Release();
+    }
+    DWORD el = iwnEl();
+    float col[4];
+    if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
+    else                    { col[0] = 0.0f; col[1] = 1.0f; col[2] = 0.0f; col[3] = 1.0f; }
+    __try { g_dxCtx->ClearRenderTargetView(g_dxRtv, col); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return FALSE; }
+    return TRUE;
+}
+
+#define IWN_DX_WRAP(IDX, PAINT)                                                \
+static LONG_PTR IWN_DxWrap##IDX(void* a, void* b, void* c, void* d, void* e,    \
+                                void* f, void* g, void* h, void* i, void* j) {  \
+    InterlockedIncrement(&g_dxCalls[IDX]);                                     \
+    BOOL painted = FALSE;                                                      \
+    if (!g_dxDev && !g_quiet && (LONG)g_dxProbe < 3) {                         \
+        IDXGISwapChain* s = dxgiAsSwapChain(a);                                \
+        if (s) { if (!dxgiEnsureDev(s)) InterlockedIncrement(&g_dxProbe); }     \
+        else InterlockedIncrement(&g_dxProbe);                                 \
+    }                                                                          \
+    if (PAINT && g_dxDev && !g_quiet) {                                        \
+        DWORD t = GetTickCount();                                              \
+        if ((DWORD)g_dxTick != t) {                                            \
+            InterlockedExchange(&g_dxTick, (LONG)t);                           \
+            if (iwnEl() >= IWN_FLASH_T0 && iwnEl() < IWN_FLASH_T1) {           \
+                __try { painted = dxgiFlash(a, IDX); }                         \
+                __except (EXCEPTION_EXECUTE_HANDLER) {                         \
+                    InterlockedIncrement(&g_fail);                             \
+                    iwnHookLog("DXGI: flash EXCEPTION");                       \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    LONG_PTR r = ((PFN_DXGI10)g_dxTramps[IDX])(a, b, c, d, e, f, g, h, i, j);  \
+    if (painted) InterlockedIncrement(&g_dxPaints);                            \
+    return r;                                                                  \
+}
+IWN_DX_WRAP(0, 1)   // CDXGISwapChainDWMLegacy::PresentDWM  - paint
+IWN_DX_WRAP(1, 0)   // CDXGISwapChain::PresentDWM           - count
+IWN_DX_WRAP(2, 1)   // CDXGISwapChain::FlipPresentToDWM     - paint
+IWN_DX_WRAP(3, 0)   // CDXGISwapChain::Present               - count
+IWN_DX_WRAP(4, 0)   // CDXGISwapChain::PresentImpl           - count
+
+static void installDxgiHooks() {
+    if ((g_dxLive & ((1 << IWN_DXGI_N) - 1)) == ((1 << IWN_DXGI_N) - 1)) return;
+    static DWORD s_lastTry = 0;           // POD static - no TLS guard
+    DWORD now = GetTickCount();
+    if (s_lastTry && now - s_lastTry < 30000) return;
+    s_lastTry = now;
+    HMODULE dx = GetModuleHandleW(L"dxgi.dll");
+    if (!dx) { iwnHookLog("dwm: DXGI skipped (dxgi not loaded)"); return; }
+    char b[176];
+    wsprintfA(b, "dwm: DXGI base=%p (all RVAs verified against live bytes)",
+              (void*)dx);
+    iwnHookLog(b);
+    // Prologue bytes read straight from the PE file, one entry per function.
+    // `disp` is the smallest complete-instruction boundary >= 12 (patch size).
+    static const BYTE e0[13] = { 0x40, 0x53,                          // push rbx
+                                 0x48, 0x83, 0xEC, 0x50,              // sub rsp,50h
+                                 0x48, 0x8B, 0x49, 0x40,              // mov rcx,[rcx+40h]
+                                 0x45, 0x8B, 0xD8 };                  // mov r11d,r8d
+    static const BYTE e1[16] = { 0x48, 0x89, 0x5C, 0x24, 0x10,        // mov [rsp+10h],rbx
+                                 0x55, 0x56, 0x57,                     // push rbp,rsi,rdi
+                                 0x41, 0x54, 0x41, 0x55,               // push r12,r13
+                                 0x41, 0x56, 0x41, 0x57 };             // push r14,r15
+    static const BYTE e2[13] = { 0x48, 0x89, 0x5C, 0x24, 0x18,        // mov [rsp+18h],rbx
+                                 0x48, 0x89, 0x7C, 0x24, 0x20,        // mov [rsp+20h],rdi
+                                 0x55, 0x41, 0x54 };                  // push rbp,r12
+    static const BYTE e3[14] = { 0x48, 0x89, 0x5C, 0x24, 0x10,        // mov [rsp+10h],rbx
+                                 0x48, 0x89, 0x74, 0x24, 0x20,        // mov [rsp+20h],rsi
+                                 0x55, 0x57, 0x41, 0x56 };            // push rbp,rdi,r14
+    static const BYTE e4[16] = { 0x48, 0x8B, 0xC4,                    // mov rax,rsp
+                                 0x57,                                // push rdi
+                                 0x41, 0x54, 0x41, 0x55,              // push r12,r13
+                                 0x41, 0x56, 0x41, 0x57,              // push r14,r15
+                                 0x48, 0x83, 0xEC, 0x70 };            // sub rsp,70h
+    static const ULONG rvas[IWN_DXGI_N] = { 0x1AE30, 0x9CA0, 0x47C0, 0x4660, 0x9EB0 };
+    static const BYTE* exps[IWN_DXGI_N] = { e0, e1, e2, e3, e4 };
+    static const int disps[IWN_DXGI_N] = { 13, 16, 13, 14, 16 };
+    static const char* names[IWN_DXGI_N] = { "LegacyPresentDWM", "SwapChainPresentDWM",
+                                             "FlipPresentToDWM", "SwapChainPresent",
+                                             "PresentImpl" };
+    void* wraps[IWN_DXGI_N] = { (void*)&IWN_DxWrap0, (void*)&IWN_DxWrap1,
+                                (void*)&IWN_DxWrap2, (void*)&IWN_DxWrap3,
+                                (void*)&IWN_DxWrap4 };
+    for (int i = 0; i < IWN_DXGI_N; i++) {
+        if (g_dxLive & (1 << i)) continue;
+        BYTE* fn = (BYTE*)dx + rvas[i];
+        if (IsBadReadPtr(fn, 16)) continue;
+        BYTE fb[16];
+        CopyMemory(fb, fn, 16);
+        wsprintfA(b, "dwm: DXGI[%d] %s @%p %02X %02X %02X %02X %02X %02X %02X %02X",
+                  i, names[i], (void*)fn, fb[0], fb[1], fb[2], fb[3], fb[4],
+                  fb[5], fb[6], fb[7]);
+        iwnHookLog(b);
+        char tag[40];
+        wsprintfA(tag, "DXGI[%d %s]", i, names[i]);
+        PFN_CHAIN4 tr = nullptr;
+        if (iwnChainDetour(fn, exps[i], disps[i], wraps[i], &tr, &g_dxMem[i], tag)) {
+            g_dxTramps[i] = (void*)tr;
+            InterlockedOr(&g_dxLive, (1 << i));
+        }
+    }
+}
+
 static void readbackPixel(int i, const char* tag) {
     if (i < 0 || i >= g_tgtN || !g_tgt[i]) return;
     readbackTex(g_tgt[i], tag);
@@ -3744,6 +3940,9 @@ void DwmWarpBeforeSubmit() {
             installChainHooks();
             // r94: the kernel-composition channel (win32u NtDComposition*)
             installNtbHooks();
+            // r95: dxgi-side present entries (route 2). Paint lands on the
+            // back buffer at the moment it is handed to scanout.
+            installDxgiHooks();
         }
         if (ph == IWN_PH_CF_DEF && g_presntTried) {
             iwnHookLog("dwm: mode C - back to CF paint (wrapper passive)");
@@ -3795,6 +3994,20 @@ void DwmWarpBeforeSubmit() {
             // r94: retry the channel hooks too (idempotent, slot-guarded)
             if (!g_ntbSlots[0] && (LONG)g_stage == IWN_PH_PRESNT)
                 installNtbHooks();
+            // r95: dxgi present entries - independent of the dwm stage machine
+            if ((g_dxLive & ((1 << IWN_DXGI_N) - 1)) != ((1 << IWN_DXGI_N) - 1))
+                installDxgiHooks();
+            {
+                char b5[176];
+                wsprintfA(b5, "DXGI l=0x%lX leg=%ld base=%ld flip=%ld pres=%ld impl=%ld "
+                          "paints=%ld nolayout=%ld probe=%ld",
+                          (unsigned long)g_dxLive,
+                          (long)g_dxCalls[0], (long)g_dxCalls[1],
+                          (long)g_dxCalls[2], (long)g_dxCalls[3],
+                          (long)g_dxCalls[4], (long)g_dxPaints,
+                          (long)g_dxNoLayout, (long)g_dxProbe);
+                iwnHookLog(b5);
+            }
             {
                 char b2[128];
                 wsprintfA(b2, "SUBMITW calls=%ld paints=%ld mpo=%ld mpaints=%ld",
