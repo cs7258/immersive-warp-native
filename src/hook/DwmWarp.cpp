@@ -1134,40 +1134,82 @@ static void iwnProbeWireBuffers(void* self) {
 static volatile LONG g_scanBlits = 0;
 static volatile LONG g_scanFails = 0;
 
+static HMODULE moduleFromPtr(const void* p);   // fwd: defined further down
+
+// r85: identify what object actually receives the submit. PresentInternal does
+//   C = *(void**)( *(void**)( *(char**)self + 0x10 ) + 0x50 ) + 0xF0
+//   call C->vt[13](wireSwapchain, rects, count, ...)
+// Logging C's vtable RVA lets us name the class from the PDB `vftable` symbols.
+static void iwnIdentifySubmit(void* self) {
+    static volatile LONG s_done = 0;
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    __try {
+        char* A = *(char**)((char*)self + 0x10);
+        if (!A || IsBadReadPtr((char*)A + 0x50, 8)) { iwnHookLog("SUBMIT: A bad"); return; }
+        char* B = *(char**)(A + 0x50);
+        if (!B || IsBadReadPtr(B + 0xf0, 8)) { iwnHookLog("SUBMIT: B bad"); return; }
+        void* C = *(void**)(B + 0xf0);
+        if (!C || IsBadReadPtr(C, 8)) { iwnHookLog("SUBMIT: C bad"); return; }
+        void** vt = *(void***)C;
+        HMODULE m = moduleFromPtr((void*)vt);
+        char b[192];
+        wsprintfA(b, "SUBMIT C=%p vtable=mod+0x%05lX (A=%p B=%p)",
+                  C, m ? (unsigned long)((char*)vt - (char*)m) : 0, A, B);
+        iwnHookLog(b);
+        if (vt && !IsBadReadPtr(&vt[13], 8)) {
+            void* f13 = vt[13];
+            HMODULE m2 = moduleFromPtr(f13);
+            wsprintfA(b, "SUBMIT slot13=mod+0x%05lX  slot0=mod+0x%05lX",
+                      m2 ? (unsigned long)((char*)f13 - (char*)m2) : 0,
+                      moduleFromPtr(vt[0])
+                          ? (unsigned long)((char*)vt[0] - (char*)moduleFromPtr(vt[0])) : 0);
+            iwnHookLog(b);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        iwnHookLog("SUBMIT identify EXCEPTION");
+    }
+}
+
 static void iwnBlitToScanout(void* self) {
     if (!self || !g_target || !g_ctx) return;
-    UINT idx = (g_lbBackLast >= 0) ? (UINT)g_lbBackLast : 0;
-    ID3D11Texture2D* bb = iwnWireBuffer(self, idx);
-    if (!bb) {
-        InterlockedIncrement(&g_scanFails);
-    } else {
-        BOOL ok = FALSE;
+    UINT n = 3;
+    __try {
+        UINT c = *(UINT*)((char*)self + 0xa0);
+        if (c > 0 && c <= 4) n = c;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    // r85: dwm's blt present can be 1-2 frames behind the buffer the wrapper
+    // sees, so paint EVERY buffer. If the screen still ignores all three, this
+    // swapchain is not the scanout source at all and the submit target must be
+    // identified (iwnIdentifySubmit).
+    UINT okN = 0;
+    for (UINT i = 0; i < n; i++) {
+        ID3D11Texture2D* bb = iwnWireBuffer(self, i);
+        if (!bb) { InterlockedIncrement(&g_scanFails); continue; }
         __try {
             ID3D11Device* d = nullptr;
             D3D11_TEXTURE2D_DESC bd = {}, td = {};
             bb->GetDesc(&bd);
             g_target->GetDesc(&td);
             bb->GetDevice(&d);
-            // CopyResource demands identical dimensions AND format
             if (d && d == g_dev && bd.Width == td.Width && bd.Height == td.Height &&
                 bd.Format == td.Format && bd.SampleDesc.Count == td.SampleDesc.Count) {
                 g_ctx->CopyResource(bb, g_target);
-                ok = TRUE;
+                okN++;
             }
             if (d) d->Release();
         } __except (EXCEPTION_EXECUTE_HANDLER) { }
         bb->Release();
-        if (ok) InterlockedIncrement(&g_scanBlits);
-        else    InterlockedIncrement(&g_scanFails);
     }
+    if (okN) InterlockedIncrement(&g_scanBlits);
+    else     InterlockedIncrement(&g_scanFails);
     {
         static DWORD s_last = 0;             // POD static - no TLS guard
         DWORD t = GetTickCount();
         if (t - s_last > 5000) {
             s_last = t;
             char b[144];
-            wsprintfA(b, "SCANOUT idx=%u blits=%ld fails=%ld draws=%ld backIdx=%ld",
-                      idx, (long)g_scanBlits, (long)g_scanFails, (long)g_draws,
+            wsprintfA(b, "SCANOUT all=%u blits=%ld fails=%ld draws=%ld backIdx=%ld",
+                      okN, (long)g_scanBlits, (long)g_scanFails, (long)g_draws,
                       (long)g_lbBackLast);
             iwnHookLog(b);
         }
@@ -1850,6 +1892,7 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
             InterlockedIncrement(&g_frames);
             // round 82: one-shot forensic - which wire buffer holds the desktop?
             iwnProbeWireBuffers(self);
+            iwnIdentifySubmit(self);
             __try {
                 g_ctx->CopyResource(g_twin, g_target); // fresh COMPLETE frame
                 const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
