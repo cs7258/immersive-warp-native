@@ -1198,7 +1198,15 @@ static void iwnBlitToBindInfo(void* self) {
         if (!IsBadReadPtr(C + 0xD0, 8)) arr = *(void***)(C + 0xD0);
         if (!IsBadReadPtr(C + 0xD8, 8)) arr2 = *(void***)(C + 0xD8);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
-    if (n == 0 || n > 8) return;
+    if (n == 0 || n > 8) {
+        static volatile LONG s_n0 = 0;
+        if (InterlockedCompareExchange(&s_n0, 1, 0) == 0) {
+            char b[160];
+            wsprintfA(b, "BIND skip: C=%p n=%u arr=%p arr2=%p", C, n, arr, arr2);
+            iwnHookLog(b);
+        }
+        return;
+    }
 
     D3D11_TEXTURE2D_DESC td = {};
     __try { g_target->GetDesc(&td); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
@@ -1214,8 +1222,16 @@ static void iwnBlitToBindInfo(void* self) {
             __try { r = list[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
             if (!r || IsBadReadPtr(r, 8)) continue;
             ID3D11Texture2D* tex = nullptr;
+            HRESULT qhr = E_FAIL;
             __try {
-                if (SUCCEEDED(((IUnknown*)r)->QueryInterface(kIIDTex2D, (void**)&tex)) && tex) {
+                qhr = ((IUnknown*)r)->QueryInterface(kIIDTex2D, (void**)&tex);
+                if (dump) {
+                    char qb[128];
+                    wsprintfA(qb, "BINDPTR arr%d[%u]=%p QI=0x%08lX", which, i, r,
+                              (unsigned long)qhr);
+                    iwnHookLog(qb);
+                }
+                if (SUCCEEDED(qhr) && tex) {
                     D3D11_TEXTURE2D_DESC d = {};
                     tex->GetDesc(&d);
                     if (dump) {
