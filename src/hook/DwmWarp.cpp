@@ -1199,7 +1199,7 @@ static void iwnIdentifySubmit(void* self) {
         // pointer (capped, one-shot)
         for (DWORD off = 0; off < 0x120 && off < 0x118; off += 8) {
             void* q = nullptr;
-            __try { q = *(void**)(C + off); } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+            __try { q = *(void**)((char*)C + off); } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
             if (!q || IsBadReadPtr(q, 8)) continue;
             char fb[128];
             wsprintfA(fb, "C+0x%03lX = %p", (unsigned long)off, q);
