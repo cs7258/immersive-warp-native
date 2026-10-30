@@ -30,6 +30,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <string.h>          // r103: memcpy/memcmp for the byte-verified patches
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi.h>
@@ -1974,6 +1975,195 @@ static BOOL solidFillAll(const float col[4]) {
     return any;
 }
 
+// ---- r103: clean-frame mirrors ---------------------------------------------
+// The r101/r102 runs settled the two open questions with the operator's own
+// eyes: the paint point is right (the console status bar now warps with the
+// desktop, so the whole frame is written after dwm's own draw commands), but
+// the picture recursed and stuttered.
+//   * recursion: g_twin was refilled from a surface that ALREADY held our own
+//     warped output. The scan buffers are a rotating ring - our warp reaches
+//     the panel, dwm then keeps compositing dirty rects into the same buffer,
+//     and the next read samples our previous warp back in. Feeding a frame to
+//     itself can only be fixed by never using a written surface as a source.
+//   * stutter: two paint points x three buffers = 6 full-screen warp draws per
+//     frame (draws=10743 for frames=1785). The blurred PS over 1366x768 x6 is
+//     the whole cost.
+// What follows gives every scan buffer a private, same-format mirror:
+//   BeginFrame   (dwm has not drawn this frame yet) -> cleanRestore():
+//                scan buffer gets its clean copy back, so the warp of the
+//                previous frame can never become an input;
+//   ConfirmFrame (dwm finished compositing, not yet latched) -> cleanBackup()
+//                then paintFromClean(): the mirror is the source, the warp is
+//                drawn straight into the scan buffer.
+// One draw per buffer per frame, and the source is by construction a frame dwm
+// produced alone. Recursion is removed structurally, not by tuning.
+static ID3D11Texture2D*          g_cleanTex[IWN_WBUF_MAX];
+static ID3D11ShaderResourceView* g_cleanSrv[IWN_WBUF_MAX];
+static volatile LONG             g_cleanOk  = 0;
+static volatile LONG             g_cleanBk  = 0;
+static volatile LONG             g_cleanRs  = 0;
+static volatile LONG             g_cleanDraw= 0;
+
+static void cleanRelease(void) {
+    for (int i = 0; i < IWN_WBUF_MAX; i++) {
+        if (g_cleanSrv[i]) { g_cleanSrv[i]->Release(); g_cleanSrv[i] = nullptr; }
+        if (g_cleanTex[i]) { g_cleanTex[i]->Release(); g_cleanTex[i] = nullptr; }
+    }
+    InterlockedExchange(&g_cleanOk, 0);
+}
+
+static BOOL cleanEnsure(void) {
+    if (g_cleanOk) return TRUE;
+    if (!g_dev || g_wrtvN == 0) return FALSE;
+    for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
+        if (!g_wrtv[i].tex) return FALSE;
+        D3D11_TEXTURE2D_DESC td = {};
+        __try { g_wrtv[i].tex->GetDesc(&td); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return FALSE; }
+        if (g_cleanTex[i]) {                      // still matches the scan buffer?
+            D3D11_TEXTURE2D_DESC od = {};
+            g_cleanTex[i]->GetDesc(&od);
+            if (od.Width != td.Width || od.Height != td.Height ||
+                od.Format != td.Format || od.SampleDesc.Count != td.SampleDesc.Count) {
+                if (g_cleanSrv[i]) { g_cleanSrv[i]->Release(); g_cleanSrv[i] = nullptr; }
+                g_cleanTex[i]->Release();
+                g_cleanTex[i] = nullptr;
+            }
+        }
+        if (!g_cleanTex[i]) {
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.CPUAccessFlags = 0;
+            td.MiscFlags = 0;
+            td.ArraySize = 1;
+            td.MipLevels = 1;
+            HRESULT hr = g_dev->CreateTexture2D(&td, nullptr, &g_cleanTex[i]);
+            if (FAILED(hr)) {
+                static volatile LONG s_miss = 0;
+                if (InterlockedCompareExchange(&s_miss, 1, 0) == 0) {
+                    char e[160];
+                    wsprintfA(e, "r103: clean mirror CreateTexture2D FAILED buf=%ld "
+                              "fmt=0x%lX %ldx%ld hr=0x%lX",
+                              (long)i, (unsigned long)td.Format,
+                              (long)td.Width, (long)td.Height, (unsigned long)hr);
+                    iwnHookLog(e);
+                }
+                return FALSE;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sd.Format = td.Format;
+            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd.Texture2D.MipLevels = 1;
+            hr = g_dev->CreateShaderResourceView(g_cleanTex[i], &sd, &g_cleanSrv[i]);
+            if (FAILED(hr)) {
+                char e[160];
+                wsprintfA(e, "r103: clean mirror CreateSRV FAILED buf=%ld fmt=0x%lX "
+                          "hr=0x%lX", (long)i, (unsigned long)td.Format,
+                          (unsigned long)hr);
+                iwnHookLog(e);
+                return FALSE;
+            }
+        }
+    }
+    InterlockedExchange(&g_cleanOk, 1);
+    char b[168];
+    wsprintfA(b, "r103: clean mirrors ready bufs=%ld %ldx%ld "
+              "(warp source can never contain our own output)",
+              (long)g_wrtvN, (long)g_rtW, (long)g_rtH);
+    iwnHookLog(b);
+    return TRUE;
+}
+
+// dwm finished this frame: snapshot every scan buffer before touching it.
+static BOOL cleanBackup(void) {
+    BOOL any = FALSE;
+    for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
+        if (!g_cleanTex[i] || !g_wrtv[i].tex) continue;
+        __try { g_ctx->CopyResource(g_cleanTex[i], g_wrtv[i].tex); any = TRUE; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+    }
+    if (any) InterlockedIncrement(&g_cleanBk);
+    return any;
+}
+
+// next frame begins: hand the scan buffers back clean, so nothing accumulates.
+static void cleanRestore(void) {
+    if (!g_cleanOk) return;
+    BOOL any = FALSE;
+    for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
+        if (!g_cleanTex[i] || !g_wrtv[i].tex) continue;
+        __try { g_ctx->CopyResource(g_wrtv[i].tex, g_cleanTex[i]); any = TRUE; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+    }
+    if (any) InterlockedIncrement(&g_cleanRs);
+}
+
+// warp each scan buffer from ITS OWN clean mirror (not from a shared twin, and
+// never from a surface we already wrote).
+static BOOL paintFromClean(void) {
+    if (!g_ready || !g_ctx || g_wrtvN == 0) return FALSE;
+    IWNState st;
+    ZeroMemory(&st, sizeof(st));
+    stateSave(&st);
+    BOOL any = FALSE;
+
+    if (g_gridDirty) { fillGrid(); fillCb(); g_gridDirty = 0; }
+
+    D3D11_VIEWPORT vp = {};
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)g_rtW;
+    vp.Height = (float)g_rtH;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    UINT stride = sizeof(IWNVtx);
+    UINT off = 0;
+
+    __try {
+        g_ctx->RSSetViewports(1, &vp);
+        g_ctx->RSSetState(g_rs);
+        g_ctx->OMSetBlendState(g_bs, nullptr, 0xFFFFFFFF);
+        g_ctx->OMSetDepthStencilState(nullptr, 0);
+        g_ctx->IASetInputLayout(g_il);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &off);
+        g_ctx->VSSetShader(g_vs, nullptr, 0);
+        g_ctx->PSSetShader(g_ps, nullptr, 0);
+        g_ctx->PSSetSamplers(0, 1, &g_smp);
+        g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+        if (g_warpRTV) {
+            const float blk[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            g_ctx->ClearRenderTargetView(g_warpRTV, blk);
+        }
+        for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
+            if (!g_wrtv[i].tex || !g_cleanSrv[i]) continue;
+            g_ctx->PSSetShaderResources(0, 1, &g_cleanSrv[i]);
+            if (g_wrtv[i].rtv) {
+                g_ctx->OMSetRenderTargets(1, &g_wrtv[i].rtv, nullptr);
+                g_ctx->Draw(g_vertCount, 0);
+            } else if (g_warpRTV && g_warpRT) {
+                g_ctx->OMSetRenderTargets(1, &g_warpRTV, nullptr);
+                g_ctx->Draw(g_vertCount, 0);
+                __try { g_ctx->CopyResource(g_wrtv[i].tex, g_warpRT); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+            } else {
+                continue;
+            }
+            InterlockedIncrement(&g_draws);
+            InterlockedIncrement(&g_cleanDraw);
+            any = TRUE;
+        }
+        // never leave our mirror bound while dwm uses the context
+        ID3D11ShaderResourceView* nul = nullptr;
+        g_ctx->PSSetShaderResources(0, 1, &nul);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("r103: paintFromClean EXCEPTION");
+    }
+    stateRestore(&st);
+    return any;
+}
+
 static BOOL wirePaintCore(void) {
     if (g_wrtvN == 0) return FALSE;
     BOOL painted = FALSE;
@@ -2007,61 +2197,18 @@ static BOOL wirePaintCore(void) {
         // one thing that still has to be judged by eye: does a full-frame warp
         // survive when it is written after the frame's own draw commands.
         if (sincePaint >= 2000) {
-            // r98: recursion fix. Until this round g_twin was refilled from the
-            // wire buffer every frame - and that buffer already held our own
-            // warped output, so the picture fed on itself (the nested frames the
-            // operator saw on the 20:10 run). The source is now the composition
-            // render target: dwm draws it, we never write it. If it turns out to
-            // BE one of the wire buffers, fall back once to a locked snapshot -
-            // a static desktop, but never a feedback loop.
-            static volatile LONG s_srcMode = -1;   // -1 undecided, 0 live comp, 1 locked
-            static volatile LONG s_srcFail = 0;
-            BOOL srcOk = FALSE;
-            if ((LONG)s_srcMode < 0) {
-                ID3D11Texture2D* src = g_target;
-                BOOL isWire = FALSE;
-                if (src)
-                    for (int i = 0; i < g_wrtvN; i++)
-                        if (g_wrtv[i].tex == src) { isWire = TRUE; break; }
-                if (src && !isWire) {
-                    __try { g_ctx->CopyResource(g_twin, src); srcOk = TRUE; }
-                    __except (EXCEPTION_EXECUTE_HANDLER) { }
-                    if (srcOk) {
-                        InterlockedExchange(&s_srcMode, 0);
-                        iwnHookLog("SUBMIT: warp source = live composition (recursion off)");
-                    }
-                }
-                if (!srcOk) {
-                    __try { g_ctx->CopyResource(g_twin, g_wrtv[0].tex); srcOk = TRUE; }
-                    __except (EXCEPTION_EXECUTE_HANDLER) { }
-                    if (srcOk) {
-                        InterlockedExchange(&s_srcMode, 1);
-                        iwnHookLog("SUBMIT: warp source = locked snapshot (comp == wire buffer)");
-                    }
-                }
-            } else if ((LONG)s_srcMode == 0 && g_target) {
-                __try { g_ctx->CopyResource(g_twin, g_target); srcOk = TRUE; }
-                __except (EXCEPTION_EXECUTE_HANDLER) { }
-                if (!srcOk) {
-                    if (InterlockedIncrement(&s_srcFail) > 120) {
-                        InterlockedExchange(&s_srcMode, 1);
-                        iwnHookLog("SUBMIT: warp source -> locked snapshot (comp reads failing)");
-                    }
-                } else {
-                    InterlockedExchange(&s_srcFail, 0);
-                }
-            } else {
-                srcOk = TRUE;                       // locked: g_twin stays as is
-            }
-            BOOL srcReady = srcOk &&
-                            ((LONG)g_forceSolid ? iwnSolidSrv() : (g_srv != nullptr));
-            if (srcReady) {
+            // r103: the source is now each scan buffer's own clean mirror, taken
+            // a few microseconds earlier in the same frame. g_target / g_twin are
+            // no longer involved: every surface we sample has been guaranteed to
+            // be dwm's output only, so the frame cannot feed on itself.
+            if (cleanEnsure() && cleanBackup()) {
                 int before = (int)g_draws;
-                paintWarp();
-                painted = ((int)g_draws != before);
+                painted = paintFromClean();
+                if ((int)g_draws == before) painted = FALSE;
                 static volatile LONG s_wp = 0;
                 if (painted && InterlockedCompareExchange(&s_wp, 1, 0) == 0)
-                    iwnHookLog("SUBMIT: warp painted (after the batch, before confirm)");
+                    iwnHookLog("r103: warp painted from clean mirror "
+                               "(source never holds our output)");
             }
         }
 #endif
@@ -2195,6 +2342,58 @@ static HRESULT STDMETHODCALLTYPE IWN_MpoWrap(void* self, void* a2, void* a3, voi
     HRESULT hr = g_mpoTramp(self, a2, a3, a4, a5, a6, a7, a8);
     if (painted) InterlockedIncrement(&g_mpoPaints);
     return hr;
+}
+
+// ---- r103: force single-plane composition ---------------------------------
+// The operator is right that MPO has to be off before any frame-level hook can
+// see the whole desktop. What the counters say about THIS machine (18363,
+// NVS 4200M / GF119, WDDM 1.2) is:
+//   ConvertPresentToMultiplaneOverlay 0x162940   mpo=0 over 45 s
+//   CDWMSwapChain vt[13] submit                  calls=0 over 45 s
+//   all 11 dxgi present entries                  leg/base/flip/pres/impl/pdwm=0
+// so dwm reaches neither present branch: it hands the frame to the kernel
+// compositor through NtDComposition{SubmitDWMBatch,ConfirmFrame}. Fermi has no
+// MPO hardware, so there is no MPO present to switch off here.
+// What CAN still move pixels outside the composite surface is per-window
+// overlay / direct-flip assignment. Forcing both predicates FALSE guarantees
+// that every pixel of the desktop passes through the surface we warp - that is
+// the "MPO off" requirement, expressed at the layer this build actually has.
+static BOOL iwnForceFalse(const char* tag, BYTE* fn, const BYTE* expect, int len) {
+    if (!fn || IsBadReadPtr(fn, len)) return FALSE;
+    if (memcmp(fn, expect, len) != 0) {
+        char b[144];
+        wsprintfA(b, "r103: %s bytes differ - NOT patched (build mismatch)", tag);
+        iwnHookLog(b);
+        return FALSE;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(fn, 16, PAGE_EXECUTE_READWRITE, &old)) return FALSE;
+    BYTE p[3] = { 0x31, 0xC0, 0xC3 };          // xor eax,eax ; ret -> FALSE
+    memcpy(fn, p, 3);
+    FlushInstructionCache(GetCurrentProcess(), fn, 3);
+    DWORD tmp = 0;
+    VirtualProtect(fn, 16, old, &tmp);
+    char b[160];
+    wsprintfA(b, "r103: %s forced FALSE (nothing can bypass the composite surface)", tag);
+    iwnHookLog(b);
+    return TRUE;
+}
+
+static void iwnDisableOverlayAssignment(void) {
+    HMODULE h = GetModuleHandleW(L"dwmcore.dll");
+    if (!h) return;
+    BYTE* b = (BYTE*)h;
+    // 0x15EE4 COverlayContext::IsOverlayAssigned
+    //   48 89 5C 24 08 | 57 | 48 83 EC 20
+    static const BYTE e1[11] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57,
+                                 0x48, 0x83, 0xEC, 0x20, 0x48 };
+    iwnForceFalse("COverlayContext::IsOverlayAssigned", b + 0x15EE4, e1, 11);
+    // 0x15E3C CRenderTargetManager::IsOverlayOrDirectFlipAssigned
+    //   48 89 5C 24 08 | 48 89 6C 24 10
+    static const BYTE e2[11] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48,
+                                 0x89, 0x6C, 0x24, 0x10, 0x48 };
+    iwnForceFalse("CRenderTargetManager::IsOverlayOrDirectFlipAssigned",
+                  b + 0x15E3C, e2, 11);
 }
 
 // 12-byte prologue detour on ConvertPresentToMultiplaneOverlay (0x162940),
@@ -2537,6 +2736,14 @@ static void* volatile g_wireSelf = nullptr;
 
 static LONG WINAPI IWN_NtbBeginWrap(void* a, void* b, void* c, void* d) {
     InterlockedIncrement(&g_ntbBegin);
+    // r103: dwm has not composited this frame yet, so this is the safe moment to
+    // hand the scan buffers back their clean content. Anything we warped during
+    // the previous frame is erased here, before dwm can draw into it or before
+    // we can sample it again. This is what structurally ends the recursion.
+    if (g_ready && !g_quiet) {
+        __try { cleanRestore(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+    }
     return g_ntbTramps[0](a, b, c, d);
 }
 // build the wire RTV cache once, from the swapchain the present wrapper saw
@@ -2583,7 +2790,15 @@ static LONG WINAPI IWN_NtbSubmitWrap(void* a, void* b, void* c, void* d) {
 // costs one blit and cannot be overwritten by the frame it just closed).
 static LONG WINAPI IWN_NtbConfirmWrap(void* a, void* b, void* c, void* d) {
     InterlockedIncrement(&g_ntbConfirm);
-    BOOL pre = FALSE, post = FALSE;
+    BOOL pre = FALSE;
+    // r103: ONE paint per frame, and this is the place: dwm has finished
+    // compositing (all windows, taskbar, wallpaper, shadows) and the frame has
+    // not been latched to scanout yet. That is exactly the layer the operator
+    // described as PresentDWM. On 18363 the object that performs it is
+    // dwmcore's CDWMSwapChain::PresentInternal, not dxgi's
+    // CDXGISwapChainDWMLegacy - which is why every dxgi present entry read 0
+    // calls for ten minutes straight (r83) and again tonight (pdwm=0 over 45s
+    // with all 11 detours live).
     if (g_ready && !g_quiet) {
         __try {
             ntbWireCache();
@@ -2592,12 +2807,11 @@ static LONG WINAPI IWN_NtbConfirmWrap(void* a, void* b, void* c, void* d) {
         __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
     }
     LONG hr = g_ntbTramps[3](a, b, c, d);
-    if (g_ready && !g_quiet) {
-        __try { post = wirePaintCore(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
-    }
+    // r103: the post-confirm paint is gone on purpose. It doubled the full-frame
+    // draw cost (6 warp draws per frame -> the stutter the operator reported)
+    // and it ran on a buffer that already carried our own output, which is what
+    // kept the feedback loop alive.
     if (pre)  InterlockedIncrement(&g_ntbCfPre);
-    if (post) InterlockedIncrement(&g_ntbCfPost);
     return hr;
 }
 static LONG WINAPI IWN_NtbUpdWrap(void* a, void* b, void* c, void* d) {
@@ -4313,6 +4527,9 @@ void DwmWarpBeforeSubmit() {
             installChainHooks();
             // r94: the kernel-composition channel (win32u NtDComposition*)
             installNtbHooks();
+            // r103: no window may be promoted to an overlay / direct-flip
+            // plane, otherwise its pixels never touch the surface we warp.
+            iwnDisableOverlayAssignment();
             // r99: dxgi present entries (route 2) are installed LATER, from the
             // heartbeat path - see the el>=12s gate below. In r98 they went in
             // here, i.e. before the first paint, and their crash took the whole
@@ -4394,6 +4611,13 @@ void DwmWarpBeforeSubmit() {
                           (long)g_dxCalls[7], (long)g_dxCalls[8],
                           (long)g_dxCalls[9], (long)g_dxCalls[10]);
                 iwnHookLog(b6);
+                char b7[192];
+                wsprintfA(b7, "r103 clean ok=%ld bk=%ld rs=%ld draw=%ld "
+                          "cfpre=%ld cfpost=%ld draws=%ld",
+                          (long)g_cleanOk, (long)g_cleanBk, (long)g_cleanRs,
+                          (long)g_cleanDraw, (long)g_ntbCfPre,
+                          (long)g_ntbCfPost, (long)g_draws);
+                iwnHookLog(b7);
             }
             {
                 char b2[128];
