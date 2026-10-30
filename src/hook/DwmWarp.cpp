@@ -1822,6 +1822,9 @@ static volatile LONG  g_mpoHookState = 0;    // 1 trying, 2 live
 
 // shared paint core: flash (phase B) or warp (phase C) into the cached wire
 // RTVs. Returns TRUE when something was painted.
+static ID3D11Texture2D*        g_flashStage = nullptr;   // r94c: copy-mode source
+static ID3D11RenderTargetView* g_flashStageRtv = nullptr;
+
 static BOOL wirePaintCore(void) {
     if (g_wrtvN == 0) return FALSE;
     BOOL painted = FALSE;
@@ -1831,8 +1834,24 @@ static BOOL wirePaintCore(void) {
             float col[4];
             if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
             else                    { col[0] = 0.0f; col[1] = 1.0f; col[2] = 0.0f; col[3] = 1.0f; }
-            for (int i = 0; i < g_wrtvN; i++)
-                g_ctx->ClearRenderTargetView(g_wrtv[i].rtv, col);
+            // r94c: lazily build our own staging texture for the RTV-refused
+            // (CopyResource-only) wire buffers
+            if (!g_flashStage && g_dev && g_target) {
+                D3D11_TEXTURE2D_DESC td = {};
+                g_target->GetDesc(&td);
+                td.BindFlags = D3D11_BIND_RENDER_TARGET;
+                td.MiscFlags = 0;
+                if (SUCCEEDED(g_dev->CreateTexture2D(&td, nullptr, &g_flashStage)))
+                    g_dev->CreateRenderTargetView(g_flashStage, nullptr,
+                                                  &g_flashStageRtv);
+            }
+            if (g_flashStageRtv) g_ctx->ClearRenderTargetView(g_flashStageRtv, col);
+            for (int i = 0; i < g_wrtvN; i++) {
+                if (g_wrtv[i].rtv)
+                    g_ctx->ClearRenderTargetView(g_wrtv[i].rtv, col);
+                else if (g_flashStage)
+                    g_ctx->CopyResource(g_wrtv[i].tex, g_flashStage);
+            }
             painted = TRUE;
             static volatile LONG s_fp = 0;
             if (InterlockedCompareExchange(&s_fp, 1, 0) == 0) {
@@ -1856,7 +1875,11 @@ static BOOL wirePaintCore(void) {
     return painted;
 }
 
-// rebuild g_wrtv from the given texture set when it changed
+// rebuild g_wrtv from the given texture set when it changed.
+// r94c: KEEP the RTV-refused buffers (rtv=nullptr) - the flash paints them via
+// CopyResource from our own staging texture. r94b cached only 1 of 3 wire
+// buffers, and LBIDX says front=2 - the unpaintable buffer may be the scanout
+// one.
 static void wireCacheRefresh(ID3D11Texture2D** bufs, int n) {
     BOOL cacheOk = (g_wrtvN == n);
     if (cacheOk) {
@@ -1875,7 +1898,8 @@ static void wireCacheRefresh(ID3D11Texture2D** bufs, int n) {
         g_wrtv[j].rtv = nullptr;
     }
     g_wrtvN = 0;
-    for (int i = 0; i < n; i++) {
+    int copyN = 0;
+    for (int i = 0; i < n && g_wrtvN < IWN_WBUF_MAX; i++) {
         D3D11_TEXTURE2D_DESC bd = {}, td = {};
         __try {
             bufs[i]->GetDesc(&bd);
@@ -1889,10 +1913,17 @@ static void wireCacheRefresh(ID3D11Texture2D** bufs, int n) {
             g_wrtv[g_wrtvN].tex = bufs[i];
             g_wrtv[g_wrtvN].rtv = rv;
             g_wrtvN++;
+        } else {
+            bufs[i]->AddRef();
+            g_wrtv[g_wrtvN].tex = bufs[i];
+            g_wrtv[g_wrtvN].rtv = nullptr;
+            g_wrtvN++;
+            copyN++;
         }
     }
     char b[128];
-    wsprintfA(b, "SUBMIT: rtv cache built n=%d (bufs=%d)", g_wrtvN, n);
+    wsprintfA(b, "SUBMIT: rtv cache built n=%d (bufs=%d, copy=%d)",
+              g_wrtvN, n, copyN);
     iwnHookLog(b);
 }
 
