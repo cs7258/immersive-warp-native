@@ -1979,12 +1979,20 @@ static BOOL DwmWarpInstallMpoHook() {
     HMODULE h = GetModuleHandleW(L"dwmcore.dll");
     if (!h) { iwnHookLog("dwm: MPO hook skipped (no dwmcore)"); return FALSE; }
     BYTE* fn = (BYTE*)h + 0x162940;
-    const BYTE exp[12] = { 0x55, 0x53, 0x56, 0x57,            // push rbp,rbx,rsi,rdi
+    // r92d: the loaded dwmcore build differs from the System32 file (REX
+    // prefixes on push rbp) - accept BOTH 8-push variants, displace 12 or 13.
+    BYTE cur[16];
+    CopyMemory(cur, fn, 16);
+    const BYTE v13[13] = { 0x40, 0x55, 0x53, 0x56, 0x57,      // REX push rbp,rbx,rsi,rdi
                            0x41, 0x54, 0x41, 0x55,            // push r12, r13
                            0x41, 0x56, 0x41, 0x57 };          // push r14, r15
-    BYTE cur[12];
-    CopyMemory(cur, fn, 12);
-    if (memcmp(cur, exp, 12) != 0) {
+    const BYTE v12[12] = { 0x55, 0x53, 0x56, 0x57,            // push rbp,rbx,rsi,rdi
+                           0x41, 0x54, 0x41, 0x55,            // push r12, r13
+                           0x41, 0x56, 0x41, 0x57 };          // push r14, r15
+    int disp = 0;
+    if (memcmp(cur, v13, 13) == 0)      disp = 13;
+    else if (memcmp(cur, v12, 12) == 0) disp = 12;
+    if (disp == 0) {
         char b[160];
         wsprintfA(b, "dwm: MPO hook skipped (prologue %02X %02X %02X %02X %02X %02X)",
                   cur[0], cur[1], cur[2], cur[3], cur[4], cur[5]);
@@ -1995,13 +2003,14 @@ static BOOL DwmWarpInstallMpoHook() {
                                     PAGE_EXECUTE_READWRITE);
     if (!blk) { iwnHookLog("dwm: MPO hook skipped (no RWX mem)"); return FALSE; }
     BYTE* p = blk;
-    CopyMemory(p, fn, 12); p += 12;
+    CopyMemory(p, fn, (SIZE_T)disp); p += disp;
     *p++ = 0x48; *p++ = 0xB8;
-    UINT64 back = (UINT64)(fn + 12);
+    UINT64 back = (UINT64)(fn + disp);
     CopyMemory(p, &back, 8); p += 8;
     *p++ = 0xFF; *p++ = 0xE0;
-    if (!(blk[12] == 0x48 && blk[13] == 0xB8 &&
-          *(UINT64*)(blk + 14) == back && blk[22] == 0xFF && blk[23] == 0xE0)) {
+    if (!(blk[disp] == 0x48 && blk[disp + 1] == 0xB8 &&
+          *(UINT64*)(blk + disp + 2) == back &&
+          blk[disp + 10] == 0xFF && blk[disp + 11] == 0xE0)) {
         iwnHookLog("dwm: MPO hook skipped (trampoline bytes bad)");
         return FALSE;
     }
