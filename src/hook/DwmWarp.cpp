@@ -72,6 +72,10 @@ static int                        g_tgtN = 0;           // surfaces painted per 
 // render target, then CopyResource it into the face.
 static ID3D11Texture2D*           g_warpRT  = nullptr;  // own render target (copy mode)
 static ID3D11RenderTargetView*    g_warpRTV = nullptr;
+// r100 scanout probe: solid 4x4 source substituted for the desktop texture
+static ID3D11Texture2D*           g_solidTex = nullptr;
+static ID3D11ShaderResourceView*  g_solidSrv = nullptr;
+static volatile LONG              g_forceSolid = 0;
 static BOOL                       g_copyMode[IWN_MAX_TGT];
 static ID3D11Texture2D*           g_twin = nullptr;     // clean copy buffer
 static ID3D11Texture2D*           g_stageTex = nullptr; // CPU-readable mirror (diagnostics)
@@ -986,7 +990,12 @@ static void paintWarp() {
         g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &off);
         g_ctx->VSSetShader(g_vs, nullptr, 0);
         g_ctx->PSSetShader(g_ps, nullptr, 0);
-        g_ctx->PSSetShaderResources(0, 1, &g_srv);
+        // r100: the 13-17s probe swaps the desktop texture for a solid 4x4 red so
+        // the mesh/shader/copy-back can be judged independently of the source.
+        {
+            ID3D11ShaderResourceView* srvUse = (LONG)g_forceSolid ? g_solidSrv : g_srv;
+            if (srvUse) g_ctx->PSSetShaderResources(0, 1, &srvUse);
+        }
         g_ctx->PSSetSamplers(0, 1, &g_smp);
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
         // copy-mode faces render through our own RT; clear it once per frame
@@ -1900,6 +1909,71 @@ static BOOL markPaintSeg(void) {
     return TRUE;
 }
 
+// ---- r100: scanout identification -------------------------------------------
+// The 21:09 run reported frames=137 draws=408 and the operator saw nothing.
+// Two possibilities: the writes never reach the panel, or the warp pipeline
+// emits something that looks like an untouched desktop. Both probes below go
+// through the SAME paint point as the warp, so the answer is attributable:
+//   4 - 7s   solid magenta into every wire buffer  -> does a plain fill show?
+//   7 - 10s  solid green                           -> is buffer 2 scanned out?
+//   10-13s   solid blue                            -> and buffer 3?
+//   13-17s   the warp mesh textured with a solid 4x4 red instead of the desktop
+//            -> does mesh + shader + copy-back reach the panel at all?
+//   17s+     the real warp
+static BOOL iwnSolidSrv(void) {
+    if (g_solidSrv) return TRUE;
+    if (!g_dev) return FALSE;
+    UINT px[16];
+    for (int i = 0; i < 16; i++) px[i] = 0xFF0000FFu;   // BGRA red
+    D3D11_SUBRESOURCE_DATA sd = {};
+    sd.pSysMem = px;
+    sd.SysMemPitch = 4 * 4;
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = 4; td.Height = 4; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(g_dev->CreateTexture2D(&td, &sd, &g_solidTex)) || !g_solidTex) {
+        iwnHookLog("SOLID: 4x4 source FAILED");
+        return FALSE;
+    }
+    if (FAILED(g_dev->CreateShaderResourceView(g_solidTex, nullptr, &g_solidSrv))) {
+        g_solidTex->Release();
+        g_solidTex = nullptr;
+        iwnHookLog("SOLID: 4x4 SRV FAILED");
+        return FALSE;
+    }
+    iwnHookLog("SOLID: 4x4 red source ready");
+    return TRUE;
+}
+
+// Plain fill into EVERY registered wire buffer - the r94c path whose magenta was
+// seen on the panel on the 20:19 run, so a negative here is a real negative.
+static BOOL solidFillAll(const float col[4]) {
+    if (!g_ctx || g_wrtvN == 0) return FALSE;
+    if (!g_flashStage && g_target) {
+        D3D11_TEXTURE2D_DESC td = {};
+        g_target->GetDesc(&td);
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = 0;
+        if (SUCCEEDED(g_dev->CreateTexture2D(&td, nullptr, &g_flashStage)))
+            g_dev->CreateRenderTargetView(g_flashStage, nullptr, &g_flashStageRtv);
+    }
+    if (g_flashStageRtv) g_ctx->ClearRenderTargetView(g_flashStageRtv, col);
+    BOOL any = FALSE;
+    for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
+        if (g_wrtv[i].rtv) {
+            g_ctx->ClearRenderTargetView(g_wrtv[i].rtv, col);
+            any = TRUE;
+        } else if (g_flashStage && g_wrtv[i].tex) {
+            __try { g_ctx->CopyResource(g_wrtv[i].tex, g_flashStage); any = TRUE; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+        }
+    }
+    return any;
+}
+
 static BOOL wirePaintCore(void) {
     if (g_wrtvN == 0) return FALSE;
     BOOL painted = FALSE;
@@ -1914,35 +1988,61 @@ static BOOL wirePaintCore(void) {
                 iwnHookLog("MARK97: first paint (staging + CopyResource only)");
         }
 #else
-        if (el >= IWN_FLASH_T0 && el < IWN_FLASH_T1) {
-            float col[4];
-            if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
-            else                    { col[0] = 0.0f; col[1] = 1.0f; col[2] = 0.0f; col[3] = 1.0f; }
-            // r94c: lazily build our own staging texture for the RTV-refused
-            // (CopyResource-only) wire buffers
-            if (!g_flashStage && g_dev && g_target) {
-                D3D11_TEXTURE2D_DESC td = {};
-                g_target->GetDesc(&td);
-                td.BindFlags = D3D11_BIND_RENDER_TARGET;
-                td.MiscFlags = 0;
-                if (SUCCEEDED(g_dev->CreateTexture2D(&td, nullptr, &g_flashStage)))
-                    g_dev->CreateRenderTargetView(g_flashStage, nullptr,
-                                                  &g_flashStageRtv);
+        int solid = 0;
+        if (el >= 4000 && el < 6000)       solid = 1;   // magenta
+        else if (el >= 6000 && el < 8000)  solid = 2;   // green
+        else if (el >= 8000 && el < 10000) solid = 3;   // blue
+        if (solid) {
+            float col[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            if (solid == 1) { col[0] = 1.0f; col[2] = 1.0f; }
+            else if (solid == 2) { col[1] = 1.0f; }
+            else { col[2] = 1.0f; }
+            painted = solidFillAll(col);
+            static volatile LONG s_last = 0;
+            if (InterlockedExchange(&s_last, (LONG)solid) != (LONG)solid) {
+                char b[128];
+                wsprintfA(b, "PROBE: solid %ld (%s) filled=%ld bufs=%ld",
+                          (long)solid,
+                          solid == 1 ? "magenta" : (solid == 2 ? "green" : "blue"),
+                          (long)painted, (long)g_wrtvN);
+                iwnHookLog(b);
             }
-            if (g_flashStageRtv) g_ctx->ClearRenderTargetView(g_flashStageRtv, col);
-            for (int i = 0; i < g_wrtvN; i++) {
-                if (g_wrtv[i].rtv)
-                    g_ctx->ClearRenderTargetView(g_wrtv[i].rtv, col);
-                else if (g_flashStage)
-                    g_ctx->CopyResource(g_wrtv[i].tex, g_flashStage);
+        } else if (el >= 14000 && el < 17000) {
+            // 14-17s: mirror test - copy the composite render target straight into
+            // the wire buffers, NO warp. If the panel keeps showing the desktop,
+            // that RT really is the final composed image (the operator's doubt
+            // answered in one direction); if the panel goes black or garbage, it
+            // is not the scanout content and every warp built on it is built on
+            // the wrong surface.
+            int done = 0;
+            for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
+                if (!g_wrtv[i].tex || !g_target) continue;
+                __try { g_ctx->CopyResource(g_wrtv[i].tex, g_target); done++; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
             }
-            painted = TRUE;
-            static volatile LONG s_fp = 0;
-            if (InterlockedCompareExchange(&s_fp, 1, 0) == 0) {
-                iwnHookLog("SUBMIT: flash painted (post-compose, pre-submit)");
-                readbackTex(g_wrtv[0].tex, "SUBMIT-FLASH");
+            painted = (done > 0);
+            static volatile LONG s_mir = 0;
+            if (InterlockedCompareExchange(&s_mir, 1, 0) == 0) {
+                char b[128];
+                wsprintfA(b, "PROBE: mirror composite->wire done=%d bufs=%ld",
+                          done, (long)g_wrtvN);
+                iwnHookLog(b);
+                if (g_wrtvN) readbackTex(g_wrtv[0].tex, "MIRROR");
             }
-        } else if (el >= IWN_FLASH_T1) {
+        } else if (el >= 10000) {
+            // 10-14s: same mesh/shader/copy-back, but the texture it samples is a
+            // solid 4x4 red instead of the desktop - isolates the pipeline from
+            // the source. If the panel stays untouched here, the paint point (not
+            // the source) is what is broken.
+            InterlockedExchange(&g_forceSolid, (el < 14000) ? 1 : 0);
+            {
+                static volatile LONG s_wm = 0;
+                LONG want = (el < 14000) ? 1 : 2;
+                if (InterlockedExchange(&s_wm, want) != want) {
+                    if (want == 1) iwnHookLog("PROBE: warp mesh with SOLID red source");
+                    else           iwnHookLog("PROBE: warp mesh with REAL desktop source");
+                }
+            }
             // r98: recursion fix. Until this round g_twin was refilled from the
             // wire buffer every frame - and that buffer already held our own
             // warped output, so the picture fed on itself (the nested frames the
@@ -1989,7 +2089,9 @@ static BOOL wirePaintCore(void) {
             } else {
                 srcOk = TRUE;                       // locked: g_twin stays as is
             }
-            if (srcOk && g_srv) {
+            BOOL srcReady = srcOk &&
+                            ((LONG)g_forceSolid ? iwnSolidSrv() : (g_srv != nullptr));
+            if (srcReady) {
                 int before = (int)g_draws;
                 paintWarp();
                 painted = ((int)g_draws != before);
