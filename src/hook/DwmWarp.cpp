@@ -1134,6 +1134,33 @@ static void iwnProbeWireBuffers(void* self) {
 static volatile LONG g_scanBlits = 0;
 static volatile LONG g_scanFails = 0;
 
+// Resolve a live object's class name through MSVC RTTI:
+//   vtable[-1] -> RTTICompleteObjectLocator, +0x0C = TypeDescriptor RVA,
+//   TypeDescriptor+0x10 = ".?AVClassName@@" - no PDB needed, works for the
+//   ICF-folded vtables whose symbol is useless.
+static void iwnRttiName(void* obj, const char* tag) {
+    if (!obj) return;
+    __try {
+        void** vt = *(void***)obj;
+        if (!vt || IsBadReadPtr(vt - 1, 8)) { iwnHookLog("RTTI: no vtable[-1]"); return; }
+        DWORD* col = (DWORD*)*(void**)(vt - 1);
+        if (!col || IsBadReadPtr(col, 0x18)) { iwnHookLog("RTTI: bad COL"); return; }
+        HMODULE core = GetModuleHandleW(L"dwmcore.dll");
+        if (!core) return;
+        DWORD tdRva = col[3];
+        if (!tdRva) { iwnHookLog("RTTI: tdRva=0"); return; }
+        char* td = (char*)core + tdRva;
+        if (IsBadReadPtr(td, 0x20)) { iwnHookLog("RTTI: bad TD"); return; }
+        const char* nm = td + 0x10;
+        if (IsBadReadPtr(nm, 4)) { iwnHookLog("RTTI: bad name"); return; }
+        char b[224];
+        wsprintfA(b, "%s rtti=%s", tag, nm);
+        iwnHookLog(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        iwnHookLog("RTTI: exception");
+    }
+}
+
 static HMODULE moduleFromPtr(const void* p);   // fwd: defined further down
 
 // r85: identify what object actually receives the submit. PresentInternal does
@@ -1164,6 +1191,19 @@ static void iwnIdentifySubmit(void* self) {
                       moduleFromPtr(vt[0])
                           ? (unsigned long)((char*)vt[0] - (char*)moduleFromPtr(vt[0])) : 0);
             iwnHookLog(b);
+        }
+        iwnRttiName(C, "SUBMIT-C");
+        iwnRttiName(A, "SUBMIT-A");
+        iwnRttiName(B, "SUBMIT-B");
+        // field dump: any qword in the first 0x120 bytes that looks like a
+        // pointer (capped, one-shot)
+        for (DWORD off = 0; off < 0x120 && off < 0x118; off += 8) {
+            void* q = nullptr;
+            __try { q = *(void**)(C + off); } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+            if (!q || IsBadReadPtr(q, 8)) continue;
+            char fb[128];
+            wsprintfA(fb, "C+0x%03lX = %p", (unsigned long)off, q);
+            iwnHookLog(fb);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         iwnHookLog("SUBMIT identify EXCEPTION");
