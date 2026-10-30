@@ -149,6 +149,7 @@ static volatile LONG  g_quiet = 0;      // 1 = all painting suppressed
 static volatile LONG  g_dwin = 0;       // 0 none, 1 window active, 2 done
 static volatile LONG  g_lbFrontLast = -1; // updated every present by the wrapper
 static volatile LONG  g_lbBackLast  = -1;
+static void*          g_submitC = nullptr; // r92: CBindInfo from the submit chain
 
 // warp corners as DESTINATION positions (uv fractions of the surface): TL, TR,
 // BL, BR. Default = visible keystone: the drawn desktop becomes a trapezoid
@@ -941,8 +942,16 @@ static void cpyObserverHeartbeat() {
 }
 
 // ---- paint
+// r92: RTVs for the wire swapchain buffers. When g_wrtvN > 0, paintWarp draws
+// the warped mesh straight into the buffers dwm is about to submit (submit-point
+// painting), instead of the registered fingerprint targets.
+#define IWN_WBUF_MAX 4
+struct IWN_WireRtv { ID3D11Texture2D* tex; ID3D11RenderTargetView* rtv; };
+static IWN_WireRtv g_wrtv[IWN_WBUF_MAX];    // POD zero-init
+static int         g_wrtvN = 0;
+
 static void paintWarp() {
-    if (!g_ready || !g_ctx || g_tgtN == 0) return;
+    if (!g_ready || !g_ctx || (g_tgtN == 0 && g_wrtvN == 0)) return;
     IWNState st;
     ZeroMemory(&st, sizeof(st));      // stateRestore releases these; never let it see stack garbage
     stateSave(&st);
@@ -985,6 +994,15 @@ static void paintWarp() {
             const float blk[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
             g_ctx->ClearRenderTargetView(g_warpRTV, blk);
         }
+        // r92: submit-point mode - draw into the wire buffers directly
+        if (g_wrtvN > 0) {
+            for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
+                if (!g_wrtv[i].rtv) continue;
+                g_ctx->OMSetRenderTargets(1, &g_wrtv[i].rtv, nullptr);
+                g_ctx->Draw(g_vertCount, 0);
+                InterlockedIncrement(&g_draws);
+            }
+        } else {
         for (int i = 0; i < g_tgtN; i++) {
             if (g_copyMode[i]) {
                 if (!g_warpRTV) continue;
@@ -1000,6 +1018,7 @@ static void paintWarp() {
             g_ctx->OMSetRenderTargets(1, &g_rtvA[i], nullptr);
             g_ctx->Draw(g_vertCount, 0);
             InterlockedIncrement(&g_draws);
+        }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
@@ -1177,6 +1196,7 @@ static void iwnIdentifySubmit(void* self) {
         if (!B || IsBadReadPtr(B + 0xf0, 8)) { iwnHookLog("SUBMIT: B bad"); return; }
         void* C = *(void**)(B + 0xf0);
         if (!C || IsBadReadPtr(C, 8)) { iwnHookLog("SUBMIT: C bad"); return; }
+        g_submitC = C;                     // r92: cached for installSubmitHook
         void** vt = *(void***)C;
         HMODULE m = moduleFromPtr((void*)vt);
         char b[192];
@@ -1501,9 +1521,10 @@ static void iwnInspectRealization(void* real, BOOL force) {
 // AddRealization (disassembly 0x52784) appends each realization to the array
 // at [C+0x20] with the count at [C+0x38] - so the realizations that existed
 // BEFORE injection (the desktop's own) are readable without any detour.
+// r92: the source object is g_submitC (cached from the present submit chain).
 static void iwnScanBindInfoRealizations(const char* tag) {
-    if (!g_bindInfoC) return;
-    char* C = (char*)g_bindInfoC;
+    if (!g_submitC) return;
+    char* C = (char*)g_submitC;
     __try {
         if (IsBadReadPtr(C + 0x38, 4) || IsBadReadPtr(C + 0x20, 8)) return;
         UINT n = *(UINT*)(C + 0x38);
@@ -1698,6 +1719,164 @@ static void paintSolidFlash(void* self) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
         iwnHookLog("dwm: FLASH EXCEPTION");
+    }
+}
+
+// ================= r92: submit-point hook (THE paint point) ==================
+// r90 proved (solid magenta read back from the buffers, screen unchanged) that
+// anything painted at PresentInternal ENTRY is overwritten by the compose copy
+// that happens inside the trampoline (r75 already saw the buffers black at
+// entry). The disassembly of PresentInternal+0x2D1 shows the real submit:
+//   mov rax,[rcx]  mov rax,[rax+0x68]      ; C->vt[13]
+//   call [rip+0x20F399]                     ; guard_dispatch_icall_nop: jmp rax
+// The CFG helper slot is shared by the whole module and must not be touched;
+// the real target is the CBindInfo vtable slot 13 (0xEFF50). We patch THAT
+// vtable slot (patchVtableSlot, the proven 8-byte .rdata write) so our wrapper
+// runs AFTER the compose copy and IMMEDIATELY BEFORE the kernel submit - the
+// exact point fanxiushu's model requires.
+typedef HRESULT (STDMETHODCALLTYPE* PFN_SUBMIT10)(void*, void*, void*, void*, void*,
+                                                  void*, void*, void*, void*, void*);
+static PFN_SUBMIT10   g_submitTramp = nullptr;
+static volatile LONG  g_submitCalls = 0;
+static volatile LONG  g_submitPaints = 0;
+
+static BOOL submitPaint(void* wireSC) {
+    if (!g_ctx || !g_dev || !g_target || !g_twin) return FALSE;
+    ID3D11Texture2D* bufs[IWN_WBUF_MAX] = { 0 };
+    int n = 0;
+    __try {
+        void** vt = *(void***)wireSC;
+        if (!vt || IsBadReadPtr(&vt[9], 8)) return FALSE;
+        typedef HRESULT (STDMETHODCALLTYPE* PFN_GETB)(void*, UINT, const IID&, void**);
+        PFN_GETB gb = (PFN_GETB)vt[9];
+        for (UINT i = 0; i < IWN_WBUF_MAX; i++) {
+            ID3D11Texture2D* tex = nullptr;
+            if (FAILED(gb(wireSC, i, kIIDTex2D, (void**)&tex)) || !tex) break;
+            bufs[n++] = tex;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        n = 0;
+    }
+    if (n == 0) return FALSE;
+
+    // rebuild the RTV cache when dwm hands us a different buffer set
+    BOOL cacheOk = (g_wrtvN == n);
+    if (cacheOk) {
+        for (int i = 0; i < n && cacheOk; i++) {
+            BOOL found = FALSE;
+            for (int j = 0; j < g_wrtvN; j++)
+                if (g_wrtv[j].tex == bufs[i]) { found = TRUE; break; }
+            if (!found) cacheOk = FALSE;
+        }
+    }
+    if (!cacheOk) {
+        for (int j = 0; j < g_wrtvN; j++) {
+            if (g_wrtv[j].rtv) g_wrtv[j].rtv->Release();
+            if (g_wrtv[j].tex) g_wrtv[j].tex->Release();
+            g_wrtv[j].tex = nullptr;
+            g_wrtv[j].rtv = nullptr;
+        }
+        g_wrtvN = 0;
+        for (int i = 0; i < n; i++) {
+            D3D11_TEXTURE2D_DESC bd = {}, td = {};
+            __try {
+                bufs[i]->GetDesc(&bd);
+                g_target->GetDesc(&td);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            if (bd.Width != td.Width || bd.Height != td.Height ||
+                bd.Format != td.Format) continue;
+            ID3D11RenderTargetView* rv = nullptr;
+            if (SUCCEEDED(g_dev->CreateRenderTargetView(bufs[i], nullptr, &rv)) && rv) {
+                bufs[i]->AddRef();
+                g_wrtv[g_wrtvN].tex = bufs[i];
+                g_wrtv[g_wrtvN].rtv = rv;
+                g_wrtvN++;
+            }
+        }
+        char b[128];
+        wsprintfA(b, "SUBMIT: rtv cache built n=%d (bufs=%d)", g_wrtvN, n);
+        iwnHookLog(b);
+    }
+    for (int i = 0; i < n; i++) { if (bufs[i]) bufs[i]->Release(); }  // GetBuffer refs
+    if (g_wrtvN == 0) return FALSE;
+
+    BOOL painted = FALSE;
+    DWORD el = iwnEl();
+    __try {
+        if (el >= IWN_FLASH_T0 && el < IWN_FLASH_T1) {
+            // phase B: solid colour AT THE SUBMIT POINT - post-compose,
+            // pre-submit. If the screen does not flash now, the wire buffers
+            // are not what the kernel composites from, period.
+            float col[4];
+            if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
+            else                    { col[0] = 0.0f; col[1] = 1.0f; col[2] = 0.0f; col[3] = 1.0f; }
+            for (int i = 0; i < g_wrtvN; i++)
+                g_ctx->ClearRenderTargetView(g_wrtv[i].rtv, col);
+            painted = TRUE;
+            static volatile LONG s_fp = 0;
+            if (InterlockedCompareExchange(&s_fp, 1, 0) == 0) {
+                iwnHookLog("SUBMIT: flash painted (post-compose, pre-submit)");
+                readbackTex(g_wrtv[0].tex, "SUBMIT-FLASH");
+            }
+        } else if (el >= IWN_FLASH_T1) {
+            // phase C: warp the just-composed desktop into the submit buffers
+            __try { g_ctx->CopyResource(g_twin, g_wrtv[0].tex); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { }
+            int before = (int)g_draws;
+            paintWarp();
+            painted = ((int)g_draws != before);
+            static volatile LONG s_wp = 0;
+            if (painted && InterlockedCompareExchange(&s_wp, 1, 0) == 0)
+                iwnHookLog("SUBMIT: warp painted (post-compose, pre-submit)");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: submitPaint EXCEPTION");
+    }
+    return painted;
+}
+
+static HRESULT STDMETHODCALLTYPE IWN_SubmitWrap(void* c, void* wireSC, void* a3, void* a4,
+                                                void* a5, void* a6, void* a7, void* a8,
+                                                void* a9, void* a10) {
+    InterlockedIncrement(&g_submitCalls);
+    BOOL painted = FALSE;
+    if (g_ready && g_submitTramp && wireSC && !g_quiet &&
+        (LONG)g_stage == IWN_PH_PRESNT) {
+        DWORD t = GetTickCount();
+        if (t != g_lastPaintTick) {
+            g_lastPaintTick = t;
+            InterlockedIncrement(&g_frames);
+            __try { painted = submitPaint(wireSC); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+        }
+    }
+    HRESULT hr = g_submitTramp(c, wireSC, a3, a4, a5, a6, a7, a8, a9, a10);
+    if (painted) InterlockedIncrement(&g_submitPaints);
+    return hr;
+}
+
+// One-shot: once iwnIdentifySubmit has cached the CBindInfo, verify its vtable
+// slot 13 really is dwmcore+0xEFF50, then repoint the slot at our wrapper.
+static void installSubmitHook() {
+    if (g_submitTramp || !g_submitC) return;
+    HMODULE m = GetModuleHandleW(L"dwmcore.dll");
+    if (!m) return;
+    void** vt = *(void***)g_submitC;
+    if (!vt || IsBadReadPtr(&vt[13], 8)) return;
+    void* cur = vt[13];
+    void* want = (void*)((BYTE*)m + 0xEFF50);
+    char b[160];
+    if (cur != want) {
+        wsprintfA(b, "SUBMIT: slot13=%p expected %p - hook skipped", cur, want);
+        iwnHookLog(b);
+        return;
+    }
+    void* o = patchVtableSlot((void*)g_submitC, 13, (void*)&IWN_SubmitWrap,
+                              "SUBMIT[slot13]");
+    if (o) {
+        g_submitTramp = (PFN_SUBMIT10)o;
+        iwnHookLog("dwm: SUBMIT HOOK LIVE - paint point = post-compose pre-submit");
     }
 }
 
@@ -2349,81 +2528,16 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
     // wrapper-entry paint for the whole run (r82: frames=0 draws=0 all 150s).
     // They are no longer installed; PresentInternal entry is the only point
     // dwm actually executes before submitting to scanout.
-    BOOL painted = FALSE;
-    if (g_ready && g_presentTramp && (LONG)g_stage == IWN_PH_PRESNT && g_ctx && !g_quiet) {
-        DWORD t = GetTickCount();
-        if (t != g_lastPaintTick) {            // one paint per compose
-            g_lastPaintTick = t;
-            InterlockedIncrement(&g_frames);
-            // round 82: one-shot forensic - which wire buffer holds the desktop?
-            iwnProbeWireBuffers(self);
-            iwnIdentifySubmit(self);
-            DWORD el = iwnEl();
-            if (el >= IWN_FLASH_T0 && el < IWN_FLASH_T1) {
-                // r90 phase B: solid magenta/lime through EVERY channel. A full
-                // screen of magenta cannot be mistaken for a static desktop -
-                // whichever channel lights the screen up IS the scanout source.
-                __try {
-                    g_ctx->CopyResource(g_twin, g_target); // keep restore working
-                    paintSolidFlash(self);
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    InterlockedIncrement(&g_fail);
-                    iwnHookLog("dwm: flash save EXCEPTION (present)");
-                }
-                painted = TRUE;
-            } else if (el >= IWN_FLASH_T1) {
-                // r90 phase C: the r82-r89 warp paint, unchanged.
-                __try {
-                    g_ctx->CopyResource(g_twin, g_target); // fresh COMPLETE frame
-                    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-                    for (int i = 0; i < g_tgtN; i++) {
-                        if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    InterlockedIncrement(&g_fail);
-                    iwnHookLog("dwm: warp save EXCEPTION (present)");
-                }
-                int before = (int)g_draws;
-                paintWarp();
-                if ((int)g_draws == before) {
-                    if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (present)");
-                } else {
-                    painted = TRUE;
-                    // per-face proof + round 74: TWIN/WARPRT proof for this mode
-                    static BOOL s_proofB = FALSE;     // POD static - no TLS guard
-                    if (!s_proofB) {
-                        s_proofB = TRUE;
-                        readbackTex(g_twin,   "TWIN-B");
-                        readbackTex(g_warpRT, "WARPRT-B");
-                    }
-                    static BOOL s_proofDone[IWN_MAX_TGT];   // POD zero-init
-                    for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
-                        if (!s_proofDone[i]) {
-                            s_proofDone[i] = TRUE;
-                            readbackPixel(i, "warp-present");
-                        }
-                    }
-                    // round 82: hand the warped frame to the buffer dwm is about to
-                    // submit - resolved with dwm's OWN accessor + logical index.
-                    iwnBlitToScanout(self);
-                    // round 86: and to the bind-info resources the kernel
-                    // compositor actually consumes.
-                    iwnBlitToBindInfo(self);
-                }
-            }
-            // el < IWN_FLASH_T0: phase A owns painting at ConfirmFrame; the
-            // wrapper was not even installed yet on this timeline.
-        }
-    }
-    if (painted) iwnForensicsBefore(self);
-    HRESULT hr = g_presentTramp(self, a2, a3, a4, a5);
-    if (painted) iwnForensicsAfter(self);
-    // Immediate post-present restore is INVISIBLE (07:42/08:01 runs: the flip
-    // has not scanned out when Present returns). Defer to the next
-    // ConfirmFrame, the proven policy: dwm draws window content AFTER CF, so
-    // the restore at CF(N+1) cannot clobber fresh renders.
-    if (painted) g_pendingRestore = 1;
-    return hr;
+    // r92: the entry paint is GONE. r90 proved with a solid magenta read back
+    // from the wire buffers that anything painted here is overwritten by the
+    // compose copy inside the trampoline (r75: the buffers are BLACK at entry).
+    // The paint point is now the CBindInfo vtable slot 13 - the submit call at
+    // PresentInternal+0x2D1, i.e. AFTER the compose copy, BEFORE the kernel
+    // composite. Forensics stay (they are read-only).
+    iwnProbeWireBuffers(self);
+    iwnIdentifySubmit(self);
+    installSubmitHook();               // r92: one-shot, needs the cached CBindInfo
+    return g_presentTramp(self, a2, a3, a4, a5);
 }
 
 static void restoreAllSurfaces(const char* why) {
