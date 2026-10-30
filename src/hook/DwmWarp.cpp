@@ -55,7 +55,7 @@ static void f2a(char* b, float v) {
 // static guard would crash (round 28, measured).
 #define IWN_GRID_N 17          // 17x17 vertices -> 16*16*2*3 = 1536 verts
 #define IWN_MAX_VP 8
-#define IWN_MAX_TGT 5          // dwm keeps several same-size RT surfaces (rotation)
+#define IWN_MAX_TGT 8          // dwm faces + swapchain wire buffers
 
 struct IWNVtx { float x, y, u, v; };
 
@@ -104,6 +104,10 @@ static volatile LONG  g_flipInspec = 0;    // one-time flip-object inspection do
 static volatile LONG  g_flipDead = 0;      // 1 = hooks installed but never called
 static DWORD          g_flipInstallTick = 0;
 static volatile LONG  g_presntTried = 0;   // round 74: mode B entered once
+
+// round 75: wire-buffer registration (defined below IWN_FlipInspect, also used
+// by DwmWarpAttachTargets to survive probe re-attach cycles)
+static void applyWireFromSC(IDXGISwapChain* sc);
 static IDXGISwapChain* g_flipSC = nullptr; // dwm's own presenting swapchain (AddRef'd)
 static int            g_frontTgt = -1;     // wire face named by dwm's present object
 static ID3D11Texture2D* g_markerTex = nullptr; // 8x8 per-face wire marker source
@@ -741,6 +745,12 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
         iwnHookLog(b);
     }
     installCopyObserver();   // find dwm's composition->scanout copy (round 66)
+    // round 75: if the wire (dwm's own swapchain buffers) was already acquired,
+    // the probe's face list must NOT override it - the wire is the scanout source
+    if (g_flipSC) {
+        iwnHookLog("dwm: re-attach - re-applying wire buffers over face list");
+        applyWireFromSC(g_flipSC);
+    }
     wsprintfA(b, "dwm: WARP READY %ux%u fmt=%u - staged rollout starting",
               (unsigned)g_rtW, (unsigned)g_rtH, (unsigned)g_desc.Format);
     iwnHookLog(b);
@@ -1100,17 +1110,116 @@ static HMODULE moduleFromPtr(const void* p) {
     return h;
 }
 
-// ---- flip-object inspection (round 68) ---------------------------------------
+// ---- round 75: swapchain wire buffers ---------------------------------------
+// Round 74 proved: warp painted into ALL registered composition faces (both CF
+// and PresentInternal entry points, RTV and copy modes) NEVER reaches the
+// display, while the faces carry desktop pixels identical to CopyFromScreen.
+// Conclusion: the faces are dwm's composition working set, but the present
+// path blits dwm's OWN swapchain buffers (the LBIDX front=2 ring) to scanout.
+// applyWireFromSC enumerates those buffers via QI(IDXGISwapChain) on the
+// PresentInternal wrapper's `this` and replaces the paint target list with
+// them - the classic back-buffer hook (the original's "robust DXGI hooking").
+static void applyWireTargets(ID3D11Texture2D** bufs, UINT n) {
+    char b[192];
+    for (int i = 0; i < g_tgtN; i++) {
+        if (g_rtvA[i]) { g_rtvA[i]->Release(); g_rtvA[i] = nullptr; }
+        if (g_tgt[i])  { g_tgt[i]->Release();  g_tgt[i]  = nullptr; }
+        g_copyMode[i] = FALSE;
+        g_tgtDevOk[i] = FALSE;
+    }
+    g_tgtN = 0;
+    for (UINT i = 0; i < n && g_tgtN < IWN_MAX_TGT; i++) {
+        ID3D11Texture2D* t = bufs[i];
+        if (!t) continue;
+        D3D11_TEXTURE2D_DESC td = {};
+        __try { t->GetDesc(&td); } __except (EXCEPTION_EXECUTE_HANDLER) { t->Release(); continue; }
+        ID3D11Device* cdev = nullptr;
+        t->GetDevice(&cdev);
+        BOOL devOk = (cdev == g_dev);
+        if (cdev) cdev->Release();
+        if (!devOk) {
+            wsprintfA(b, "dwm: WIRE buf[%u] CROSS-DEVICE - skipped", i);
+            iwnHookLog(b);
+            t->Release();
+            continue;
+        }
+        ID3D11RenderTargetView* rv = nullptr;
+        HRESULT hr2 = g_dev->CreateRenderTargetView(t, nullptr, &rv);
+        BOOL rtvOk = SUCCEEDED(hr2) && rv;
+        t->AddRef();
+        g_tgt[g_tgtN]      = t;
+        g_rtvA[g_tgtN]     = rtvOk ? rv : nullptr;
+        g_copyMode[g_tgtN] = !rtvOk;
+        g_tgtDevOk[g_tgtN] = TRUE;
+        g_tgtN++;
+        wsprintfA(b, "dwm: WIRE tgt[%d] = buf[%u] %ux%u bind=0x%X misc=0x%X %s",
+                  g_tgtN - 1, i, (unsigned)td.Width, (unsigned)td.Height,
+                  (unsigned)td.BindFlags, (unsigned)td.MiscFlags,
+                  rtvOk ? "RTV mode" : "COPY mode (RTV refused)");
+        iwnHookLog(b);
+    }
+    if (g_tgtN > 0) {
+        g_target = g_tgt[0];   // borrowed ref: twin source + save/restore subject
+        D3D11_TEXTURE2D_DESC td0 = {};
+        __try { g_target->GetDesc(&td0); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        if (td0.Width != g_rtW || td0.Height != g_rtH) {
+            wsprintfA(b, "dwm: WIRE size %ux%u != face %ux%u - twin/restore may mismatch",
+                      (unsigned)td0.Width, (unsigned)td0.Height,
+                      (unsigned)g_rtW, (unsigned)g_rtH);
+            iwnHookLog(b);
+        }
+        iwnHookLog("dwm: PAINT TARGETS = dwm swapchain wire buffers");
+    } else {
+        iwnHookLog("dwm: WIRE registration produced no targets - faces kept");
+    }
+}
+
+static void applyWireFromSC(IDXGISwapChain* sc) {
+    char b[224];
+    if (!sc) return;
+    DXGI_SWAP_CHAIN_DESC dsc = {};
+    if (FAILED(sc->GetDesc(&dsc))) { iwnHookLog("dwm: WIRE GetDesc failed"); return; }
+    const char* se = dsc.SwapEffect == 0 ? "DISCARD(blt)" :
+                     dsc.SwapEffect == 1 ? "SEQUENTIAL(blt)" :
+                     dsc.SwapEffect == 3 ? "FLIP_SEQUENTIAL" :
+                     dsc.SwapEffect == 4 ? "FLIP_DISCARD" : "?";
+    wsprintfA(b, "dwm: WIRE SC %ux%u bufcnt=%u swap=%s windowed=%u fmt=%u",
+              (unsigned)dsc.BufferDesc.Width, (unsigned)dsc.BufferDesc.Height,
+              (unsigned)dsc.BufferCount, se, (unsigned)dsc.Windowed,
+              (unsigned)dsc.BufferDesc.Format);
+    iwnHookLog(b);
+    ID3D11Texture2D* wire[4] = {}; UINT wireN = 0;
+    for (UINT i = 0; i < dsc.BufferCount && i < 4; i++) {   // back buffers only
+        ID3D11Texture2D* t = nullptr;
+        HRESULT hb = sc->GetBuffer(i, __uuidof(ID3D11Texture2D), (void**)&t);
+        if (SUCCEEDED(hb) && t) {
+            D3D11_TEXTURE2D_DESC td = {};
+            t->GetDesc(&td);
+            wsprintfA(b, "dwm: WIRE buf[%u] %ux%u bind=0x%X misc=0x%X ptr=%p",
+                      i, (unsigned)td.Width, (unsigned)td.Height,
+                      (unsigned)td.BindFlags, (unsigned)td.MiscFlags, (void*)t);
+            iwnHookLog(b);
+            if (td.Width == g_rtW && td.Height == g_rtH &&
+                (td.BindFlags & D3D11_BIND_RENDER_TARGET) && wireN < 4) {
+                wire[wireN++] = t;      // ref handed to applyWireTargets
+            } else {
+                t->Release();
+            }
+        } else {
+            wsprintfA(b, "dwm: WIRE buf[%u] GetBuffer hr=0x%08X", i, (unsigned)hb);
+            iwnHookLog(b);
+        }
+    }
+    if (wireN > 0) applyWireTargets(wire, wireN);
+    else iwnHookLog("dwm: WIRE no usable back buffers");
+}
+
+// ---- flip-object inspection (round 68, wired into the wrapper in round 75) ---
 // The front surf must be named by dwm's OWN present path, not guessed among
-// the scanned candidates. IWN_FlipWrapA/B run INSIDE dwm's inner present call;
-// `self` there is the object dwm actually presents through. QueryInterface for
-// IDXGISwapChain: GetDesc reveals the real buffer count and swap effect (blt
-// vs flip - the question that decides whether a user-mode front buffer even
-// exists), GetBuffer(i) enumerates the wire buffers in dwm's own terms.
-//   * wire buffer == registered face  -> g_frontTgt named, engine knows its target
-//   * screen-size wire buffer NOT registered -> registered on the spot (copy
-//     mode, the proven-safe path) so the next frames paint the real wire
-//   * QI fails -> memory-scan the presenting object for registered pointers
+// the scanned candidates. Called once from IWN_PresentWrap: `self` there is
+// the object dwm actually presents through. QI for IDXGISwapChain (self, then
+// the [0x1A8] member the buffer accessors index through), GetDesc reveals the
+// real buffer count and swap effect, GetBuffer(i) enumerates the wire buffers.
 static void IWN_FlipInspect(void* self) {
     char b[280];
     if (!self) { iwnHookLog("dwm: FLIPSC self=null"); return; }
@@ -1119,67 +1228,26 @@ static void IWN_FlipInspect(void* self) {
     __try { hr = ((IUnknown*)self)->QueryInterface(__uuidof(IDXGISwapChain), (void**)&sc); }
     __except (EXCEPTION_EXECUTE_HANDLER) { sc = nullptr; hr = 0xE0000001; }
     if (SUCCEEDED(hr) && sc) {
-        DXGI_SWAP_CHAIN_DESC dsc = {};
-        if (SUCCEEDED(sc->GetDesc(&dsc))) {
-            const char* se = dsc.SwapEffect == 0 ? "DISCARD(blt)" :
-                             dsc.SwapEffect == 1 ? "SEQUENTIAL(blt)" :
-                             dsc.SwapEffect == 3 ? "FLIP_SEQUENTIAL" :
-                             dsc.SwapEffect == 4 ? "FLIP_DISCARD" : "?";
-            wsprintfA(b, "dwm: FLIPSC %ux%u bufcnt=%u swap=%s windowed=%u fmt=%u flags=0x%X",
-                      (unsigned)dsc.BufferDesc.Width, (unsigned)dsc.BufferDesc.Height,
-                      (unsigned)dsc.BufferCount, se, (unsigned)dsc.Windowed,
-                      (unsigned)dsc.BufferDesc.Format, (unsigned)dsc.Flags);
-            iwnHookLog(b);
-        } else {
-            iwnHookLog("dwm: FLIPSC QI ok but GetDesc failed");
-        }
-        int found = 0;
-        for (UINT i = 0; i < (UINT)dsc.BufferCount + 1 && i < 4; i++) {
-            ID3D11Texture2D* t = nullptr;
-            HRESULT hb = sc->GetBuffer(i, __uuidof(ID3D11Texture2D), (void**)&t);
-            if (SUCCEEDED(hb) && t) {
-                D3D11_TEXTURE2D_DESC td = {};
-                t->GetDesc(&td);
-                int match = -1;
-                for (int j = 0; j < g_tgtN; j++) if (g_tgt[j] == (void*)t) match = j;
-                wsprintfA(b, "dwm: FLIPBUF[%u] %ux%u bind=0x%X misc=0x%X ptr=%p %s",
-                          (unsigned)i, (unsigned)td.Width, (unsigned)td.Height,
-                          (unsigned)td.BindFlags, (unsigned)td.MiscFlags, (void*)t,
-                          match >= 0 ? "= REGISTERED tgt" : "(new)");
-                iwnHookLog(b);
-                if (match >= 0) {
-                    if (g_frontTgt < 0) g_frontTgt = match;
-                    found++;
-                } else if (g_rtW && td.Width == g_rtW && td.Height == g_rtH &&
-                           (td.BindFlags & D3D11_BIND_RENDER_TARGET) && g_tgtN < IWN_MAX_TGT) {
-                    // a wire buffer we were NOT painting - register it now so
-                    // the next frames paint the real presentation face
-                    t->AddRef();
-                    g_tgt[g_tgtN]      = t;
-                    g_rtvA[g_tgtN]     = nullptr;
-                    g_copyMode[g_tgtN] = TRUE;   // copy mode: proven safe on foreign faces
-                    g_tgtN++;
-                    g_frontTgt = g_tgtN - 1;
-                    wsprintfA(b, "dwm: FRONT SURF candidate registered as tgt[%d] (copy mode, from dwm present object)",
-                              g_tgtN - 1);
-                    iwnHookLog(b);
-                    found++;
-                }
-                t->Release();
-            } else {
-                wsprintfA(b, "dwm: FLIPBUF[%u] get hr=0x%08X", (unsigned)i, (unsigned)hb);
-                iwnHookLog(b);
-            }
-        }
-        if (found > 0 && g_frontTgt >= 0)
-            wsprintfA(b, "dwm: FRONT SURF = tgt[%d] (named by dwm's own present object)", g_frontTgt);
-        else
-            wsprintfA(b, "dwm: FRONT SURF not among registered faces (wire is elsewhere)");
-        iwnHookLog(b);
+        iwnHookLog("dwm: FLIPSC QI OK on self - enumerating wire buffers");
+        applyWireFromSC(sc);
         g_flipSC = sc;   // keep the AddRef from QueryInterface
         return;
     }
-    wsprintfA(b, "dwm: FLIPSC QI hr=0x%08X - not a DXGI swapchain, scanning object", (unsigned)hr);
+    // round 75: the [0x1A8] member is what the buffer accessors index through -
+    // the swapchain COM object may live there rather than on self
+    void* oA = IsBadReadPtr((char*)self + 0x1a8, 8) ? nullptr
+                                                    : *(void**)((char*)self + 0x1a8);
+    if (oA) {
+        __try { hr = ((IUnknown*)oA)->QueryInterface(__uuidof(IDXGISwapChain), (void**)&sc); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { sc = nullptr; hr = 0xE0000002; }
+        if (SUCCEEDED(hr) && sc) {
+            iwnHookLog("dwm: FLIPSC QI OK on self+1A8 - enumerating wire buffers");
+            applyWireFromSC(sc);
+            g_flipSC = sc;
+            return;
+        }
+    }
+    wsprintfA(b, "dwm: FLIPSC QI hr=0x%08X (self and +1A8) - not a DXGI swapchain, scanning object", (unsigned)hr);
     iwnHookLog(b);
     for (UINT off = 0; off < 0x1C0; off += 8) {
         if (IsBadReadPtr((char*)self + off, 8)) break;
@@ -1399,6 +1467,14 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
     // moves to IWN_FlipWrap (after the window compose, before the flip).
     // Failure -> keep the legacy entry paint below (wallpaper warp only; the
     // window regions of it are dirty-redrawn straight inside the trampoline).
+    // round 75: one-shot wire inspection at wrapper entry. The flip hooks never
+    // fire, so FLIP_BODY's inspection never ran - do it here where we KNOW we
+    // are inside dwm's real present path. applyWireFromSC replaces the paint
+    // target list with dwm's own swapchain buffers (the scanout source).
+    if ((LONG)g_stage == IWN_PH_PRESNT && !g_flipInspec) {
+        if (InterlockedCompareExchange(&g_flipInspec, 1, 0) == 0)
+            IWN_FlipInspect(self);
+    }
     if (!g_flipHooked) tryInstallFlipHook(self);
     // round 73 flip-dead detection: the A/B vtable slots were patched but get
     // ZERO calls on this blt path (round 72: frames frozen at 390 for 60s while
