@@ -2755,7 +2755,7 @@ static void installDxgiHooks() {
                                             0xA270, 0x1FE5C, 0xB790, 0x5420, 0x5110,
                                             0x15890 };
     // r98 additions - bytes read from the PE, one instruction boundary each.
-    static const BYTE e5[12] = { 0x40, 0x55,                          // push rbp
+    static const BYTE e5[13] = { 0x40, 0x55,                          // push rbp (REX+op)
                                  0x53, 0x56, 0x57,                     // push rbx,rsi,rdi
                                  0x41, 0x54, 0x41, 0x55,               // push r12,r13
                                  0x41, 0x56, 0x41, 0x57 };             // push r14,r15
@@ -2779,7 +2779,7 @@ static void installDxgiHooks() {
                                  0x48, 0x83, 0xEC, 0x20 };            // sub rsp,20h
     static const BYTE* exps[IWN_DXGI_N] = { e0, e1, e2, e3, e4,
                                             e5, e6, e7, e8, e9, e10 };
-    static const int disps[IWN_DXGI_N] = { 13, 16, 13, 14, 16, 12, 16, 19, 11, 12, 6 };
+    static const int disps[IWN_DXGI_N] = { 13, 16, 13, 14, 16, 13, 16, 19, 11, 12, 6 };
     static const char* names[IWN_DXGI_N] = { "LegacyPresentDWM", "SwapChainPresentDWM",
                                              "FlipPresentToDWM", "SwapChainPresent",
                                              "PresentImpl", "PresentImplCore",
