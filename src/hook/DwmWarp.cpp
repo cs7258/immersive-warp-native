@@ -2740,6 +2740,85 @@ static BOOL dxgiEnsureDev(IDXGISwapChain* sc) {
     return TRUE;
 }
 
+// ---- r102: the fanxiushu route, exactly as the article describes it --------
+// CDXGISwapChainDWMLegacy::PresentDWM (dxgi+0x1AE30) is dwm's "hand this frame
+// to the display" entry. GetBuffer(0) there IS the image about to be scanned
+// out - modify it before the original runs and the panel shows the warp while
+// any capture still sees the clean composed desktop. This is the whole point of
+// the present-layer approach: no dirty-rect competition, the frame is replaced
+// whole, every frame.
+//   source : CopyResource(g_twin, backbuffer)   (g_srv already views g_twin)
+//   warp   : the existing mesh/shader into our own RT
+//   output : CopyResource(backbuffer, g_warpRT) before org_PresentDWM runs
+static volatile LONG g_pdwmPaints = 0;
+static volatile LONG g_pdwmBad = 0;
+
+static BOOL dxPresentWarp(void* self) {
+    if (!g_ctx || !g_dev || !g_twin || !g_srv || !g_warpRT || !g_warpRTV) return FALSE;
+    IDXGISwapChain* sc = dxgiAsSwapChain(self);
+    if (!sc) {                                  // wrapper: real object at +0x40
+        void* alt = nullptr;
+        __try { alt = *(void**)((char*)self + 0x40); } __except (1) { alt = nullptr; }
+        if (alt) sc = dxgiAsSwapChain(alt);
+    }
+    if (!sc) { InterlockedIncrement(&g_pdwmBad); return FALSE; }
+    ID3D11Texture2D* bb = nullptr;
+    __try {
+        if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)))
+            bb = nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { bb = nullptr; }
+    if (!bb) { InterlockedIncrement(&g_pdwmBad); return FALSE; }
+
+    BOOL ok = FALSE;
+    __try {
+        D3D11_TEXTURE2D_DESC d = {};
+        bb->GetDesc(&d);
+        static volatile LONG s_once = 0;
+        if (InterlockedCompareExchange(&s_once, 1, 0) == 0) {
+            ID3D11Device* dev = nullptr;
+            __try { sc->GetDevice(__uuidof(ID3D11Device), (void**)&dev); }
+            __except (1) { dev = nullptr; }
+            char b[224];
+            wsprintfA(b, "PDWM: backbuffer %ux%u fmt=%d bind=0x%X msaa=%u devSame=%d ours=%ux%u",
+                      d.Width, d.Height, (int)d.Format, d.BindFlags,
+                      d.SampleDesc.Count, (dev == g_dev) ? 1 : 0, g_rtW, g_rtH);
+            iwnHookLog(b);
+            if (dev) dev->Release();
+        }
+        if (d.Width == g_rtW && d.Height == g_rtH) {
+            g_ctx->CopyResource(g_twin, bb);       // the frame leaving dwm
+            if (g_gridDirty) { fillGrid(); fillCb(); g_gridDirty = 0; }
+            D3D11_VIEWPORT vp = { 0, 0, (float)g_rtW, (float)g_rtH, 0.0f, 1.0f };
+            UINT stride = sizeof(IWNVtx), off = 0;
+            g_ctx->RSSetViewports(1, &vp);
+            g_ctx->RSSetState(g_rs);
+            g_ctx->OMSetBlendState(g_bs, nullptr, 0xFFFFFFFF);
+            g_ctx->OMSetDepthStencilState(nullptr, 0);
+            g_ctx->IASetInputLayout(g_il);
+            g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &off);
+            g_ctx->VSSetShader(g_vs, nullptr, 0);
+            g_ctx->PSSetShader(g_ps, nullptr, 0);
+            g_ctx->PSSetShaderResources(0, 1, &g_srv);
+            g_ctx->PSSetSamplers(0, 1, &g_smp);
+            g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+            const float blk[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            g_ctx->ClearRenderTargetView(g_warpRTV, blk);
+            g_ctx->OMSetRenderTargets(1, &g_warpRTV, nullptr);
+            g_ctx->Draw(g_vertCount, 0);
+            g_ctx->CopyResource(bb, g_warpRT);     // whole frame replaced
+            ok = TRUE;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("PDWM: EXCEPTION during warp");
+        ok = FALSE;
+    }
+    bb->Release();
+    if (ok) InterlockedIncrement(&g_pdwmPaints);
+    return ok;
+}
+
 // Clear the back buffer that is about to be presented. Runs at the dxgi
 // present entry, i.e. after dwm finished compositing and before scanout.
 static BOOL dxgiFlash(void* self, int which) {
@@ -2796,25 +2875,19 @@ static LONG_PTR IWN_DxWrap##IDX(void* a, void* b, void* c, void* d, void* e,    
         if (s) { if (!dxgiEnsureDev(s)) InterlockedIncrement(&g_dxProbe); }     \
         else InterlockedIncrement(&g_dxProbe);                                 \
     }                                                                          \
-    if (PAINT && g_dxDev && !g_quiet) {                                        \
-        DWORD t = GetTickCount();                                              \
-        if ((DWORD)g_dxTick != t) {                                            \
-            InterlockedExchange(&g_dxTick, (LONG)t);                           \
-            if (iwnEl() >= IWN_FLASH_T0 && iwnEl() < IWN_FLASH_T1) {           \
-                __try { painted = dxgiFlash(a, IDX); }                         \
-                __except (EXCEPTION_EXECUTE_HANDLER) {                         \
-                    InterlockedIncrement(&g_fail);                             \
-                    iwnHookLog("DXGI: flash EXCEPTION");                       \
-                }                                                              \
-            }                                                                  \
+    if (PAINT && g_ctx && !g_quiet && iwnEl() >= 2000) {                       \
+        __try { painted = dxPresentWarp(a); }                                  \
+        __except (EXCEPTION_EXECUTE_HANDLER) {                                 \
+            InterlockedIncrement(&g_fail);                                     \
+            iwnHookLog("DXGI: present warp EXCEPTION");                        \
         }                                                                      \
     }                                                                          \
     LONG_PTR r = ((PFN_DXGI10)g_dxTramps[IDX])(a, b, c, d, e, f, g, h, i, j);  \
     if (painted) InterlockedIncrement(&g_dxPaints);                            \
     return r;                                                                  \
 }
-IWN_DX_WRAP(0, 0)   // CDXGISwapChainDWMLegacy::PresentDWM  - count only (r96:
-                    // a second paint source would muddy the corner experiment)
+IWN_DX_WRAP(0, 1)   // CDXGISwapChainDWMLegacy::PresentDWM  - r102: THE paint
+                    // point (getbuffer -> warp -> copy back -> org present)
 IWN_DX_WRAP(1, 0)   // CDXGISwapChain::PresentDWM           - count
 IWN_DX_WRAP(2, 0)   // CDXGISwapChain::FlipPresentToDWM     - count only (r96)
 IWN_DX_WRAP(3, 0)   // CDXGISwapChain::Present               - count
@@ -4296,22 +4369,23 @@ void DwmWarpBeforeSubmit() {
             // r94: retry the channel hooks too (idempotent, slot-guarded)
             if (!g_ntbSlots[0] && (LONG)g_stage == IWN_PH_PRESNT)
                 installNtbHooks();
-            // r95/r99: dxgi present entries - installed only AFTER the paint
-            // window is established (12s in). Route 2 is a measurement, not a
-            // prerequisite: if it misbehaves the warp evidence is already on
-            // disk and on screen.
-            if (iwnEl() >= 12000 &&
+            // r102: route 2 is now the primary path, so the hooks go in EARLY
+            // (1.5s) instead of after the dwmcore paint window - PresentDWM has
+            // to be wrapped before the first frame it presents, otherwise the
+            // 45s budget could expire before a single call is captured.
+            if (iwnEl() >= 1500 &&
                 (g_dxLive & ((1 << IWN_DXGI_N) - 1)) != ((1 << IWN_DXGI_N) - 1))
                 installDxgiHooks();
             {
-                char b5[176];
+                char b5[208];
                 wsprintfA(b5, "DXGI l=0x%lX leg=%ld base=%ld flip=%ld pres=%ld impl=%ld "
-                          "paints=%ld nolayout=%ld probe=%ld",
+                          "paints=%ld nolayout=%ld probe=%ld pdwm=%ld pdwmBad=%ld",
                           (unsigned long)g_dxLive,
                           (long)g_dxCalls[0], (long)g_dxCalls[1],
                           (long)g_dxCalls[2], (long)g_dxCalls[3],
                           (long)g_dxCalls[4], (long)g_dxPaints,
-                          (long)g_dxNoLayout, (long)g_dxProbe);
+                          (long)g_dxNoLayout, (long)g_dxProbe,
+                          (long)g_pdwmPaints, (long)g_pdwmBad);
                 iwnHookLog(b5);
                 char b6[176];
                 wsprintfA(b6, "DXGI2 implCore=%ld fullscr=%ld compose=%ld "
