@@ -1978,6 +1978,20 @@ static BOOL wirePaintCore(void) {
     if (g_wrtvN == 0) return FALSE;
     BOOL painted = FALSE;
     DWORD el = iwnEl();
+    // r100b: the probe schedule must be anchored to the FIRST REAL PAINT, not to
+    // g_t0. On the 23:19 run g_t0 predated the first paint by ~12s, so the
+    // 4-10s colour windows expired before a single frame was drawn and only the
+    // el>=14000 branch ever ran. Paint-relative time removes that class of error.
+    static volatile LONG s_paintT0 = 0;
+    if (!s_paintT0) {
+        LONG prev = InterlockedCompareExchange(&s_paintT0, (LONG)GetTickCount(), 0);
+        if (prev == 0) {
+            char b[96];
+            wsprintfA(b, "PROBE: clock anchored at first paint (el=%lums)", (unsigned long)el);
+            iwnHookLog(b);
+        }
+    }
+    DWORD sincePaint = GetTickCount() - (DWORD)s_paintT0;
     __try {
 #if IWN_MARK_ONLY
         (void)el;                    // markPaintSeg reads the clock itself
@@ -1989,9 +2003,9 @@ static BOOL wirePaintCore(void) {
         }
 #else
         int solid = 0;
-        if (el >= 4000 && el < 6000)       solid = 1;   // magenta
-        else if (el >= 6000 && el < 8000)  solid = 2;   // green
-        else if (el >= 8000 && el < 10000) solid = 3;   // blue
+        if (sincePaint >= 3000 && sincePaint < 5000)       solid = 1;   // magenta
+        else if (sincePaint >= 5000 && sincePaint < 7000)  solid = 2;   // green
+        else if (sincePaint >= 7000 && sincePaint < 9000)  solid = 3;   // blue
         if (solid) {
             float col[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
             if (solid == 1) { col[0] = 1.0f; col[2] = 1.0f; }
@@ -2007,7 +2021,7 @@ static BOOL wirePaintCore(void) {
                           (long)painted, (long)g_wrtvN);
                 iwnHookLog(b);
             }
-        } else if (el >= 14000 && el < 17000) {
+        } else if (sincePaint >= 13000 && sincePaint < 16000) {
             // 14-17s: mirror test - copy the composite render target straight into
             // the wire buffers, NO warp. If the panel keeps showing the desktop,
             // that RT really is the final composed image (the operator's doubt
@@ -2029,15 +2043,16 @@ static BOOL wirePaintCore(void) {
                 iwnHookLog(b);
                 if (g_wrtvN) readbackTex(g_wrtv[0].tex, "MIRROR");
             }
-        } else if (el >= 10000) {
-            // 10-14s: same mesh/shader/copy-back, but the texture it samples is a
+        } else if (sincePaint >= 9000) {
+            // 9-13s: same mesh/shader/copy-back, but the texture it samples is a
             // solid 4x4 red instead of the desktop - isolates the pipeline from
             // the source. If the panel stays untouched here, the paint point (not
             // the source) is what is broken.
-            InterlockedExchange(&g_forceSolid, (el < 14000) ? 1 : 0);
+            InterlockedExchange(&g_forceSolid,
+                                (sincePaint < 13000) ? 1 : 0);
             {
                 static volatile LONG s_wm = 0;
-                LONG want = (el < 14000) ? 1 : 2;
+                LONG want = (sincePaint < 13000) ? 1 : 2;
                 if (InterlockedExchange(&s_wm, want) != want) {
                     if (want == 1) iwnHookLog("PROBE: warp mesh with SOLID red source");
                     else           iwnHookLog("PROBE: warp mesh with REAL desktop source");
