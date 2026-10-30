@@ -103,6 +103,7 @@ static volatile LONG  g_flipCalls = 0;     // inner present calls seen (path A/B
 static volatile LONG  g_flipInspec = 0;    // one-time flip-object inspection done
 static volatile LONG  g_flipDead = 0;      // 1 = hooks installed but never called
 static DWORD          g_flipInstallTick = 0;
+static volatile LONG  g_presntTried = 0;   // round 74: mode B entered once
 static IDXGISwapChain* g_flipSC = nullptr; // dwm's own presenting swapchain (AddRef'd)
 static int            g_frontTgt = -1;     // wire face named by dwm's present object
 static ID3D11Texture2D* g_markerTex = nullptr; // 8x8 per-face wire marker source
@@ -900,25 +901,22 @@ static void drawWireMarkers() {
 // ---------------------------------------------------------------- diagnostics
 // One pixel out of a candidate surface, via a staging copy. Never call this from
 // the reporter thread: the immediate context is not free-threaded.
-static void readbackPixel(int i, const char* tag) {
-    if (!g_stageTex || !g_ctx || i < 0 || i >= g_tgtN || !g_tgt[i]) return;
-    if (!g_tgtDevOk[i]) return;            // round 70: cross-device guard
+static void readbackTex(ID3D11Texture2D* tex, const char* tag) {
+    if (!g_stageTex || !g_ctx || !tex) return;
     __try {
-        g_ctx->CopyResource(g_stageTex, g_tgt[i]);
+        g_ctx->CopyResource(g_stageTex, tex);
         D3D11_MAPPED_SUBRESOURCE m = {};
         if (SUCCEEDED(g_ctx->Map(g_stageTex, 0, D3D11_MAP_READ, 0, &m)) && m.pData) {
             size_t off = (size_t)(g_rtH / 2) * m.RowPitch + (size_t)(g_rtW / 2) * 4;
             unsigned mid = *(const unsigned*)((const BYTE*)m.pData + off);
-            // The centre samples nearly the same source uv before and after the
-            // warp (corner uv average = centre), so it proves nothing. The
-            // top-left corner does: after the warp it shows the desktop pixel
-            // from uv~(0.15,0.02), which is a completely different colour.
             size_t off2 = (size_t)32 * m.RowPitch + 32 * 4;
-            // "near" is still a legacy MSVC keyword - do not name a variable that
             unsigned px2 = *(const unsigned*)((const BYTE*)m.pData + off2);
+            // one more sample near the centre-right, free extra signal
+            size_t off3 = (size_t)(g_rtH / 2) * m.RowPitch + (size_t)(g_rtW * 3 / 4) * 4;
+            unsigned px3 = *(const unsigned*)((const BYTE*)m.pData + off3);
             g_ctx->Unmap(g_stageTex, 0);
             char b[192];
-            wsprintfA(b, "dwm: READBACK %s tgt=%d mid=%08X corner=%08X", tag, i, mid, px2);
+            wsprintfA(b, "dwm: READBACK %s mid=%08X corner=%08X q3=%08X", tag, mid, px2, px3);
             iwnHookLog(b);
         } else {
             iwnHookLog("dwm: READBACK map failed");
@@ -926,6 +924,11 @@ static void readbackPixel(int i, const char* tag) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         iwnHookLog("dwm: READBACK EXCEPTION");
     }
+}
+
+static void readbackPixel(int i, const char* tag) {
+    if (i < 0 || i >= g_tgtN || !g_tgt[i]) return;
+    readbackTex(g_tgt[i], tag);
 }
 
 // ---- round 72: full-face raw dump (engine device only - DEVCHK-proven) ------
@@ -966,12 +969,12 @@ static void writeFaceRaw(const wchar_t* path, ID3D11Texture2D* face) {
     stg->Release();
 }
 
-// Three dump rounds at engine el 32/42/52s. Called from the CF boundary while
-// the quiet window suppresses every paint path (faces = dwm's own frames).
+// Four dump rounds: r1/r2 inside modes A/B (face = last painted content,
+// pre-restore), r3/r4 in the quiet window (residue + cursor composition check).
 static void dumpFacesTick(DWORD el) {
-    static const DWORD kRounds[3] = { 122000, 132000, 142000 };
+    static const DWORD kRounds[4] = { 25000, 55000, 122000, 140000 };
     static int s_next = 0;                       // POD static - no TLS guard
-    if (s_next >= 3) return;
+    if (s_next >= 4) return;
     if (el < kRounds[s_next]) return;
     int r = s_next + 1;
     s_next++;
@@ -999,7 +1002,7 @@ static void dumpFacesTick(DWORD el) {
                   (long)cp.x, (long)cp.y);
         iwnHookLog(b);
     }
-    if (r == 3) {
+    if (r == 4) {
         g_quiet = 0;
         g_dwin = 2;
         iwnHookLog("FACE DUMP window closed - paint resumed");
@@ -1431,8 +1434,13 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
                 if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (present)");
             } else {
                 painted = TRUE;
-                // per-face proof: read the painted corner of EVERY face once,
-                // so the log shows which faces actually carry the warp
+                // per-face proof + round 74: TWIN/WARPRT proof for this mode
+                static BOOL s_proofB = FALSE;     // POD static - no TLS guard
+                if (!s_proofB) {
+                    s_proofB = TRUE;
+                    readbackTex(g_twin,   "TWIN-B");
+                    readbackTex(g_warpRT, "WARPRT-B");
+                }
                 static BOOL s_proofDone[IWN_MAX_TGT];   // POD zero-init
                 for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
                     if (!s_proofDone[i]) {
@@ -1689,9 +1697,16 @@ static void paintAtConfirmFrame(LONG ph) {
     paintWarp();
     if ((int)g_draws == before) {
         if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw");
-    } else if (!g_proofWarp) {
-        g_proofWarp = 1;
-        readbackPixel(0, "warp");
+    } else {
+        // round 74: first CF-mode paint proof - TWIN (mesh input) and WARPRT
+        // (mesh output) split "draw produces nothing" from "input was black"
+        static BOOL s_proofA = FALSE;         // POD static - no TLS guard
+        if (!s_proofA) {
+            s_proofA = TRUE;
+            readbackTex(g_twin,   "TWIN-A");
+            readbackTex(g_warpRT, "WARPRT-A");
+            readbackPixel(0, "warp");
+        }
     }
 }
 
@@ -1954,13 +1969,15 @@ void DwmWarpBeforeSubmit() {
         return;
     }
     LONG ph;
-    // Timeline: passthrough -> CF immediate-restore sanity phase -> steady.
-    // At steady entry the PresentInternal WRAPPER is installed; on success the
-    // paint point moves there (frame is FINAL there - windows included - which
-    // the CF point can never be, 07:00 run: windows stay unwarped because dwm
-    // dirty-rect redraws them after our CF paint).
+    // round 74 mode-comparison timeline (each mode gets a 30s visibility window
+    // judged by the external screenshots):
+    //   A  8-30s   CF_DEF paint (23:18-run visible reference), NO wrapper
+    //   B 30-60s   PresentInternal wrapper entry paint (round-63 recipe)
+    //   C 60-150s  back to CF_DEF (wrapper stays installed but passive)
     if (el < 1500)       ph = IWN_PH_IDLE;
     else if (el < 8000)  ph = IWN_PH_CF_IMM;
+    else if (el < 30000) ph = IWN_PH_CF_DEF;
+    else if (el < 60000) ph = IWN_PH_PRESNT;
     else                 ph = IWN_PH_CF_DEF;
 
     if (ph != g_lastLoggedStage) {
@@ -1971,38 +1988,45 @@ void DwmWarpBeforeSubmit() {
         switch (ph) {
             case IWN_PH_IDLE:   what = "passthrough (must look unchanged)"; break;
             case IWN_PH_CF_IMM: what = "CF paint + immediate restore (forcePreserveBB)"; break;
-            case IWN_PH_CF_DEF: what = "CF paint + deferred restore (fallback mode)"; break;
-            case IWN_PH_PRESNT: what = "present-wrapper paint (frame final)"; break;
+            case IWN_PH_CF_DEF: what = "CF paint + deferred restore (mode A/C)"; break;
+            case IWN_PH_PRESNT: what = "present-wrapper paint (mode B, frame final)"; break;
         }
         wsprintfA(b, "dwm: WARP phase %ld @%lums - %s", ph, (unsigned long)el, what);
         iwnHookLog(b);
         // Steady-warp entry: suppress MPO/DirectFlip so overlay-direct windows
         // (cmd.exe, video, fullscreen) are routed back through the composite
         // surface we paint. Restored on every shutdown path via restoreBaseline.
-        if (ph == IWN_PH_CF_DEF) {
+        if (ph == IWN_PH_CF_DEF && !g_presntTried) {
+            // mode A entry: pure CF paint, wrapper deliberately NOT installed
             DwmWarpSetMpoSuppressed(TRUE);
             installLegacyPresentHook();   // round 69: dxgi legacy PresentDWM hook
+        }
+        if (ph == IWN_PH_PRESNT && !g_presntTried) {
+            // mode B entry: install the wrapper once
+            g_presntTried = 1;
             if (DwmWarpInstallPresentHook()) {
-                g_stage = IWN_PH_PRESNT;
-                iwnHookLog("dwm: paint point moved to PresentInternal wrapper");
+                iwnHookLog("dwm: mode B - paint point moved to PresentInternal wrapper");
             } else {
+                g_stage = IWN_PH_CF_DEF;
                 iwnHookLog("dwm: present wrapper NOT installed - staying on CF deferred-restore mode");
             }
+        }
+        if (ph == IWN_PH_CF_DEF && g_presntTried) {
+            iwnHookLog("dwm: mode C - back to CF paint (wrapper passive)");
         }
     }
 
     if (ph == IWN_PH_IDLE) return;
 
-    // round 72: quiet dump window (see the globals block comment). Round 73:
-    // moved to the END of the run (el 120..142s) so the steady warp gets a
-    // 112s visibility window first; the dumps then double as the cursor-
-    // composition check while the script walks the cursor.
+    // round 72: quiet dump window. Round 74: opens at el=120s (after the mode
+    // comparison); dumpFacesTick itself is scheduled independently so rounds
+    // r1/r2 fire inside modes A/B while the warp is live.
     if (g_dwin == 0 && el > 120000) {
         g_dwin = 1;
         g_quiet = 1;
-        iwnHookLog("FACE DUMP window open (paint quiet until el=142s)");
+        iwnHookLog("FACE DUMP window open (paint quiet until el=140s)");
     }
-    if (g_dwin == 1) dumpFacesTick(el);
+    dumpFacesTick(el);
 
     if ((LONG)g_stage == IWN_PH_PRESNT) {
         // Deferred restore from the previous present (mirrors phase B). Done
