@@ -1564,8 +1564,19 @@ static void suspendOtherThreads(int* suspended, HANDLE* handles, int cap);   // 
 static BOOL DwmWarpInstallRealizationHook() {
     if (InterlockedCompareExchange(&g_realHookState, 1, 0) != 0)
         return g_addRealTramp != nullptr;
-    HMODULE h = GetModuleHandleW(L"dwmcore.dll");
+    // r92: target the SAME dwmcore instance the CBindInfo vtable lives in -
+    // dwm.exe loads dwmcore.dll twice and GetModuleHandleW may return the
+    // inactive copy (r91: hook went LIVE but never fired).
+    HMODULE h = nullptr;
+    if (g_submitC && !IsBadReadPtr(g_submitC, 8)) {
+        void** cvt = *(void***)g_submitC;
+        if (cvt) h = moduleFromPtr((void*)cvt);
+    }
+    if (!h) h = GetModuleHandleW(L"dwmcore.dll");
     if (!h) { iwnHookLog("dwm: REAL hook skipped (no dwmcore)"); return FALSE; }
+    char bb[128];
+    wsprintfA(bb, "dwm: REAL hook targeting dwmcore @%p", (void*)h);
+    iwnHookLog(bb);
     BYTE* fn = (BYTE*)h + 0x52784;
     const BYTE exp[15] = { 0x48, 0x89, 0x5C, 0x24, 0x18,   // mov [rsp+18h],rbx
                            0x48, 0x89, 0x74, 0x24, 0x20,   // mov [rsp+20h],rsi
@@ -1864,17 +1875,22 @@ static HRESULT STDMETHODCALLTYPE IWN_SubmitWrap(void* c, void* wireSC, void* a3,
 
 // One-shot: once iwnIdentifySubmit has cached the CBindInfo, verify its vtable
 // slot 13 really is dwmcore+0xEFF50, then repoint the slot at our wrapper.
+// r92 fix: dwm.exe loads dwmcore.dll TWICE (the C vtable and its slot13
+// function live in the SECOND instance, while GetModuleHandleW returns the
+// first - the 16:02 run measured slot13=...E377FF50 vs expected ...9ECDFF50).
+// Base-agnostic fix: take the base from moduleFromPtr(slot13) and match by RVA.
 static void installSubmitHook() {
     if (g_submitTramp || !g_submitC) return;
-    HMODULE m = GetModuleHandleW(L"dwmcore.dll");
-    if (!m) return;
     void** vt = *(void***)g_submitC;
     if (!vt || IsBadReadPtr(&vt[13], 8)) return;
     void* cur = vt[13];
-    void* want = (void*)((BYTE*)m + 0xEFF50);
+    HMODULE base = moduleFromPtr(cur);
+    if (!base) { iwnHookLog("SUBMIT: slot13 module unknown - hook skipped"); return; }
+    ULONG rva = (ULONG)((char*)cur - (char*)base);
     char b[160];
-    if (cur != want) {
-        wsprintfA(b, "SUBMIT: slot13=%p expected %p - hook skipped", cur, want);
+    if (rva != 0xEFF50) {
+        wsprintfA(b, "SUBMIT: slot13 RVA=0x%lX unexpected - hook skipped",
+                  (unsigned long)rva);
         iwnHookLog(b);
         return;
     }
@@ -1883,6 +1899,10 @@ static void installSubmitHook() {
     if (o) {
         g_submitTramp = (PFN_SUBMIT10)o;
         iwnHookLog("dwm: SUBMIT HOOK LIVE - paint point = post-compose pre-submit");
+        // r92: the realization detour must target the SAME dwmcore instance
+        // this vtable lives in (r91 proved GetModuleHandle can pick the wrong
+        // one of the two copies - the hook went LIVE but never fired).
+        DwmWarpInstallRealizationHook();
     }
 }
 
@@ -3177,8 +3197,8 @@ void DwmWarpBeforeSubmit() {
                 g_stage = IWN_PH_CF_DEF;
                 iwnHookLog("dwm: present wrapper NOT installed - staying on CF deferred-restore mode");
             }
-            // r90: capture realizations as they appear (AddRealization detour)
-            DwmWarpInstallRealizationHook();
+            // r92: the realization hook installs from installSubmitHook (after
+            // the CBindInfo is cached) so it targets the right dwmcore copy
         }
         if (ph == IWN_PH_CF_DEF && g_presntTried) {
             iwnHookLog("dwm: mode C - back to CF paint (wrapper passive)");
