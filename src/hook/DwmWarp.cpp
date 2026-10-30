@@ -770,42 +770,77 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
 // CopyResource calls to find that copy. Vtable slot 47 = CopyResource. The
 // patch is one aligned 8-byte vtable store (atomic on x64), same pattern as
 // the proven flip-hook vtable patches.
-static void (STDMETHODCALLTYPE* g_cpyOrig)(void*, void*, void*) = nullptr;
-static volatile LONG g_cpyLogged = 0;
+// ---- round 77: copy observer range (ctx vtable slots 44..54) ----------------
+// The slot-47 CopyResource observer saw ZERO dwm copies, yet the composed frame
+// reaches the scanout allocation. dwm's compose->scanout copy must go through
+// another context method (CopySubresourceRegion / UpdateSubresource /
+// ResolveSubresource / ...). Observe the whole copy-method neighbourhood with
+// 6-arg forwarders (covers every copy method's arg count) and log any call
+// whose first args look like our screen-size textures.
+typedef void (STDMETHODCALLTYPE* PFN_CPY6)(void*, void*, void*, void*, void*, void*);
+static PFN_CPY6 g_cpyOrigR[11] = {};          // slots 44..54
+static volatile LONG g_cpyRLogged = 0;
 
-static void STDMETHODCALLTYPE IWN_CopyHook(void* self, void* dst, void* src) {
-    // skip our own copies (they always touch twin/warpRT/stageTex)
-    BOOL ours = (dst == (void*)g_twin || src == (void*)g_twin ||
-                 dst == (void*)g_warpRT || src == (void*)g_warpRT ||
-                 dst == (void*)g_stageTex || src == (void*)g_stageTex);
-    if (!ours && g_cpyLogged < 40 && dst && src) {
-        InterlockedIncrement(&g_cpyLogged);
-        D3D11_TEXTURE2D_DESC dd = {}, sd = {};
-        __try { ((ID3D11Texture2D*)dst)->GetDesc(&dd); } __except (EXCEPTION_EXECUTE_HANDLER) { dd.Width = 0; }
-        __try { ((ID3D11Texture2D*)src)->GetDesc(&sd); } __except (EXCEPTION_EXECUTE_HANDLER) { sd.Width = 0; }
-        char b[280];
-        wsprintfA(b, "dwm: CPY[%ld] dst %lux%lu fmt=%lu bind=0x%X misc=0x%X <- src %lux%lu fmt=%lu bind=0x%X misc=0x%X",
-                  (long)g_cpyLogged,
-                  (unsigned long)dd.Width, (unsigned long)dd.Height, (unsigned long)dd.Format,
-                  (unsigned)dd.BindFlags, (unsigned)dd.MiscFlags,
-                  (unsigned long)sd.Width, (unsigned long)sd.Height, (unsigned long)sd.Format,
-                  (unsigned)sd.BindFlags, (unsigned)sd.MiscFlags);
-        iwnHookLog(b);
-    }
-    if (g_cpyOrig) g_cpyOrig(self, dst, src);
+static void IWN_CpyLog(int slot, void* a1, void* a2) {
+    if (g_cpyRLogged >= 40) return;
+    if (!a1 && !a2) return;
+    D3D11_TEXTURE2D_DESC d1 = {}, d2 = {};
+    int ok1 = 0, ok2 = 0;
+    __try { if (a1) { ((ID3D11Texture2D*)a1)->GetDesc(&d1); ok1 = 1; } }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+    __try { if (a2) { ((ID3D11Texture2D*)a2)->GetDesc(&d2); ok2 = 1; } }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+    // only report screen-size texture traffic (dwm's desktop surfaces)
+    BOOL hit = (ok1 && d1.Width == (UINT)g_rtW && d1.Height == (UINT)g_rtH) ||
+               (ok2 && d2.Width == (UINT)g_rtW && d2.Height == (UINT)g_rtH);
+    if (!hit) return;
+    InterlockedIncrement(&g_cpyRLogged);
+    char b[280];
+    wsprintfA(b, "dwm: CPYR slot=%d a1=%p %lux%lu bind=0x%X misc=0x%X | a2=%p %lux%lu bind=0x%X misc=0x%X",
+              slot, a1, (unsigned long)d1.Width, (unsigned long)d1.Height,
+              (unsigned)d1.BindFlags, (unsigned)d1.MiscFlags,
+              a2, (unsigned long)d2.Width, (unsigned long)d2.Height,
+              (unsigned)d2.BindFlags, (unsigned)d2.MiscFlags);
+    iwnHookLog(b);
 }
 
+#define IWN_CPY_W(N, IDX)                                                        \
+static void STDMETHODCALLTYPE IWN_CpyW##N(void* s, void* a, void* b, void* c,    \
+                                          void* d, void* e) {                    \
+    IWN_CpyLog(IDX, a, b);                                                       \
+    if (g_cpyOrigR[IDX - 44]) g_cpyOrigR[IDX - 44](s, a, b, c, d, e);            \
+}
+IWN_CPY_W(0, 44) IWN_CPY_W(1, 45) IWN_CPY_W(2, 46) IWN_CPY_W(3, 47)
+IWN_CPY_W(4, 48) IWN_CPY_W(5, 49) IWN_CPY_W(6, 50) IWN_CPY_W(7, 51)
+IWN_CPY_W(8, 52) IWN_CPY_W(9, 53) IWN_CPY_W(10, 54)
+
 static void installCopyObserver() {
-    if (g_cpyOrig || !g_ctx) return;
+    if (g_cpyOrigR[3] || !g_ctx) return;
     void** vt = *(void***)g_ctx;
-    if (!vt || IsBadReadPtr(&vt[47], 8)) { iwnHookLog("dwm: CPY hook vtable unreadable"); return; }
-    g_cpyOrig = (void (STDMETHODCALLTYPE*)(void*, void*, void*))vt[47];
+    if (!vt || IsBadReadPtr(&vt[44], 11 * 8)) { iwnHookLog("dwm: CPYR vtable unreadable"); return; }
+    static const void* hooks[11] = {
+        (void*)&IWN_CpyW0,  (void*)&IWN_CpyW1,  (void*)&IWN_CpyW2, (void*)&IWN_CpyW3,
+        (void*)&IWN_CpyW4,  (void*)&IWN_CpyW5,  (void*)&IWN_CpyW6, (void*)&IWN_CpyW7,
+        (void*)&IWN_CpyW8,  (void*)&IWN_CpyW9,  (void*)&IWN_CpyW10
+    };
     DWORD op = 0;
-    if (!VirtualProtect(&vt[47], 8, PAGE_READWRITE, &op)) { g_cpyOrig = nullptr; return; }
-    vt[47] = (void*)&IWN_CopyHook;
+    if (!VirtualProtect(&vt[44], 11 * 8, PAGE_READWRITE, &op)) {
+        iwnHookLog("dwm: CPYR VirtualProtect failed");
+        return;
+    }
+    int n = 0;
+    for (int i = 0; i < 11; i++) {
+        if (vt[44 + i] != hooks[i]) {
+            g_cpyOrigR[i] = (PFN_CPY6)vt[44 + i];
+            vt[44 + i] = (void*)hooks[i];
+            n++;
+        }
+    }
     DWORD op2 = 0;
-    VirtualProtect(&vt[47], 8, op, &op2);
-    iwnHookLog("dwm: CPY observer installed (ctx vtable slot 47)");
+    VirtualProtect(&vt[44], 11 * 8, op, &op2);
+    char b[96];
+    wsprintfA(b, "dwm: CPYR observer installed on %d ctx slots (44-54)", n);
+    iwnHookLog(b);
 }
 
 // ---- paint
@@ -1232,6 +1267,31 @@ static void IWN_FlipInspect(void* self) {
     __except (EXCEPTION_EXECUTE_HANDLER) { sc = nullptr; hr = 0xE0000001; }
     if (SUCCEEDED(hr) && sc) {
         iwnHookLog("dwm: FLIPSC QI OK on self - enumerating wire buffers");
+        // round 77: enumerate the wire object's FULL vtable - find which slot
+        // (if any) holds dwm's internal present methods (PresentDWM legacy
+        // 0x1AE30 / CDXGISwapChain::PresentDWM 0x9CA0) that the COM Present
+        // (slot 8, round 76: zero calls) is bypassed by.
+        {
+            void** vt = *(void***)sc;
+            HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+            if (vt && !IsBadReadPtr(vt, 64 * 8)) {
+                char b2[160];
+                for (int s = 0; s < 64; s++) {
+                    if (IsBadReadPtr(&vt[s], 8)) break;
+                    void* fp = vt[s];
+                    HMODULE m = moduleFromPtr(fp);
+                    if (m) {
+                        unsigned long rva = (unsigned long)((char*)fp - (char*)m);
+                        wsprintfA(b2, "dwm: WIREVT slot%-2d = mod+0x%05lX%s", s, rva,
+                                  (m == dxgi && (rva == 0x1AE30 || rva == 0x9CA0))
+                                      ? "  <== PresentDWM" : "");
+                    } else {
+                        wsprintfA(b2, "dwm: WIREVT slot%-2d = %p (no module)", s, fp);
+                    }
+                    iwnHookLog(b2);
+                }
+            }
+        }
         applyWireFromSC(sc);
         g_flipSC = sc;   // keep the AddRef from QueryInterface
         return;
@@ -1245,6 +1305,27 @@ static void IWN_FlipInspect(void* self) {
         __except (EXCEPTION_EXECUTE_HANDLER) { sc = nullptr; hr = 0xE0000002; }
         if (SUCCEEDED(hr) && sc) {
             iwnHookLog("dwm: FLIPSC QI OK on self+1A8 - enumerating wire buffers");
+            {
+                void** vt = *(void***)sc;
+                HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+                if (vt && !IsBadReadPtr(vt, 64 * 8)) {
+                    char b2[160];
+                    for (int s = 0; s < 64; s++) {
+                        if (IsBadReadPtr(&vt[s], 8)) break;
+                        void* fp = vt[s];
+                        HMODULE m = moduleFromPtr(fp);
+                        if (m) {
+                            unsigned long rva = (unsigned long)((char*)fp - (char*)m);
+                            wsprintfA(b2, "dwm: WIREVT slot%-2d = mod+0x%05lX%s", s, rva,
+                                      (m == dxgi && (rva == 0x1AE30 || rva == 0x9CA0))
+                                          ? "  <== PresentDWM" : "");
+                        } else {
+                            wsprintfA(b2, "dwm: WIREVT slot%-2d = %p (no module)", s, fp);
+                        }
+                        iwnHookLog(b2);
+                    }
+                }
+            }
             applyWireFromSC(sc);
             g_flipSC = sc;
             return;
