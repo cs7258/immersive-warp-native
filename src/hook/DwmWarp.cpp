@@ -97,6 +97,13 @@ static UINT                       g_vertCount = 0;
 
 static volatile LONG  g_ready = 0;      // 1 = resources live, paint path usable
 static volatile LONG  g_stage = 0;      // 0 off, 1..4 staged rollout
+// r104: one-shot latch. Once the 45s budget (or the failure budget) closes the
+// engine, nothing may re-arm it. The 00:19 run proved why: the probe's 10s
+// texture rescan called DwmWarpAttachTargets again 14s after auto-off, which
+// rebuilt the pipeline on top of the still-registered target set (RTV count
+// went 3 -> 6) and dwm died 2s later in
+// CD3DDeviceManager::HandleAdvanceFrame+0x55F (0xe0464645).
+static volatile LONG  g_hardStop = 0;   // 1 = engine is finished for this dwm
 static volatile LONG  g_frames = 0;
 static volatile LONG  g_fail = 0;
 static volatile LONG  g_draws = 0;
@@ -512,6 +519,12 @@ static void logDeviceRemoved(const char* where) {
 bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
     if (!list || n <= 0) return false;
     char b[256];
+    // r104: hard stop. The budget latch is permanent for this dwm process, so
+    // a late rescan can never rebuild the engine over a half-torn-down state.
+    if (InterlockedCompareExchange(&g_hardStop, 1, 1) == 1) {
+        iwnHookLog("dwm: attach REFUSED (engine hard-stopped for this dwm)");
+        return false;
+    }
 
     if (g_ready) {
         // Re-attach while running (periodic rescan): rebuild the RTV set only.
@@ -1989,14 +2002,15 @@ static BOOL solidFillAll(const float col[4]) {
 //     frame (draws=10743 for frames=1785). The blurred PS over 1366x768 x6 is
 //     the whole cost.
 // What follows gives every scan buffer a private, same-format mirror:
-//   BeginFrame   (dwm has not drawn this frame yet) -> cleanRestore():
-//                scan buffer gets its clean copy back, so the warp of the
-//                previous frame can never become an input;
 //   ConfirmFrame (dwm finished compositing, not yet latched) -> cleanBackup()
 //                then paintFromClean(): the mirror is the source, the warp is
 //                drawn straight into the scan buffer.
-// One draw per buffer per frame, and the source is by construction a frame dwm
-// produced alone. Recursion is removed structurally, not by tuning.
+// The other half of the fix is on dwm's side, not ours: fullFrameRedraw() makes
+// dwm repaint the entire frame, so whatever we warped last frame is overwritten
+// by dwm's own output before we can sample it again. r103 tried to do this by
+// copying the mirror back into the scan buffer at BeginFrame, which writes the
+// buffer being scanned out - tearing after a desktop click, then a dwm crash in
+// CD3DDeviceManager::HandleAdvanceFrame+0x55F. That path is removed.
 static ID3D11Texture2D*          g_cleanTex[IWN_WBUF_MAX];
 static ID3D11ShaderResourceView* g_cleanSrv[IWN_WBUF_MAX];
 static volatile LONG             g_cleanOk  = 0;
@@ -2087,16 +2101,12 @@ static BOOL cleanBackup(void) {
 }
 
 // next frame begins: hand the scan buffers back clean, so nothing accumulates.
-static void cleanRestore(void) {
-    if (!g_cleanOk) return;
-    BOOL any = FALSE;
-    for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
-        if (!g_cleanTex[i] || !g_wrtv[i].tex) continue;
-        __try { g_ctx->CopyResource(g_wrtv[i].tex, g_cleanTex[i]); any = TRUE; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
-    }
-    if (any) InterlockedIncrement(&g_cleanRs);
-}
+// r104: the r103 cleanRestore() is removed on purpose. Copying a "clean" mirror
+// back into the scan buffers at BeginFrame writes the buffer that is currently
+// being scanned out; that is what produced the tearing after a desktop click and
+// what killed dwm in CD3DDeviceManager::HandleAdvanceFrame+0x55F. The wipe is
+// now dwm's own forced full-frame render (fullFrameRedraw), which cannot race
+// the scanout because dwm schedules it itself.
 
 // warp each scan buffer from ITS OWN clean mirror (not from a shared twin, and
 // never from a surface we already wrote).
@@ -2498,6 +2508,41 @@ static BOOL DwmWarpInstallMpoHook() {
 // spilled rdx/r8 (prologue stores), not stack parameters - 4-register
 // forwarding is correct for all four.
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CHAIN4)(void*, void*, void*, void*);
+
+// ---- r104: forced full-frame redraw -----------------------------------------
+// Root cause of the recursion, finally measured on the 00:19 run: this dwm
+// composites INCREMENTALLY (`WIRE SC swap=SEQUENTIAL(blt)`). It only repaints
+// the dirty region, so whatever we warped outside that region survives into the
+// next frame, gets sampled as if it were clean, and is warped again - the
+// operator's "recursion" is that accumulation, not a stale source pointer.
+// r103 tried to undo it by restoring a clean mirror into the scan buffers at
+// BeginFrame; that writes the buffer being scanned out and dwm died in
+// CD3DDeviceManager::HandleAdvanceFrame+0x55F.
+//
+// The self-consistent fix is to make dwm repaint every pixel every frame. Then
+// its own output erases our previous warp before we ever sample it: the source
+// is always a complete, clean frame, no rollback is needed, and no buffer is
+// written while it is being scanned out.
+//   CComposition::ForceFullRender(this, bool)      dwmcore + 0xD5C0C
+//     mov rcx,[rcx+0x40] ; test dl,dl ; je 0xD5C24 ; jmp 0x1877A4
+// It is called from the wrapper we already have on CComposition::Present, which
+// fires every frame (CHAIN A c=1615 on the last run) - so this adds no new hook.
+static HMODULE     g_chainBase[2];
+static PFN_CHAIN4  g_forceFullRender = nullptr;
+static volatile LONG g_fullRender = 0;        // successful ForceFullRender calls
+
+static void fullFrameRedraw(void* comp) {
+    if (!g_forceFullRender || !comp || IsBadReadPtr(comp, 8)) return;
+    DWORD t = GetTickCount();
+    static DWORD s_last = 0;                  // POD static - no TLS guard
+    if (t == s_last) return;
+    s_last = t;
+    __try {
+        ((HRESULT (STDMETHODCALLTYPE*)(void*, unsigned char, void*, void*))
+            g_forceFullRender)(comp, 1, nullptr, nullptr);
+        InterlockedIncrement(&g_fullRender);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+}
 // r93b: hooks go into BOTH dwmcore instances. r93's live run proved the m1
 // (GetModuleHandle / PresentInternal) copies of rtm/hwnd/int get ZERO calls
 // in 150s, while m2 (the instance hosting the CBindInfo/CDWMSwapChain
@@ -2513,6 +2558,7 @@ static void*      g_chainTrampMems[2][4];
 static HRESULT STDMETHODCALLTYPE NAME(void* a, void* b, void* c, void* d) {    \
     InterlockedIncrement(&g_chainCalls[INST][IDX]);                            \
     BOOL painted = FALSE;                                                      \
+    if (IDX == 0 && g_ready && !g_quiet) fullFrameRedraw(a);                   \
     if (IDX == 3 && g_ready && !g_quiet && (LONG)g_stage == IWN_PH_PRESNT) {   \
         DWORD t = GetTickCount();                                              \
         if (t != g_lastPaintTick) {                                            \
@@ -2675,6 +2721,22 @@ static void installChainHooks() {
     static const ULONG rvaTab[4] = { 0x77538, 0x7782C, 0x5B2A0, 0x5B328 };
     static const char* nameTab[4] = { "comp", "rtm", "hwnd", "int" };
     HMODULE bases[2] = { m1, m2 };
+    g_chainBase[0] = m1;
+    g_chainBase[1] = m2;
+    // r104: arm the forced full-frame redraw against instance #1 (the copy whose
+    // CComposition::Present actually fires - CHAIN A c=1615, liveB=0x0).
+    if (m1 && !g_forceFullRender) {
+        static const BYTE expFFR[6] = { 0x48, 0x8B, 0x49, 0x40,   // mov rcx,[rcx+40h]
+                                        0x84, 0xD2 };             // test dl,dl
+        BYTE* ffr = (BYTE*)m1 + 0xD5C0C;
+        if (!IsBadReadPtr(ffr, 6) && memcmp(ffr, expFFR, 6) == 0) {
+            g_forceFullRender = (PFN_CHAIN4)ffr;
+            iwnHookLog("dwm: FORCE FULL RENDER armed "
+                       "(CComposition::ForceFullRender @dwmcore+0xD5C0C)");
+        } else {
+            iwnHookLog("dwm: FORCE FULL RENDER bytes differ - NOT armed");
+        }
+    }
     if (m2 == m1) iwnHookLog("dwm: CHAIN m2 == m1 (C vtable module = GetModuleHandle copy)");
     for (int inst = 0; inst < 2; inst++) {
         if (!bases[inst]) continue;
@@ -2736,14 +2798,13 @@ static void* volatile g_wireSelf = nullptr;
 
 static LONG WINAPI IWN_NtbBeginWrap(void* a, void* b, void* c, void* d) {
     InterlockedIncrement(&g_ntbBegin);
-    // r103: dwm has not composited this frame yet, so this is the safe moment to
-    // hand the scan buffers back their clean content. Anything we warped during
-    // the previous frame is erased here, before dwm can draw into it or before
-    // we can sample it again. This is what structurally ends the recursion.
-    if (g_ready && !g_quiet) {
-        __try { cleanRestore(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
-    }
+    // r104: cleanRestore() is gone. r103 handed the scan buffers back their
+    // "clean" mirror at BeginFrame, but that writes to the buffer that is
+    // currently being scanned out - the operator saw tearing/hang and dwm
+    // eventually died in CD3DDeviceManager::HandleAdvanceFrame. With the
+    // forced full-frame redraw (CDirtyRegion::IsEmpty -> SetFullDirty) dwm
+    // overwrites every pixel of the buffer itself on every frame, so no
+    // rollback is needed: the wipe is dwm's own full render.
     return g_ntbTramps[0](a, b, c, d);
 }
 // build the wire RTV cache once, from the swapchain the present wrapper saw
@@ -4450,6 +4511,7 @@ void DwmWarpBeforeSubmit() {
         BOOL failStop = ((LONG)g_fail > 400);
         g_ready = 0;
         g_stage = -1;
+        InterlockedExchange(&g_hardStop, 1);   // r104: no re-arm, ever
         // Hand the desktop back: dwm only redraws dirty regions, so the last
         // warped frame would otherwise sit on screen until a manual refresh.
         restoreBaseline("r98 budget spent");
@@ -4612,11 +4674,11 @@ void DwmWarpBeforeSubmit() {
                           (long)g_dxCalls[9], (long)g_dxCalls[10]);
                 iwnHookLog(b6);
                 char b7[192];
-                wsprintfA(b7, "r103 clean ok=%ld bk=%ld rs=%ld draw=%ld "
-                          "cfpre=%ld cfpost=%ld draws=%ld",
-                          (long)g_cleanOk, (long)g_cleanBk, (long)g_cleanRs,
+                wsprintfA(b7, "r104 clean ok=%ld bk=%ld draw=%ld "
+                          "cfpre=%ld cfpost=%ld fullredraw=%ld draws=%ld",
+                          (long)g_cleanOk, (long)g_cleanBk,
                           (long)g_cleanDraw, (long)g_ntbCfPre,
-                          (long)g_ntbCfPost, (long)g_draws);
+                          (long)g_ntbCfPost, (long)g_fullRender, (long)g_draws);
                 iwnHookLog(b7);
             }
             {
@@ -4740,6 +4802,7 @@ void DwmWarpBeforeSubmit() {
     if (g_fail > 30) {
         g_ready = 0;
         g_stage = -1;
+        InterlockedExchange(&g_hardStop, 1);   // r104: no re-arm, ever
         restoreBaseline("repeated failures");
         iwnHookLog("dwm: WARP DISABLED after repeated failures - baseline restored");
     }
