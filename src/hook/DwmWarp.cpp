@@ -1825,11 +1825,130 @@ static volatile LONG  g_mpoHookState = 0;    // 1 trying, 2 live
 static ID3D11Texture2D*        g_flashStage = nullptr;   // r94c: copy-mode source
 static ID3D11RenderTargetView* g_flashStageRtv = nullptr;
 
+// ---- r96: corner-square locate experiment ----------------------------------
+// The 19:23 run settled that a write to a wire buffer DOES reach the panel, and
+// also showed the price: dwm repaints only dirty rects, so a fully painted
+// buffer keeps its colour on screen until a full redraw. From here on every
+// experiment paints a 220x220 square in the top-left corner instead, one
+// distinct colour per wire buffer, and puts the original pixels back when the
+// window closes. Which colours appear, and in what rhythm, is what names the
+// buffer dwm actually scans out - read from the operator's eyes, because the
+// probe's screenshots read the composition surface and never see the flip chain.
+#define IWN_MARK_ONLY   1
+#define IWN_MARK_X      20
+#define IWN_MARK_Y      20
+#define IWN_MARK_W      220
+#define IWN_MARK_H      220
+#define IWN_MARK_T0     30000     // ms after injection (NTB hooks land at 15s)
+#define IWN_MARK_T1     42000     // 12s window - enough for the operator to watch
+static ID3D11Texture2D* g_markSolid[3] = { nullptr, nullptr, nullptr };
+static ID3D11Texture2D* g_markSnap[3]  = { nullptr, nullptr, nullptr };
+static BOOL              g_markSnapped[3] = { FALSE, FALSE, FALSE };
+static volatile LONG     g_markPaints = 0;
+static volatile LONG     g_markRestored = 0;
+
+static ID3D11Texture2D* iwnSolidTex(UINT col, DXGI_FORMAT fmt) {
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = IWN_MARK_W;
+    td.Height = IWN_MARK_H;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    const UINT n = IWN_MARK_W * IWN_MARK_H;
+    UINT* px = (UINT*)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)n * 4);
+    if (!px) return nullptr;
+    for (UINT k = 0; k < n; k++) px[k] = col;
+    D3D11_SUBRESOURCE_DATA sd = {};
+    sd.pSysMem = px;
+    sd.SysMemPitch = IWN_MARK_W * 4;
+    ID3D11Texture2D* t = nullptr;
+    HRESULT hr = g_dev->CreateTexture2D(&td, &sd, &t);
+    HeapFree(GetProcessHeap(), 0, px);
+    if (FAILED(hr) || !t) return nullptr;
+    return t;
+}
+
+// one frame of the marker: same corner on up to three wire buffers, one colour
+// each. The original corner pixels are kept once per buffer for the restore.
+static BOOL markPaint(void) {
+    if (!g_dev || !g_ctx || g_wrtvN <= 0) return FALSE;
+    D3D11_TEXTURE2D_DESC bd = {};
+    __try { g_wrtv[0].tex->GetDesc(&bd); } __except (EXCEPTION_EXECUTE_HANDLER) { return FALSE; }
+    if (!g_markSolid[0]) {
+        // B8G8R8A8 in memory is 0xAARRGGBB: magenta / green / orange
+        g_markSolid[0] = iwnSolidTex(0xFFFF00FFu, bd.Format);
+        g_markSolid[1] = iwnSolidTex(0xFF00FF00u, bd.Format);
+        g_markSolid[2] = iwnSolidTex(0xFF00A5FFu, bd.Format);
+        char b[144];
+        wsprintfA(b, "MARK: solid sources m0=%p m1=%p m2=%p fmt=%u",
+                  (void*)g_markSolid[0], (void*)g_markSolid[1],
+                  (void*)g_markSolid[2], (unsigned)bd.Format);
+        iwnHookLog(b);
+    }
+    if (!g_markSolid[0]) return FALSE;
+    for (int i = 0; i < g_wrtvN && i < 3; i++) {
+        ID3D11Texture2D* dst = g_wrtv[i].tex;
+        if (!dst || !g_markSolid[i]) continue;
+        if (!g_markSnapped[i]) {
+            D3D11_TEXTURE2D_DESC sd = bd;
+            sd.Width = IWN_MARK_W;
+            sd.Height = IWN_MARK_H;
+            sd.MipLevels = 1;
+            sd.ArraySize = 1;
+            sd.Usage = D3D11_USAGE_DEFAULT;
+            sd.BindFlags = 0;
+            sd.CPUAccessFlags = 0;
+            sd.MiscFlags = 0;
+            if (SUCCEEDED(g_dev->CreateTexture2D(&sd, nullptr, &g_markSnap[i])) &&
+                g_markSnap[i]) {
+                D3D11_BOX bx = { IWN_MARK_X, IWN_MARK_Y, 0,
+                                 IWN_MARK_X + IWN_MARK_W,
+                                 IWN_MARK_Y + IWN_MARK_H, 1 };
+                g_ctx->CopySubresourceRegion(g_markSnap[i], 0, 0, 0, 0, dst, 0, &bx);
+            }
+            g_markSnapped[i] = TRUE;
+        }
+        g_ctx->CopySubresourceRegion(dst, 0, IWN_MARK_X, IWN_MARK_Y, 0,
+                                     g_markSolid[i], 0, nullptr);
+    }
+    return TRUE;
+}
+
+static void markRestore(void) {
+    if (!g_ctx) return;
+    for (int i = 0; i < 3; i++) {
+        if (!g_wrtv[i].tex || !g_markSnap[i]) continue;
+        __try {
+            g_ctx->CopySubresourceRegion(g_wrtv[i].tex, 0, IWN_MARK_X, IWN_MARK_Y, 0,
+                                         g_markSnap[i], 0, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
+    iwnHookLog("MARK: corner restored - experiment finished");
+}
+
 static BOOL wirePaintCore(void) {
     if (g_wrtvN == 0) return FALSE;
     BOOL painted = FALSE;
     DWORD el = iwnEl();
     __try {
+#if IWN_MARK_ONLY
+        if (el >= IWN_MARK_T0 && el < IWN_MARK_T1) {
+            painted = markPaint();
+            if (painted) {
+                InterlockedIncrement(&g_markPaints);
+                static volatile LONG s_mp = 0;      // POD zero-init, no TLS guard
+                if (InterlockedCompareExchange(&s_mp, 1, 0) == 0) {
+                    iwnHookLog("MARK: corner painted on the wire buffers");
+                    readbackTex(g_wrtv[0].tex, "MARK");
+                }
+            }
+        } else if (el >= IWN_MARK_T1 && g_markPaints && !g_markRestored) {
+            InterlockedExchange(&g_markRestored, 1);
+            markRestore();
+        }
+#else
         if (el >= IWN_FLASH_T0 && el < IWN_FLASH_T1) {
             float col[4];
             if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
@@ -1868,6 +1987,7 @@ static BOOL wirePaintCore(void) {
             if (painted && InterlockedCompareExchange(&s_wp, 1, 0) == 0)
                 iwnHookLog("SUBMIT: warp painted (post-compose, pre-submit)");
         }
+#endif
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedIncrement(&g_fail);
         iwnHookLog("dwm: wirePaintCore EXCEPTION");
@@ -2570,9 +2690,10 @@ static LONG_PTR IWN_DxWrap##IDX(void* a, void* b, void* c, void* d, void* e,    
     if (painted) InterlockedIncrement(&g_dxPaints);                            \
     return r;                                                                  \
 }
-IWN_DX_WRAP(0, 1)   // CDXGISwapChainDWMLegacy::PresentDWM  - paint
+IWN_DX_WRAP(0, 0)   // CDXGISwapChainDWMLegacy::PresentDWM  - count only (r96:
+                    // a second paint source would muddy the corner experiment)
 IWN_DX_WRAP(1, 0)   // CDXGISwapChain::PresentDWM           - count
-IWN_DX_WRAP(2, 1)   // CDXGISwapChain::FlipPresentToDWM     - paint
+IWN_DX_WRAP(2, 0)   // CDXGISwapChain::FlipPresentToDWM     - count only (r96)
 IWN_DX_WRAP(3, 0)   // CDXGISwapChain::Present               - count
 IWN_DX_WRAP(4, 0)   // CDXGISwapChain::PresentImpl           - count
 
@@ -4030,11 +4151,12 @@ void DwmWarpBeforeSubmit() {
                 iwnHookLog(b3);
             }
             {
-                char b4[128];
+                char b4[160];
                 wsprintfA(b4, "NTB begin=%ld submit=%ld updates=%ld "
-                          "ntbpaints=%ld live=%d%d%d",
+                          "ntbpaints=%ld mark=%ld restored=%ld live=%d%d%d",
                           (long)g_ntbBegin, (long)g_ntbSubmit,
                           (long)g_ntbUpdates, (long)g_ntbPaints,
+                          (long)g_markPaints, (long)g_markRestored,
                           g_ntbSlots[0] ? 1 : 0, g_ntbSlots[1] ? 1 : 0,
                           g_ntbSlots[2] ? 1 : 0);
                 iwnHookLog(b4);
