@@ -1385,6 +1385,279 @@ static void iwnForensicsAfter(void* self) {
     readbackTex(g_target, "F-SRC2");         // is the source re-rendered too?
 }
 
+// ======================= r90: decisive-channel experiment ====================
+// r82-r89 verdicts all came from subtle warp images: a warped desktop still
+// LOOKS like the desktop, and a static desktop produces no dirty-rect traffic,
+// so "no visible change" could never separate "wrong channel" from "weak
+// signal". r90 separates the channels with a solid colour that cannot be
+// mistaken for anything else:
+//   phase A  3-15s   CF paint (round-63 recipe) into the registered targets
+//   phase B 15-27s   solid magenta (15-21s) then lime (21-27s) at present
+//                    entry, into EVERY channel: registered targets, ALL wire
+//                    buffers, and any realization texture captured below
+//   phase C 27-150s  present-wrapper warp paint (r82-r89 behaviour)
+// Plus a detour on CBindInfo::AddRealization (dwmcore+0x52784): every
+// realization (re)created during the run is inspected, and any screen-size
+// texture hiding inside it is cached and joins the phase-B flash.
+#define IWN_PHASE_A_END 15000
+#define IWN_FLASH_T0    15000
+#define IWN_FLASH_MID   21000
+#define IWN_FLASH_T1    27000
+
+static DWORD iwnEl() { return GetTickCount() - g_t0; }
+
+#define IWN_REAL_MAX 8
+static ID3D11Texture2D*       g_realTex[IWN_REAL_MAX];   // AddRef'd captures
+static volatile LONG          g_realN = 0;
+static volatile LONG          g_realSeen = 0;
+static volatile LONG          g_realHookState = 0;       // 1 trying, 2 live
+static HRESULT (STDMETHODCALLTYPE* g_addRealTramp)(void*, void*) = nullptr;
+static void*                  g_addRealTrampMem = nullptr;
+
+// Cache a screen-size, same-device, RT-bindable texture found in a realization.
+static void iwnCacheRealTex(ID3D11Texture2D* tex) {
+    if (!tex || !g_dev || !g_target) return;
+    D3D11_TEXTURE2D_DESC d = {}, td = {};
+    __try {
+        tex->GetDesc(&d);
+        g_target->GetDesc(&td);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (d.Width != td.Width || d.Height != td.Height || d.Format != td.Format) return;
+    if (!(d.BindFlags & D3D11_BIND_RENDER_TARGET)) return;
+    ID3D11Device* dv = nullptr;
+    tex->GetDevice(&dv);
+    BOOL same = (dv == g_dev);
+    if (dv) dv->Release();
+    if (!same) return;
+    for (int i = 0; i < IWN_REAL_MAX; i++)
+        if (g_realTex[i] == tex) return;             // already cached
+    int slot = (int)g_realN;
+    if (slot >= IWN_REAL_MAX) return;
+    tex->AddRef();
+    g_realTex[slot] = tex;
+    InterlockedIncrement(&g_realN);
+    char b[128];
+    wsprintfA(b, "REAL: cached tex %lux%lu bind=0x%X slot=%ld",
+              (unsigned long)d.Width, (unsigned long)d.Height,
+              (unsigned)d.BindFlags, (long)slot);
+    iwnHookLog(b);
+}
+
+// Inspect one realization: vtable RVA, QI, and a bounded field walk looking
+// for any D3D11 texture hidden inside (the CDxHandle realization holds the
+// shared-handle resource the kernel compositor consumes).
+static void iwnInspectRealization(void* real) {
+    LONG n = InterlockedIncrement(&g_realSeen);
+    static volatile LONG s_lastMs = 0;       // POD static - no TLS guard
+    DWORD now = GetTickCount();
+    BOOL full = (n <= 60) || (now - (DWORD)s_lastMs > 1000);
+    if (!full) return;
+    s_lastMs = (LONG)now;
+    __try {
+        void** vt = *(void***)real;
+        HMODULE m = vt ? moduleFromPtr((void*)vt) : nullptr;
+        char b[160];
+        wsprintfA(b, "REAL #%ld obj=%p vt=mod+0x%05lX", (long)n, real,
+                  m ? (unsigned long)((char*)vt - (char*)m) : 0);
+        iwnHookLog(b);
+        ID3D11Texture2D* tex = nullptr;
+        if (SUCCEEDED(((IUnknown*)real)->QueryInterface(kIIDTex2D, (void**)&tex)) && tex) {
+            iwnCacheRealTex(tex);
+            tex->Release();
+        }
+        for (DWORD off = 0; off < 0x1C0; off += 8) {
+            void* q = *(void**)((char*)real + off);
+            if (!q || (uintptr_t)q < 0x10000 || IsBadReadPtr(q, 8)) continue;
+            if (moduleFromPtr(q)) continue;          // vtable / code pointer
+            void* qvt = *(void**)q;
+            if (!qvt || IsBadReadPtr(qvt, 8)) continue;
+            tex = nullptr;
+            if (SUCCEEDED(((IUnknown*)q)->QueryInterface(kIIDTex2D, (void**)&tex)) && tex) {
+                D3D11_TEXTURE2D_DESC d = {};
+                tex->GetDesc(&d);
+                wsprintfA(b, "REAL #%ld field+0x%02lX tex %lux%lu bind=0x%X misc=0x%X",
+                          (long)n, (unsigned long)off, (unsigned long)d.Width,
+                          (unsigned long)d.Height, (unsigned)d.BindFlags,
+                          (unsigned)d.MiscFlags);
+                iwnHookLog(b);
+                iwnCacheRealTex(tex);
+                tex->Release();
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        iwnHookLog("REAL: inspect EXCEPTION");
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE IWN_AddRealWrap(void* self, void* real) {
+    HRESULT hr = g_addRealTramp(self, real);
+    if (real && g_ready && !g_quiet) iwnInspectRealization(real);
+    return hr;
+}
+
+static void suspendOtherThreads(int* suspended, HANDLE* handles, int cap);   // fwd
+
+// Detour CBindInfo::AddRealization (dwmcore+0x52784). Prologue is exactly
+// 12 bytes: two 5-byte rsp stores + push rbp + push rdi - verified against
+// the live image before patching. Same suspended-thread + CFG recipe as the
+// PresentInternal wrapper install.
+static BOOL DwmWarpInstallRealizationHook() {
+    if (InterlockedCompareExchange(&g_realHookState, 1, 0) != 0)
+        return g_addRealTramp != nullptr;
+    HMODULE h = GetModuleHandleW(L"dwmcore.dll");
+    if (!h) { iwnHookLog("dwm: REAL hook skipped (no dwmcore)"); return FALSE; }
+    BYTE* fn = (BYTE*)h + 0x52784;
+    const BYTE exp[12] = { 0x48, 0x89, 0x5C, 0x24, 0x08,
+                           0x48, 0x89, 0x74, 0x24, 0x10, 0x55, 0x57 };
+    BYTE cur[12];
+    CopyMemory(cur, fn, 12);
+    if (memcmp(cur, exp, 12) != 0) {
+        char b[160];
+        wsprintfA(b, "dwm: REAL hook skipped (prologue %02X %02X %02X %02X)",
+                  cur[0], cur[1], cur[2], cur[3]);
+        iwnHookLog(b);
+        return FALSE;
+    }
+    BYTE* blk = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_EXECUTE_READWRITE);
+    if (!blk) { iwnHookLog("dwm: REAL hook skipped (no RWX mem)"); return FALSE; }
+    BYTE* p = blk;
+    CopyMemory(p, fn, 12); p += 12;
+    *p++ = 0x48; *p++ = 0xB8;
+    UINT64 back = (UINT64)(fn + 12);
+    CopyMemory(p, &back, 8); p += 8;
+    *p++ = 0xFF; *p++ = 0xE0;
+    if (!(blk[12] == 0x48 && blk[13] == 0xB8 &&
+          *(UINT64*)(blk + 14) == back && blk[22] == 0xFF && blk[23] == 0xE0)) {
+        iwnHookLog("dwm: REAL hook skipped (trampoline bytes bad)");
+        return FALSE;
+    }
+    g_addRealTramp = (HRESULT (STDMETHODCALLTYPE*)(void*, void*))blk;
+    g_addRealTrampMem = blk;
+    FlushInstructionCache(GetCurrentProcess(), blk, 0x1C);
+
+    HANDLE th[128]; int ns = 0;
+    suspendOtherThreads(&ns, th, 128);
+    DWORD old = 0;
+    BOOL ok = VirtualProtect(fn, 32, PAGE_EXECUTE_READWRITE, &old) != 0;
+    BYTE patch[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
+    UINT64 sa = (UINT64)&IWN_AddRealWrap;
+    CopyMemory(patch + 2, &sa, 8);
+    if (ok) {
+        CopyMemory(fn, patch, 12);
+        VirtualProtect(fn, 32, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), fn, 12);
+    }
+    BYTE nowb[12];
+    CopyMemory(nowb, fn, 12);
+    BOOL good = ok && memcmp(nowb, patch, 12) == 0;
+    for (int i = ns - 1; i >= 0; i--) { ResumeThread(th[i]); CloseHandle(th[i]); }
+    char b[128];
+    wsprintfA(b, "dwm: REAL hook %s",
+              good ? "LIVE @0x52784 (AddRealization)" : "FAILED (patch did not verify)");
+    iwnHookLog(b);
+    if (!good) { g_addRealTramp = nullptr; return FALSE; }
+    // CFG: keep every 16-aligned entry on the patched page a valid target
+    typedef struct { ULONG Offset; ULONG Flags; } IWN_CFG_T2;
+    typedef BOOL (WINAPI *PFN_SVCT2)(HANDLE, PVOID, SIZE_T, ULONG, IWN_CFG_T2*);
+    PFN_SVCT2 svct = (PFN_SVCT2)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                               "SetProcessValidCallTargets");
+    if (svct) {
+        uintptr_t page = (uintptr_t)fn & ~(uintptr_t)0xFFF;
+        IWN_CFG_T2 info[256];
+        for (int i = 0; i < 256; i++) { info[i].Offset = (ULONG)(i * 16); info[i].Flags = 1; }
+        svct(GetCurrentProcess(), (PVOID)page, 0x1000, 256, info);
+    }
+    InterlockedExchange(&g_realHookState, 2);
+    return TRUE;
+}
+
+// ---- r90 phase B: solid-colour flash through every paint channel ------------
+static ID3D11Texture2D*        g_flashTex = nullptr;
+static ID3D11RenderTargetView* g_flashRtv = nullptr;
+
+static void paintSolidFlash(void* self) {
+    if (!g_ctx || !g_dev || !g_target) return;
+    DWORD el = iwnEl();
+    float col[4];
+    if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
+    else                    { col[0] = 0.0f; col[1] = 1.0f; col[2] = 0.0f; col[3] = 1.0f; }
+    __try {
+        if (!g_flashTex) {
+            D3D11_TEXTURE2D_DESC td = {};
+            g_target->GetDesc(&td);
+            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            td.MiscFlags = 0;
+            if (SUCCEEDED(g_dev->CreateTexture2D(&td, nullptr, &g_flashTex)) && g_flashTex)
+                g_dev->CreateRenderTargetView(g_flashTex, nullptr, &g_flashRtv);
+        }
+        if (!g_flashTex) return;
+        if (g_flashRtv) g_ctx->ClearRenderTargetView(g_flashRtv, col);
+        // channel 1: the registered composition surfaces
+        for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++)
+            if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], col);
+        // channel 2: ALL wire swapchain buffers
+        UINT wireOk = 0;
+        if (self && g_flashRtv) {
+            UINT n = 3;
+            __try {
+                UINT c = *(UINT*)((char*)self + 0xa0);
+                if (c > 0 && c <= 4) n = c;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            D3D11_TEXTURE2D_DESC td = {}, fd = {};
+            g_flashTex->GetDesc(&fd);
+            for (UINT i = 0; i < n; i++) {
+                ID3D11Texture2D* bb = iwnWireBuffer(self, i);
+                if (!bb) continue;
+                __try {
+                    bb->GetDesc(&td);
+                    if (td.Width == fd.Width && td.Height == fd.Height &&
+                        td.Format == fd.Format &&
+                        td.SampleDesc.Count == fd.SampleDesc.Count) {
+                        g_ctx->CopyResource(bb, g_flashTex);
+                        wireOk++;
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                bb->Release();
+            }
+        }
+        // channel 3: textures captured from realizations
+        UINT realOk = 0;
+        for (int i = 0; i < IWN_REAL_MAX && i < (int)g_realN; i++) {
+            ID3D11Texture2D* t2 = g_realTex[i];
+            if (!t2) continue;
+            D3D11_TEXTURE2D_DESC td = {}, fd = {};
+            __try {
+                t2->GetDesc(&td);
+                g_flashTex->GetDesc(&fd);
+                if (td.Width == fd.Width && td.Height == fd.Height &&
+                    td.Format == fd.Format) {
+                    g_ctx->CopyResource(t2, g_flashTex);
+                    realOk++;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        }
+        // one-shot proof: the wire buffer really holds the flash colour
+        static volatile LONG s_proof = 0;
+        if (InterlockedCompareExchange(&s_proof, 1, 0) == 0) {
+            ID3D11Texture2D* bb = iwnWireBuffer(self, 0);
+            if (bb) { readbackTex(bb, "FLASH-WB0"); bb->Release(); }
+        }
+        static DWORD s_last = 0;             // POD static - no TLS guard
+        DWORD t = GetTickCount();
+        if (t - s_last > 2000) {
+            s_last = t;
+            char b[160];
+            wsprintfA(b, "FLASH el=%lums wire=%u real=%u cachedReal=%ld",
+                      (unsigned long)el, wireOk, realOk, (long)g_realN);
+            iwnHookLog(b);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: FLASH EXCEPTION");
+    }
+}
+
 static void readbackPixel(int i, const char* tag) {
     if (i < 0 || i >= g_tgtN || !g_tgt[i]) return;
     readbackTex(g_tgt[i], tag);
@@ -2042,43 +2315,61 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
             // round 82: one-shot forensic - which wire buffer holds the desktop?
             iwnProbeWireBuffers(self);
             iwnIdentifySubmit(self);
-            __try {
-                g_ctx->CopyResource(g_twin, g_target); // fresh COMPLETE frame
-                const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-                for (int i = 0; i < g_tgtN; i++) {
-                    if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
+            DWORD el = iwnEl();
+            if (el >= IWN_FLASH_T0 && el < IWN_FLASH_T1) {
+                // r90 phase B: solid magenta/lime through EVERY channel. A full
+                // screen of magenta cannot be mistaken for a static desktop -
+                // whichever channel lights the screen up IS the scanout source.
+                __try {
+                    g_ctx->CopyResource(g_twin, g_target); // keep restore working
+                    paintSolidFlash(self);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    InterlockedIncrement(&g_fail);
+                    iwnHookLog("dwm: flash save EXCEPTION (present)");
                 }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                InterlockedIncrement(&g_fail);
-                iwnHookLog("dwm: warp save EXCEPTION (present)");
-            }
-            int before = (int)g_draws;
-            paintWarp();
-            if ((int)g_draws == before) {
-                if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (present)");
-            } else {
                 painted = TRUE;
-                // per-face proof + round 74: TWIN/WARPRT proof for this mode
-                static BOOL s_proofB = FALSE;     // POD static - no TLS guard
-                if (!s_proofB) {
-                    s_proofB = TRUE;
-                    readbackTex(g_twin,   "TWIN-B");
-                    readbackTex(g_warpRT, "WARPRT-B");
-                }
-                static BOOL s_proofDone[IWN_MAX_TGT];   // POD zero-init
-                for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
-                    if (!s_proofDone[i]) {
-                        s_proofDone[i] = TRUE;
-                        readbackPixel(i, "warp-present");
+            } else if (el >= IWN_FLASH_T1) {
+                // r90 phase C: the r82-r89 warp paint, unchanged.
+                __try {
+                    g_ctx->CopyResource(g_twin, g_target); // fresh COMPLETE frame
+                    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    for (int i = 0; i < g_tgtN; i++) {
+                        if (g_rtvA[i]) g_ctx->ClearRenderTargetView(g_rtvA[i], black);
                     }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    InterlockedIncrement(&g_fail);
+                    iwnHookLog("dwm: warp save EXCEPTION (present)");
                 }
-                // round 82: hand the warped frame to the buffer dwm is about to
-                // submit - resolved with dwm's OWN accessor + logical index.
-                iwnBlitToScanout(self);
-                // round 86: and to the bind-info resources the kernel
-                // compositor actually consumes.
-                iwnBlitToBindInfo(self);
+                int before = (int)g_draws;
+                paintWarp();
+                if ((int)g_draws == before) {
+                    if (g_fail < 40) iwnHookLog("dwm: warp paint produced no Draw (present)");
+                } else {
+                    painted = TRUE;
+                    // per-face proof + round 74: TWIN/WARPRT proof for this mode
+                    static BOOL s_proofB = FALSE;     // POD static - no TLS guard
+                    if (!s_proofB) {
+                        s_proofB = TRUE;
+                        readbackTex(g_twin,   "TWIN-B");
+                        readbackTex(g_warpRT, "WARPRT-B");
+                    }
+                    static BOOL s_proofDone[IWN_MAX_TGT];   // POD zero-init
+                    for (int i = 0; i < g_tgtN && i < IWN_MAX_TGT; i++) {
+                        if (!s_proofDone[i]) {
+                            s_proofDone[i] = TRUE;
+                            readbackPixel(i, "warp-present");
+                        }
+                    }
+                    // round 82: hand the warped frame to the buffer dwm is about to
+                    // submit - resolved with dwm's OWN accessor + logical index.
+                    iwnBlitToScanout(self);
+                    // round 86: and to the bind-info resources the kernel
+                    // compositor actually consumes.
+                    iwnBlitToBindInfo(self);
+                }
             }
+            // el < IWN_FLASH_T0: phase A owns painting at ConfirmFrame; the
+            // wrapper was not even installed yet on this timeline.
         }
     }
     if (painted) iwnForensicsBefore(self);
@@ -2687,8 +2978,13 @@ void DwmWarpBeforeSubmit() {
     //   tex  = CDWMSwapChain::GetBuffer (0xE6060) -> wire->vt[9](idx, IID_Tex2D)
     // Every earlier round painted either a fingerprint-scanned render target
     // or a blind GetBuffer(0) - never the buffer dwm is about to hand over.
-    if (el < 1000) ph = IWN_PH_IDLE;
-    else           ph = IWN_PH_PRESNT;
+    // r90 decisive-channel timeline (each phase gets an unambiguous verdict):
+    //   A  3-15s   CF paint (round-63 recipe) - wrapper not installed yet
+    //   B 15-27s   solid magenta -> lime flash at present entry (every channel)
+    //   C  27s+    present-wrapper warp paint (r82-r89 behaviour)
+    if (el < 3000)                 ph = IWN_PH_IDLE;
+    else if (el < IWN_PHASE_A_END) ph = IWN_PH_CF_DEF;
+    else                           ph = IWN_PH_PRESNT;
 
     if (ph != g_lastLoggedStage) {
         g_lastLoggedStage = ph;
@@ -2721,6 +3017,8 @@ void DwmWarpBeforeSubmit() {
                 g_stage = IWN_PH_CF_DEF;
                 iwnHookLog("dwm: present wrapper NOT installed - staying on CF deferred-restore mode");
             }
+            // r90: capture realizations as they appear (AddRealization detour)
+            DwmWarpInstallRealizationHook();
         }
         if (ph == IWN_PH_CF_DEF && g_presntTried) {
             iwnHookLog("dwm: mode C - back to CF paint (wrapper passive)");
