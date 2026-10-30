@@ -2278,6 +2278,17 @@ static BOOL iwnChainDetour(BYTE* fn, const BYTE* exp, int disp,
                            void* hookFn, PFN_CHAIN4* tramp, void** trampMem,
                            const char* tag) {
     char b[224];
+    // r99: HARD INVARIANT. The patch below is always 12 bytes (mov rax,imm64 +
+    // jmp rax). If `disp` is smaller, the tail of the patch overwrites live
+    // instructions that the trampoline then jumps back into -> dwm executes a
+    // fragment and dies with 0xc000001d (STATUS_ILLEGAL_INSTRUCTION). That is
+    // exactly what dxgi FlipPresentHandleTransform (disp=11) and
+    // UseProxyFlipCore (disp=6) did in r98. Refuse instead of patching.
+    if (disp < 12) {
+        wsprintfA(b, "dwm: %s REFUSED (disp=%d < 12 patch bytes)", tag, disp);
+        iwnHookLog(b);
+        return FALSE;
+    }
     if (!fn || IsBadReadPtr(fn, 32)) {
         wsprintfA(b, "dwm: %s skipped (bad fn ptr)", tag);
         iwnHookLog(b);
@@ -2769,17 +2780,24 @@ static void installDxgiHooks() {
                                  0x41, 0x54, 0x41, 0x55,              // push r12,r13
                                  0x41, 0x56, 0x41, 0x57,              // push r14,r15
                                  0x48, 0x81, 0xEC, 0xA0, 0x00, 0x00, 0x00 };  // sub rsp,0A0h
-    static const BYTE e8[11] = { 0x48, 0x83, 0xEC, 0x28,              // sub rsp,28h
-                                 0xF6, 0x81, 0x80, 0x01, 0x00, 0x00, 0x04 };  // test byte [rcx+180h],4
+    // r99: disp must be a real instruction boundary AND >= 12 (patch size).
+    // 0x5420: sub rsp,28h(4) test [rcx+180h],4(7) mov r9,rdx(3) = 14 -> 0x542E
+    static const BYTE e8[14] = { 0x48, 0x83, 0xEC, 0x28,              // sub rsp,28h
+                                 0xF6, 0x81, 0x80, 0x01, 0x00, 0x00, 0x04,  // test byte [rcx+180h],4
+                                 0x4C, 0x8B, 0xCA };                  // mov r9,rdx
     static const BYTE e9[12] = { 0x48, 0x8B, 0xC4,                    // mov rax,rsp
                                  0x57,                                // push rdi
                                  0x41, 0x54, 0x41, 0x55,              // push r12,r13
                                  0x41, 0x56, 0x41, 0x57 };            // push r14,r15
-    static const BYTE e10[6] = { 0x40, 0x53,                          // push rbx
-                                 0x48, 0x83, 0xEC, 0x20 };            // sub rsp,20h
+    // 0x15890: push rbx(2) sub rsp,20h(4) mov rbx,rcx(3) mov ecx,[rcx+0xe7c](6)
+    // = 15 -> 0x1589F (12 is NOT a boundary here - that was the r98 bug)
+    static const BYTE e10[15] = { 0x40, 0x53,                        // push rbx
+                                  0x48, 0x83, 0xEC, 0x20,            // sub rsp,20h
+                                  0x48, 0x8B, 0xD9,                  // mov rbx,rcx
+                                  0x8B, 0x89, 0x7C, 0x0E, 0x00, 0x00 }; // mov ecx,[rcx+0xe7c]
     static const BYTE* exps[IWN_DXGI_N] = { e0, e1, e2, e3, e4,
                                             e5, e6, e7, e8, e9, e10 };
-    static const int disps[IWN_DXGI_N] = { 13, 16, 13, 14, 16, 13, 16, 19, 11, 12, 6 };
+    static const int disps[IWN_DXGI_N] = { 13, 16, 13, 14, 16, 13, 16, 19, 14, 12, 15 };
     static const char* names[IWN_DXGI_N] = { "LegacyPresentDWM", "SwapChainPresentDWM",
                                              "FlipPresentToDWM", "SwapChainPresent",
                                              "PresentImpl", "PresentImplCore",
@@ -4121,9 +4139,11 @@ void DwmWarpBeforeSubmit() {
             installChainHooks();
             // r94: the kernel-composition channel (win32u NtDComposition*)
             installNtbHooks();
-            // r95: dxgi-side present entries (route 2). Paint lands on the
-            // back buffer at the moment it is handed to scanout.
-            installDxgiHooks();
+            // r99: dxgi present entries (route 2) are installed LATER, from the
+            // heartbeat path - see the el>=12s gate below. In r98 they went in
+            // here, i.e. before the first paint, and their crash took the whole
+            // round down with zero warp evidence. The experiment must never
+            // outrank the thing it is measuring.
         }
         if (ph == IWN_PH_CF_DEF && g_presntTried) {
             iwnHookLog("dwm: mode C - back to CF paint (wrapper passive)");
@@ -4175,8 +4195,12 @@ void DwmWarpBeforeSubmit() {
             // r94: retry the channel hooks too (idempotent, slot-guarded)
             if (!g_ntbSlots[0] && (LONG)g_stage == IWN_PH_PRESNT)
                 installNtbHooks();
-            // r95: dxgi present entries - independent of the dwm stage machine
-            if ((g_dxLive & ((1 << IWN_DXGI_N) - 1)) != ((1 << IWN_DXGI_N) - 1))
+            // r95/r99: dxgi present entries - installed only AFTER the paint
+            // window is established (12s in). Route 2 is a measurement, not a
+            // prerequisite: if it misbehaves the warp evidence is already on
+            // disk and on screen.
+            if (iwnEl() >= 12000 &&
+                (g_dxLive & ((1 << IWN_DXGI_N) - 1)) != ((1 << IWN_DXGI_N) - 1))
                 installDxgiHooks();
             {
                 char b5[176];
