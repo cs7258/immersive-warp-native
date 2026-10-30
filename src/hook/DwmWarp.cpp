@@ -437,6 +437,7 @@ static void releaseAll() {
 
 // Own render target for copy-mode faces. Created lazily on first need; kept
 static void installCopyObserver();   // fwd: defined in the paint section below
+static void cpyObserverHeartbeat();  // round 79: patch-alive + per-slot counters
 // Own render target for copy-mode faces. Created lazily on first need; kept
 // across re-attaches (dims never change). If THIS RTV also fails, the device
 // genuinely lacks RT support for the surface format and copy mode is
@@ -792,18 +793,33 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
 // patch is one aligned 8-byte vtable store (atomic on x64), same pattern as
 // the proven flip-hook vtable patches.
 // ---- round 77: copy observer range (ctx vtable slots 44..54) ----------------
-// The slot-47 CopyResource observer saw ZERO dwm copies, yet the composed frame
-// reaches the scanout allocation. dwm's compose->scanout copy must go through
-// another context method (CopySubresourceRegion / UpdateSubresource /
-// ResolveSubresource / ...). Observe the whole copy-method neighbourhood with
-// 6-arg forwarders (covers every copy method's arg count) and log any call
-// whose first args look like our screen-size textures.
-typedef void (STDMETHODCALLTYPE* PFN_CPY6)(void*, void*, void*, void*, void*, void*);
-static PFN_CPY6 g_cpyOrigR[11] = {};          // slots 44..54
-static volatile LONG g_cpyRLogged = 0;
+// The round-77 observer (slots 44-54, 6-arg forwarders) saw ZERO traffic - not
+// even our OWN CopyResource calls (readbackTex calls g_ctx->CopyResource every
+// proof read through vtable slot 47). A live patch cannot miss those, so the
+// round-77 "zero copies" verdict was a FALSE NEGATIVE: the patch was not
+// effective (and its 6-arg forwarders would have dropped args 7-8 of
+// CopySubresourceRegion anyway). Round 79 rebuild:
+//   - the 8 slots that matter per the standard IDL vtable order:
+//     12 DrawIndexed  13 Draw  33 OMSetRenderTargets  46 CopySubresourceRegion
+//     47 CopyResource 48 UpdateSubresource 50 ClearRenderTargetView
+//     55 ResolveSubresource
+//   - 8-arg forwarders (the widest method is CopySubresourceRegion with 8)
+//   - unconditional per-slot call counters -> the heartbeat proves the patch
+//     is alive (our own CopyResource MUST tick slot idx 4)
+//   - install-time selftest: one real CopyResource right after patching
+typedef void (STDMETHODCALLTYPE* PFN_CPY8)(void*, void*, void*, void*, void*, void*, void*, void*);
+#define IWN_COBS_N 8
+static const int kCpySlots[IWN_COBS_N] = { 12, 13, 33, 46, 47, 48, 50, 55 };
+static PFN_CPY8 g_cpyOrigR[IWN_COBS_N] = {};
+static volatile LONG g_cpyCalls[IWN_COBS_N] = {};
+static volatile LONG g_cpyLogged = 0;
+static void** g_cpyVt = nullptr;               // ctx vtable base (self-check)
+static const char* kCpyNames[IWN_COBS_N] = {
+    "DrawIndexed", "Draw", "OMSetRT", "CopySubres", "CopyResource",
+    "UpdateSubres", "ClearRTV", "Resolve" };
 
 static void IWN_CpyLog(int slot, void* a1, void* a2) {
-    if (g_cpyRLogged >= 40) return;
+    if (g_cpyLogged >= 40) return;
     if (!a1 && !a2) return;
     D3D11_TEXTURE2D_DESC d1 = {}, d2 = {};
     int ok1 = 0, ok2 = 0;
@@ -815,7 +831,7 @@ static void IWN_CpyLog(int slot, void* a1, void* a2) {
     BOOL hit = (ok1 && d1.Width == (UINT)g_rtW && d1.Height == (UINT)g_rtH) ||
                (ok2 && d2.Width == (UINT)g_rtW && d2.Height == (UINT)g_rtH);
     if (!hit) return;
-    InterlockedIncrement(&g_cpyRLogged);
+    InterlockedIncrement(&g_cpyLogged);
     char b[280];
     wsprintfA(b, "dwm: CPYR slot=%d a1=%p %lux%lu bind=0x%X misc=0x%X | a2=%p %lux%lu bind=0x%X misc=0x%X",
               slot, a1, (unsigned long)d1.Width, (unsigned long)d1.Height,
@@ -825,42 +841,65 @@ static void IWN_CpyLog(int slot, void* a1, void* a2) {
     iwnHookLog(b);
 }
 
-#define IWN_CPY_W(N, IDX)                                                        \
-static void STDMETHODCALLTYPE IWN_CpyW##N(void* s, void* a, void* b, void* c,    \
-                                          void* d, void* e) {                    \
-    IWN_CpyLog(IDX, a, b);                                                       \
-    if (g_cpyOrigR[IDX - 44]) g_cpyOrigR[IDX - 44](s, a, b, c, d, e);            \
+#define IWN_COBS_W(N, IDX)                                                       \
+static void STDMETHODCALLTYPE IWN_CObs##N(void* s, void* a, void* b, void* c,    \
+                                          void* d, void* e, void* f, void* g) {  \
+    InterlockedIncrement(&g_cpyCalls[IDX]);                                      \
+    IWN_CpyLog(kCpySlots[IDX], a, b);                                            \
+    if (g_cpyOrigR[IDX]) g_cpyOrigR[IDX](s, a, b, c, d, e, f, g);                \
 }
-IWN_CPY_W(0, 44) IWN_CPY_W(1, 45) IWN_CPY_W(2, 46) IWN_CPY_W(3, 47)
-IWN_CPY_W(4, 48) IWN_CPY_W(5, 49) IWN_CPY_W(6, 50) IWN_CPY_W(7, 51)
-IWN_CPY_W(8, 52) IWN_CPY_W(9, 53) IWN_CPY_W(10, 54)
+IWN_COBS_W(0, 0) IWN_COBS_W(1, 1) IWN_COBS_W(2, 2) IWN_COBS_W(3, 3)
+IWN_COBS_W(4, 4) IWN_COBS_W(5, 5) IWN_COBS_W(6, 6) IWN_COBS_W(7, 7)
 
 static void installCopyObserver() {
-    if (g_cpyOrigR[3] || !g_ctx) return;
+    if (g_cpyVt || !g_ctx) return;
     void** vt = *(void***)g_ctx;
-    if (!vt || IsBadReadPtr(&vt[44], 11 * 8)) { iwnHookLog("dwm: CPYR vtable unreadable"); return; }
-    static const void* hooks[11] = {
-        (void*)&IWN_CpyW0,  (void*)&IWN_CpyW1,  (void*)&IWN_CpyW2, (void*)&IWN_CpyW3,
-        (void*)&IWN_CpyW4,  (void*)&IWN_CpyW5,  (void*)&IWN_CpyW6, (void*)&IWN_CpyW7,
-        (void*)&IWN_CpyW8,  (void*)&IWN_CpyW9,  (void*)&IWN_CpyW10
+    if (!vt || IsBadReadPtr(vt, 56 * 8)) { iwnHookLog("dwm: CPYR vtable unreadable"); return; }
+    static const void* hooks[IWN_COBS_N] = {
+        (void*)&IWN_CObs0, (void*)&IWN_CObs1, (void*)&IWN_CObs2, (void*)&IWN_CObs3,
+        (void*)&IWN_CObs4, (void*)&IWN_CObs5, (void*)&IWN_CObs6, (void*)&IWN_CObs7
     };
     DWORD op = 0;
-    if (!VirtualProtect(&vt[44], 11 * 8, PAGE_READWRITE, &op)) {
-        iwnHookLog("dwm: CPYR VirtualProtect failed");
-        return;
-    }
+    // patch slot by slot - the 8 slots are scattered, not contiguous
     int n = 0;
-    for (int i = 0; i < 11; i++) {
-        if (vt[44 + i] != hooks[i]) {
-            g_cpyOrigR[i] = (PFN_CPY6)vt[44 + i];
-            vt[44 + i] = (void*)hooks[i];
-            n++;
-        }
+    for (int i = 0; i < IWN_COBS_N; i++) {
+        void** slot = &vt[kCpySlots[i]];
+        if (IsBadWritePtr(slot, 8) &&
+            !VirtualProtect(slot, 8, PAGE_READWRITE, &op)) continue;
+        if (*slot == (void*)hooks[i]) continue;   // already ours
+        g_cpyOrigR[i] = (PFN_CPY8)*slot;
+        *slot = (void*)hooks[i];
+        n++;
     }
-    DWORD op2 = 0;
-    VirtualProtect(&vt[44], 11 * 8, op, &op2);
+    g_cpyVt = vt;
     char b[96];
-    wsprintfA(b, "dwm: CPYR observer installed on %d ctx slots (44-54)", n);
+    wsprintfA(b, "dwm: CPYR v2 observer installed on %d/%d ctx slots", n, IWN_COBS_N);
+    iwnHookLog(b);
+    // install-time selftest: one REAL CopyResource must tick slot idx 4
+    // (g_stageTex <- g_twin, both screen-size). If it does not, the patch is
+    // ineffective and every "zero traffic" verdict is void.
+    if (g_stageTex && g_twin) {
+        __try { g_ctx->CopyResource(g_stageTex, g_twin); } __except (1) { }
+        wsprintfA(b, "dwm: CPYR SELFTEST CopyResource calls=%ld (must be >=1)",
+                  (long)g_cpyCalls[4]);
+        iwnHookLog(b);
+    }
+}
+
+// round 79: 10s heartbeat - per-slot counters + patch-alive self-check
+static void cpyObserverHeartbeat() {
+    if (!g_cpyVt) return;
+    static DWORD s_last = 0;               // POD static - no TLS guard
+    DWORD t = GetTickCount();
+    if (t - s_last < 10000) return;
+    s_last = t;
+    void* cur47 = g_cpyVt[47];
+    char b[300];
+    wsprintfA(b, "CPYR hb vt47=%s calls: DI=%ld D=%ld OM=%ld CSR=%ld CR=%ld US=%ld CRTV=%ld RS=%ld logged=%ld",
+              cur47 == (void*)&IWN_CObs4 ? "LIVE" : "REVERTED",
+              (long)g_cpyCalls[0], (long)g_cpyCalls[1], (long)g_cpyCalls[2],
+              (long)g_cpyCalls[3], (long)g_cpyCalls[4], (long)g_cpyCalls[5],
+              (long)g_cpyCalls[6], (long)g_cpyCalls[7], (long)g_cpyLogged);
     iwnHookLog(b);
 }
 
@@ -2332,6 +2371,11 @@ void DwmWarpBeforeSubmit() {
 
     if (ph == IWN_PH_IDLE) return;
 
+    // round 79: context-method observer heartbeat (patch alive + counters).
+    // Kept on the common path so it also runs inside the PRESNT window (the
+    // stage branch below returns early).
+    cpyObserverHeartbeat();
+
     // round 72: quiet dump window. Round 74: opens at el=120s (after the mode
     // comparison); dumpFacesTick itself is scheduled independently so rounds
     // r1/r2 fire inside modes A/B while the warp is live.
@@ -2403,6 +2447,9 @@ void DwmWarpBeforeSubmit() {
             iwnHookLog(db);
         }
     }
+
+    // round 79: context-method observer heartbeat moved to the common path
+    // above (must run inside the PRESNT window too).
 
     // round 70: catch device removal the moment it happens, with the reason
     if (g_dev && g_ready) {
