@@ -2263,6 +2263,130 @@ static void installChainHooks() {
     }
 }
 
+// ---- r94: the kernel-composition channel (win32u NtDComposition*) -----------
+// r93c proved the m1 chain comp->rtm->hwnd->int NEVER runs (150s, all four
+// LIVE, zero calls) and the m2 copy is a different build entirely. dwmcore
+// imports the kernel-compositor channel API from win32u.dll:
+// NtDCompositionBeginFrame / NtDCompositionSubmitDWMBatch /
+// NtDCompositionGetFrameSurfaceUpdates (ConfirmFrame is already IAT-hooked by
+// the probe and fires steadily). Call-site disassembly (disk build, register
+// args only - no stack args, so 4-arg forwarding is safe):
+//   SubmitDWMBatch(ecx = [batch+0x10], rdx = [batch+0x18])    @0xC0CEA
+//   BeginFrame([conn+8])                                      @0xC341C
+//   GetFrameSurfaceUpdates(&out0, &out1, &out2)               @0x6AEE6
+// Hook = IAT slot swap only: no code bytes touched, no CFG exposure, and the
+// technique is proven durable in dwm (the probe's ConfirmFrame/RetireFrame
+// IAT hooks survive whole runs while vtable/code patches get reverted).
+typedef LONG (WINAPI* PFN_NTB4)(void*, void*, void*, void*);
+static volatile LONG g_ntbBegin = 0, g_ntbSubmit = 0, g_ntbUpdates = 0,
+                     g_ntbPaints = 0;
+static PFN_NTB4  g_ntbTramps[3];
+static void**    g_ntbSlots[3];
+
+static LONG WINAPI IWN_NtbBeginWrap(void* a, void* b, void* c, void* d) {
+    InterlockedIncrement(&g_ntbBegin);
+    return g_ntbTramps[0](a, b, c, d);
+}
+static LONG WINAPI IWN_NtbSubmitWrap(void* a, void* b, void* c, void* d) {
+    InterlockedIncrement(&g_ntbSubmit);
+    BOOL painted = FALSE;
+    if (g_ready && !g_quiet && (LONG)g_stage == IWN_PH_PRESNT) {
+        DWORD t = GetTickCount();
+        if (t != g_lastPaintTick) {
+            g_lastPaintTick = t;
+            InterlockedIncrement(&g_frames);
+            __try { painted = wirePaintCore(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+        }
+    }
+    LONG hr = g_ntbTramps[1](a, b, c, d);
+    if (painted) InterlockedIncrement(&g_ntbPaints);
+    return hr;
+}
+static LONG WINAPI IWN_NtbUpdWrap(void* a, void* b, void* c, void* d) {
+    InterlockedIncrement(&g_ntbUpdates);
+    return g_ntbTramps[2](a, b, c, d);
+}
+
+// locate the IAT slot of (dll, func) inside a loaded module (same recipe as
+// the probe's findIatSlot - case-insensitive dll compare, name compare)
+static void** iwnFindIat(HMODULE mod, const char* dll, const char* fn) {
+    if (!mod) return nullptr;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    IMAGE_DATA_DIRECTORY& dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return nullptr;
+    IMAGE_IMPORT_DESCRIPTOR* imp =
+        (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)mod + dir.VirtualAddress);
+    for (; imp->Name; imp++) {
+        const char* name = (const char*)((BYTE*)mod + imp->Name);
+        BOOL hit = FALSE;
+        for (const char* a = name, *b = dll; *a && *b; a++, b++) {
+            char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+            char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+            if (ca != cb) break;
+            if (!a[1]) hit = TRUE;
+        }
+        if (!hit) continue;
+        IMAGE_THUNK_DATA* oft = (IMAGE_THUNK_DATA*)((BYTE*)mod +
+            (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        IMAGE_THUNK_DATA* ft = (IMAGE_THUNK_DATA*)((BYTE*)mod + imp->FirstThunk);
+        for (; oft->u1.Function; oft++, ft++) {
+            if (IMAGE_SNAP_BY_ORDINAL(oft->u1.Ordinal)) continue;
+            IMAGE_IMPORT_BY_NAME* ibn =
+                (IMAGE_IMPORT_BY_NAME*)((BYTE*)mod + oft->u1.AddressOfData);
+            const char* p = ibn->Name; const char* q = fn;
+            while (*p && *q && *p == *q) { p++; q++; }
+            if (*p == 0 && *q == 0) return (void**)&ft->u1.Function;
+        }
+    }
+    return nullptr;
+}
+
+static BOOL iwnIatSwap(void** slot, void* newFn, void** oldFn) {
+    if (!slot) return FALSE;
+    DWORD old = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return FALSE;
+    if (oldFn) *oldFn = *slot;
+    *slot = newFn;
+    DWORD dummy = 0;
+    VirtualProtect(slot, sizeof(void*), old, &dummy);
+    return TRUE;
+}
+
+static void installNtbHooks() {
+    if (g_ntbSlots[0]) return;                       // already live
+    HMODULE core = GetModuleHandleW(L"dwmcore.dll");
+    if (!core) return;
+    static const char* names[3] = { "NtDCompositionBeginFrame",
+                                    "NtDCompositionSubmitDWMBatch",
+                                    "NtDCompositionGetFrameSurfaceUpdates" };
+    static PFN_NTB4 wraps[3] = { &IWN_NtbBeginWrap, &IWN_NtbSubmitWrap,
+                                 &IWN_NtbUpdWrap };
+    char b[128];
+    for (int i = 0; i < 3; i++) {
+        if (g_ntbSlots[i]) continue;
+        void** slot = iwnFindIat(core, "win32u.dll", names[i]);
+        if (!slot) {
+            wsprintfA(b, "dwm: NTB %s slot not found", names[i]);
+            iwnHookLog(b);
+            continue;
+        }
+        void* old = nullptr;
+        if (iwnIatSwap(slot, (void*)wraps[i], &old) && old) {
+            g_ntbSlots[i] = slot;
+            g_ntbTramps[i] = (PFN_NTB4)old;
+            wsprintfA(b, "dwm: NTB %s IAT LIVE prev=%p", names[i], old);
+        } else {
+            wsprintfA(b, "dwm: NTB %s swap FAILED", names[i]);
+        }
+        iwnHookLog(b);
+    }
+}
+
 static void readbackPixel(int i, const char* tag) {
     if (i < 0 || i >= g_tgtN || !g_tgt[i]) return;
     readbackTex(g_tgt[i], tag);
@@ -3561,6 +3685,8 @@ void DwmWarpBeforeSubmit() {
             // r93: the real per-frame chain (comp -> rtm -> hwnd -> int).
             // Counters decide which link runs at 60fps; InternalPresent paints.
             installChainHooks();
+            // r94: the kernel-composition channel (win32u NtDComposition*)
+            installNtbHooks();
         }
         if (ph == IWN_PH_CF_DEF && g_presntTried) {
             iwnHookLog("dwm: mode C - back to CF paint (wrapper passive)");
@@ -3609,6 +3735,9 @@ void DwmWarpBeforeSubmit() {
             if (g_submitC && (g_chainLive[1] & 0xF) != 0xF &&
                 (LONG)g_stage == IWN_PH_PRESNT)
                 installChainHooks();
+            // r94: retry the channel hooks too (idempotent, slot-guarded)
+            if (!g_ntbSlots[0] && (LONG)g_stage == IWN_PH_PRESNT)
+                installNtbHooks();
             {
                 char b2[128];
                 wsprintfA(b2, "SUBMITW calls=%ld paints=%ld mpo=%ld mpaints=%ld",
@@ -3629,6 +3758,16 @@ void DwmWarpBeforeSubmit() {
                           (unsigned long)g_chainLive[0],
                           (unsigned long)g_chainLive[1]);
                 iwnHookLog(b3);
+            }
+            {
+                char b4[128];
+                wsprintfA(b4, "NTB begin=%ld submit=%ld updates=%ld "
+                          "ntbpaints=%ld live=%d%d%d",
+                          (long)g_ntbBegin, (long)g_ntbSubmit,
+                          (long)g_ntbUpdates, (long)g_ntbPaints,
+                          g_ntbSlots[0] ? 1 : 0, g_ntbSlots[1] ? 1 : 0,
+                          g_ntbSlots[2] ? 1 : 0);
+                iwnHookLog(b4);
             }
         }
     }
