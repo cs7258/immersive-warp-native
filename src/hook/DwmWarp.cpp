@@ -1734,6 +1734,12 @@ static void paintSolidFlash(void* self) {
 // vtable slot (patchVtableSlot, the proven 8-byte .rdata write) so our wrapper
 // runs AFTER the compose copy and IMMEDIATELY BEFORE the kernel submit - the
 // exact point fanxiushu's model requires.
+// (phase enums + paint tick moved up from the stage section for use here)
+#define IWN_PH_IDLE   1
+#define IWN_PH_CF_IMM 2
+#define IWN_PH_CF_DEF 3
+#define IWN_PH_PRESNT 4
+static DWORD          g_lastPaintTick = 0;
 typedef HRESULT (STDMETHODCALLTYPE* PFN_SUBMIT10)(void*, void*, void*, void*, void*,
                                                   void*, void*, void*, void*, void*);
 static PFN_SUBMIT10   g_submitTramp = nullptr;
@@ -1989,13 +1995,10 @@ static void dumpFacesTick(DWORD el) {
 //                12-byte patch, 28-byte position-independent prologue moves to
 //                a trampoline), restore at the next ConfirmFrame
 // All phases use the same fresh-save + black-clear + dest-keystone paint.
-#define IWN_PH_IDLE   1
-#define IWN_PH_CF_IMM 2
-#define IWN_PH_CF_DEF 3
-#define IWN_PH_PRESNT 4
+// (IWN_PH_* enums and g_lastPaintTick now live with the r92 submit hook.)
 
 static volatile LONG  g_pendingRestore = 0;
-static DWORD          g_lastPaintTick = 0;
+// (g_lastPaintTick now defined with the r92 submit hook)
 
 // ---- PresentInternal wrapper detour ----------------------------------------
 // 07:00 run established WHY the CF paint point cannot warp windows: dwm paints
