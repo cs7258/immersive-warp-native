@@ -2282,6 +2282,10 @@ static volatile LONG g_ntbBegin = 0, g_ntbSubmit = 0, g_ntbUpdates = 0,
                      g_ntbPaints = 0;
 static PFN_NTB4  g_ntbTramps[3];
 static void**    g_ntbSlots[3];
+// r94b: the CDWMSwapChain as seen by the present wrapper (cached on every
+// wrapper entry, benign race). The NTB submit wrapper needs it to build the
+// wire RTV cache - the submit/mpo paths that used to build it never fire.
+static void* volatile g_wireSelf = nullptr;
 
 static LONG WINAPI IWN_NtbBeginWrap(void* a, void* b, void* c, void* d) {
     InterlockedIncrement(&g_ntbBegin);
@@ -2290,12 +2294,32 @@ static LONG WINAPI IWN_NtbBeginWrap(void* a, void* b, void* c, void* d) {
 static LONG WINAPI IWN_NtbSubmitWrap(void* a, void* b, void* c, void* d) {
     InterlockedIncrement(&g_ntbSubmit);
     BOOL painted = FALSE;
-    if (g_ready && !g_quiet && (LONG)g_stage == IWN_PH_PRESNT) {
+    // r94b: no stage gate - the phase machine returns to CF_DEF right after
+    // PRESNT entry, which blocked every paint in r94. wirePaintCore itself
+    // no-ops outside the flash/warp time windows.
+    if (g_ready && !g_quiet) {
         DWORD t = GetTickCount();
         if (t != g_lastPaintTick) {
             g_lastPaintTick = t;
             InterlockedIncrement(&g_frames);
-            __try { painted = wirePaintCore(); }
+            __try {
+                // build the wire RTV cache once, from the wrapper's swapchain
+                void* sc = (void*)g_wireSelf;
+                if (g_wrtvN == 0 && sc && !IsBadReadPtr((char*)sc + 0xa0, 4)) {
+                    UINT cnt = 3;
+                    UINT c = *(UINT*)((char*)sc + 0xa0);
+                    if (c > 0 && c <= 4) cnt = c;
+                    ID3D11Texture2D* bufs[IWN_WBUF_MAX] = { 0 };
+                    int n = 0;
+                    for (UINT i = 0; i < cnt && n < IWN_WBUF_MAX; i++) {
+                        ID3D11Texture2D* tx = iwnWireBuffer(sc, i);   // AddRef'd
+                        if (tx) bufs[n++] = tx;
+                    }
+                    wireCacheRefresh(bufs, n);
+                    for (int i = 0; i < n; i++) { if (bufs[i]) bufs[i]->Release(); }
+                }
+                painted = wirePaintCore();
+            }
             __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
         }
     }
@@ -2952,6 +2976,8 @@ static void* g_lbbiFn = nullptr;   // dwmcore + 0xC1580
 static void* g_lfbiFn = nullptr;   // dwmcore + 0xC6DD0
 
 static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3, void* a4, UINT64 a5) {
+    // r94b: cache the CDWMSwapChain for the NTB submit wrapper's RTV build
+    if (self) g_wireSelf = self;
     // round 71: dwm names its own buffers (see LBIDX block comment)
     if (g_lfbiFn && self) {
         static volatile LONG s_lbCalls = 0;   // POD statics - no TLS guard
