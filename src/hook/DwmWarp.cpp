@@ -1756,6 +1756,8 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_SUBMIT10)(void*, void*, void*, void*, vo
 static PFN_SUBMIT10   g_submitTramp = nullptr;
 static volatile LONG  g_submitCalls = 0;
 static volatile LONG  g_submitPaints = 0;
+static BOOL wirePaintCore(void);                        // r92c: shared paint core
+static void wireCacheRefresh(ID3D11Texture2D** bufs, int n);
 
 static BOOL submitPaint(void* wireSC) {
     if (!g_ctx || !g_dev || !g_target || !g_twin) return FALSE;
@@ -1777,80 +1779,9 @@ static BOOL submitPaint(void* wireSC) {
     if (n == 0) return FALSE;
 
     // rebuild the RTV cache when dwm hands us a different buffer set
-    BOOL cacheOk = (g_wrtvN == n);
-    if (cacheOk) {
-        for (int i = 0; i < n && cacheOk; i++) {
-            BOOL found = FALSE;
-            for (int j = 0; j < g_wrtvN; j++)
-                if (g_wrtv[j].tex == bufs[i]) { found = TRUE; break; }
-            if (!found) cacheOk = FALSE;
-        }
-    }
-    if (!cacheOk) {
-        for (int j = 0; j < g_wrtvN; j++) {
-            if (g_wrtv[j].rtv) g_wrtv[j].rtv->Release();
-            if (g_wrtv[j].tex) g_wrtv[j].tex->Release();
-            g_wrtv[j].tex = nullptr;
-            g_wrtv[j].rtv = nullptr;
-        }
-        g_wrtvN = 0;
-        for (int i = 0; i < n; i++) {
-            D3D11_TEXTURE2D_DESC bd = {}, td = {};
-            __try {
-                bufs[i]->GetDesc(&bd);
-                g_target->GetDesc(&td);
-            } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
-            if (bd.Width != td.Width || bd.Height != td.Height ||
-                bd.Format != td.Format) continue;
-            ID3D11RenderTargetView* rv = nullptr;
-            if (SUCCEEDED(g_dev->CreateRenderTargetView(bufs[i], nullptr, &rv)) && rv) {
-                bufs[i]->AddRef();
-                g_wrtv[g_wrtvN].tex = bufs[i];
-                g_wrtv[g_wrtvN].rtv = rv;
-                g_wrtvN++;
-            }
-        }
-        char b[128];
-        wsprintfA(b, "SUBMIT: rtv cache built n=%d (bufs=%d)", g_wrtvN, n);
-        iwnHookLog(b);
-    }
+    wireCacheRefresh(bufs, n);
     for (int i = 0; i < n; i++) { if (bufs[i]) bufs[i]->Release(); }  // GetBuffer refs
-    if (g_wrtvN == 0) return FALSE;
-
-    BOOL painted = FALSE;
-    DWORD el = iwnEl();
-    __try {
-        if (el >= IWN_FLASH_T0 && el < IWN_FLASH_T1) {
-            // phase B: solid colour AT THE SUBMIT POINT - post-compose,
-            // pre-submit. If the screen does not flash now, the wire buffers
-            // are not what the kernel composites from, period.
-            float col[4];
-            if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
-            else                    { col[0] = 0.0f; col[1] = 1.0f; col[2] = 0.0f; col[3] = 1.0f; }
-            for (int i = 0; i < g_wrtvN; i++)
-                g_ctx->ClearRenderTargetView(g_wrtv[i].rtv, col);
-            painted = TRUE;
-            static volatile LONG s_fp = 0;
-            if (InterlockedCompareExchange(&s_fp, 1, 0) == 0) {
-                iwnHookLog("SUBMIT: flash painted (post-compose, pre-submit)");
-                readbackTex(g_wrtv[0].tex, "SUBMIT-FLASH");
-            }
-        } else if (el >= IWN_FLASH_T1) {
-            // phase C: warp the just-composed desktop into the submit buffers
-            __try { g_ctx->CopyResource(g_twin, g_wrtv[0].tex); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { }
-            int before = (int)g_draws;
-            paintWarp();
-            painted = ((int)g_draws != before);
-            static volatile LONG s_wp = 0;
-            if (painted && InterlockedCompareExchange(&s_wp, 1, 0) == 0)
-                iwnHookLog("SUBMIT: warp painted (post-compose, pre-submit)");
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        InterlockedIncrement(&g_fail);
-        iwnHookLog("dwm: submitPaint EXCEPTION");
-    }
-    return painted;
+    return wirePaintCore();
 }
 
 static HRESULT STDMETHODCALLTYPE IWN_SubmitWrap(void* c, void* wireSC, void* a3, void* a4,
@@ -1871,6 +1802,98 @@ static HRESULT STDMETHODCALLTYPE IWN_SubmitWrap(void* c, void* wireSC, void* a3,
     HRESULT hr = g_submitTramp(c, wireSC, a3, a4, a5, a6, a7, a8, a9, a10);
     if (painted) InterlockedIncrement(&g_submitPaints);
     return hr;
+}
+
+// ---- r92c: the REAL per-frame submit on this machine -----------------------
+// The 16:15 run patched the vt[13] submit yet the wrapper never fired. The
+// full PresentInternal disassembly shows why: when [self+0x24C]==2 and
+// [self+0x247]==0 (the 16:15:45.407 state), the per-frame submit goes through
+// CDWMSwapChain::ConvertPresentToMultiplaneOverlay (0x162940) - the MPO
+// present - and the vt[13] call at +0x2D1 is never reached. Hook 0x162940:
+// prologue is exactly 8 pushes (12 bytes), and `self` IS the CDWMSwapChain,
+// so iwnWireBuffer works directly.
+typedef HRESULT (STDMETHODCALLTYPE* PFN_MPO8)(void*, void*, void*, void*, void*,
+                                              void*, void*, void*);
+static PFN_MPO8       g_mpoTramp = nullptr;
+static void*          g_mpoTrampMem = nullptr;
+static volatile LONG  g_mpoCalls = 0;
+static volatile LONG  g_mpoPaints = 0;
+static volatile LONG  g_mpoHookState = 0;    // 1 trying, 2 live
+
+// shared paint core: flash (phase B) or warp (phase C) into the cached wire
+// RTVs. Returns TRUE when something was painted.
+static BOOL wirePaintCore(void) {
+    if (g_wrtvN == 0) return FALSE;
+    BOOL painted = FALSE;
+    DWORD el = iwnEl();
+    __try {
+        if (el >= IWN_FLASH_T0 && el < IWN_FLASH_T1) {
+            float col[4];
+            if (el < IWN_FLASH_MID) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; }
+            else                    { col[0] = 0.0f; col[1] = 1.0f; col[2] = 0.0f; col[3] = 1.0f; }
+            for (int i = 0; i < g_wrtvN; i++)
+                g_ctx->ClearRenderTargetView(g_wrtv[i].rtv, col);
+            painted = TRUE;
+            static volatile LONG s_fp = 0;
+            if (InterlockedCompareExchange(&s_fp, 1, 0) == 0) {
+                iwnHookLog("SUBMIT: flash painted (post-compose, pre-submit)");
+                readbackTex(g_wrtv[0].tex, "SUBMIT-FLASH");
+            }
+        } else if (el >= IWN_FLASH_T1) {
+            __try { g_ctx->CopyResource(g_twin, g_wrtv[0].tex); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { }
+            int before = (int)g_draws;
+            paintWarp();
+            painted = ((int)g_draws != before);
+            static volatile LONG s_wp = 0;
+            if (painted && InterlockedCompareExchange(&s_wp, 1, 0) == 0)
+                iwnHookLog("SUBMIT: warp painted (post-compose, pre-submit)");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("dwm: wirePaintCore EXCEPTION");
+    }
+    return painted;
+}
+
+// rebuild g_wrtv from the given texture set when it changed
+static void wireCacheRefresh(ID3D11Texture2D** bufs, int n) {
+    BOOL cacheOk = (g_wrtvN == n);
+    if (cacheOk) {
+        for (int i = 0; i < n && cacheOk; i++) {
+            BOOL found = FALSE;
+            for (int j = 0; j < g_wrtvN; j++)
+                if (g_wrtv[j].tex == bufs[i]) { found = TRUE; break; }
+            if (!found) cacheOk = FALSE;
+        }
+    }
+    if (cacheOk) return;
+    for (int j = 0; j < g_wrtvN; j++) {
+        if (g_wrtv[j].rtv) g_wrtv[j].rtv->Release();
+        if (g_wrtv[j].tex) g_wrtv[j].tex->Release();
+        g_wrtv[j].tex = nullptr;
+        g_wrtv[j].rtv = nullptr;
+    }
+    g_wrtvN = 0;
+    for (int i = 0; i < n; i++) {
+        D3D11_TEXTURE2D_DESC bd = {}, td = {};
+        __try {
+            bufs[i]->GetDesc(&bd);
+            g_target->GetDesc(&td);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (bd.Width != td.Width || bd.Height != td.Height ||
+            bd.Format != td.Format) continue;
+        ID3D11RenderTargetView* rv = nullptr;
+        if (SUCCEEDED(g_dev->CreateRenderTargetView(bufs[i], nullptr, &rv)) && rv) {
+            bufs[i]->AddRef();
+            g_wrtv[g_wrtvN].tex = bufs[i];
+            g_wrtv[g_wrtvN].rtv = rv;
+            g_wrtvN++;
+        }
+    }
+    char b[128];
+    wsprintfA(b, "SUBMIT: rtv cache built n=%d (bufs=%d)", g_wrtvN, n);
+    iwnHookLog(b);
 }
 
 // One-shot: once iwnIdentifySubmit has cached the CBindInfo, verify its vtable
@@ -1904,6 +1927,122 @@ static void installSubmitHook() {
         // one of the two copies - the hook went LIVE but never fired).
         DwmWarpInstallRealizationHook();
     }
+}
+
+// r92c: paint at the ConvertPresentToMultiplaneOverlay entry. `self` is the
+// CDWMSwapChain - the exact object our present wrapper sees, so the proven
+// iwnWireBuffer accessors resolve the buffers.
+static BOOL mpoPaint(void* self) {
+    if (!g_ctx || !g_dev || !g_target || !g_twin) return FALSE;
+    UINT cnt = 3;
+    __try {
+        UINT c = *(UINT*)((char*)self + 0xa0);
+        if (c > 0 && c <= 4) cnt = c;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    ID3D11Texture2D* bufs[IWN_WBUF_MAX] = { 0 };
+    int n = 0;
+    for (UINT i = 0; i < cnt && n < IWN_WBUF_MAX; i++) {
+        ID3D11Texture2D* t = iwnWireBuffer(self, i);   // AddRef'd
+        if (t) bufs[n++] = t;
+    }
+    wireCacheRefresh(bufs, n);
+    for (int i = 0; i < n; i++) { if (bufs[i]) bufs[i]->Release(); }
+    return wirePaintCore();
+}
+
+static HRESULT STDMETHODCALLTYPE IWN_MpoWrap(void* self, void* a2, void* a3, void* a4,
+                                             void* a5, void* a6, void* a7, void* a8) {
+    InterlockedIncrement(&g_mpoCalls);
+    BOOL painted = FALSE;
+    if (g_ready && g_mpoTramp && self && !g_quiet &&
+        (LONG)g_stage == IWN_PH_PRESNT) {
+        DWORD t = GetTickCount();
+        if (t != g_lastPaintTick) {
+            g_lastPaintTick = t;
+            InterlockedIncrement(&g_frames);
+            __try { painted = mpoPaint(self); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+        }
+    }
+    HRESULT hr = g_mpoTramp(self, a2, a3, a4, a5, a6, a7, a8);
+    if (painted) InterlockedIncrement(&g_mpoPaints);
+    return hr;
+}
+
+// 12-byte prologue detour on ConvertPresentToMultiplaneOverlay (0x162940),
+// dwmcore instance #1 (the one whose PresentInternal runs - the present
+// wrapper proves GetModuleHandle's instance is the live code). Same
+// suspended-thread + CFG recipe as the PresentInternal install.
+static BOOL DwmWarpInstallMpoHook() {
+    if (InterlockedCompareExchange(&g_mpoHookState, 1, 0) != 0)
+        return g_mpoTramp != nullptr;
+    HMODULE h = GetModuleHandleW(L"dwmcore.dll");
+    if (!h) { iwnHookLog("dwm: MPO hook skipped (no dwmcore)"); return FALSE; }
+    BYTE* fn = (BYTE*)h + 0x162940;
+    const BYTE exp[12] = { 0x55, 0x53, 0x56, 0x57,            // push rbp,rbx,rsi,rdi
+                           0x41, 0x54, 0x41, 0x55,            // push r12, r13
+                           0x41, 0x56, 0x41, 0x57 };          // push r14, r15
+    BYTE cur[12];
+    CopyMemory(cur, fn, 12);
+    if (memcmp(cur, exp, 12) != 0) {
+        char b[160];
+        wsprintfA(b, "dwm: MPO hook skipped (prologue %02X %02X %02X %02X %02X %02X)",
+                  cur[0], cur[1], cur[2], cur[3], cur[4], cur[5]);
+        iwnHookLog(b);
+        return FALSE;
+    }
+    BYTE* blk = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_EXECUTE_READWRITE);
+    if (!blk) { iwnHookLog("dwm: MPO hook skipped (no RWX mem)"); return FALSE; }
+    BYTE* p = blk;
+    CopyMemory(p, fn, 12); p += 12;
+    *p++ = 0x48; *p++ = 0xB8;
+    UINT64 back = (UINT64)(fn + 12);
+    CopyMemory(p, &back, 8); p += 8;
+    *p++ = 0xFF; *p++ = 0xE0;
+    if (!(blk[12] == 0x48 && blk[13] == 0xB8 &&
+          *(UINT64*)(blk + 14) == back && blk[22] == 0xFF && blk[23] == 0xE0)) {
+        iwnHookLog("dwm: MPO hook skipped (trampoline bytes bad)");
+        return FALSE;
+    }
+    g_mpoTramp = (PFN_MPO8)blk;
+    g_mpoTrampMem = blk;
+    FlushInstructionCache(GetCurrentProcess(), blk, 0x18);
+
+    HANDLE th[128]; int ns = 0;
+    suspendOtherThreads(&ns, th, 128);
+    DWORD old = 0;
+    BOOL ok = VirtualProtect(fn, 32, PAGE_EXECUTE_READWRITE, &old) != 0;
+    BYTE patch[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };
+    UINT64 sa = (UINT64)&IWN_MpoWrap;
+    CopyMemory(patch + 2, &sa, 8);
+    if (ok) {
+        CopyMemory(fn, patch, 12);
+        VirtualProtect(fn, 32, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), fn, 12);
+    }
+    BYTE nowb[12];
+    CopyMemory(nowb, fn, 12);
+    BOOL good = ok && memcmp(nowb, patch, 12) == 0;
+    for (int i = ns - 1; i >= 0; i--) { ResumeThread(th[i]); CloseHandle(th[i]); }
+    char b[128];
+    wsprintfA(b, "dwm: MPO hook %s",
+              good ? "LIVE @0x162940 (ConvertPresentToMultiplaneOverlay)"
+                   : "FAILED (patch did not verify)");
+    iwnHookLog(b);
+    if (!good) { g_mpoTramp = nullptr; return FALSE; }
+    typedef struct { ULONG Offset; ULONG Flags; } IWN_CFG_T3;
+    typedef BOOL (WINAPI *PFN_SVCT3)(HANDLE, PVOID, SIZE_T, ULONG, IWN_CFG_T3*);
+    PFN_SVCT3 svct = (PFN_SVCT3)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                               "SetProcessValidCallTargets");
+    if (svct) {
+        uintptr_t page = (uintptr_t)fn & ~(uintptr_t)0xFFF;
+        IWN_CFG_T3 info[256];
+        for (int i = 0; i < 256; i++) { info[i].Offset = (ULONG)(i * 16); info[i].Flags = 1; }
+        svct(GetCurrentProcess(), (PVOID)page, 0x1000, 256, info);
+    }
+    InterlockedExchange(&g_mpoHookState, 2);
+    return TRUE;
 }
 
 static void readbackPixel(int i, const char* tag) {
@@ -3197,8 +3336,10 @@ void DwmWarpBeforeSubmit() {
                 g_stage = IWN_PH_CF_DEF;
                 iwnHookLog("dwm: present wrapper NOT installed - staying on CF deferred-restore mode");
             }
-            // r92: the realization hook installs from installSubmitHook (after
-            // the CBindInfo is cached) so it targets the right dwmcore copy
+            // r92c: the per-frame submit goes through
+            // ConvertPresentToMultiplaneOverlay when [self+0x24C]==2 - hook it
+            // alongside the wrapper (same dwmcore instance).
+            DwmWarpInstallMpoHook();
         }
         if (ph == IWN_PH_CF_DEF && g_presntTried) {
             iwnHookLog("dwm: mode C - back to CF paint (wrapper passive)");
@@ -3230,6 +3371,24 @@ void DwmWarpBeforeSubmit() {
             // the desktop's own realizations exist before we injected, and
             // AddRealization may never fire again for them.
             iwnScanBindInfoRealizations("tick");
+            // r92: which submit path actually runs + vtable self-heal (r80
+            // proved an unknown writer restores patched vtable pages)
+            if (g_submitTramp && g_submitC && !IsBadReadPtr(g_submitC, 8)) {
+                void** cvt = *(void***)g_submitC;
+                if (cvt && !IsBadReadPtr(&cvt[13], 8) &&
+                    cvt[13] != (void*)&IWN_SubmitWrap) {
+                    void* o = patchVtableSlot((void*)g_submitC, 13,
+                                              (void*)&IWN_SubmitWrap, "SUBMIT[re-heal]");
+                    if (o) iwnHookLog("SUBMIT: vt13 self-heal re-patched");
+                }
+            }
+            {
+                char b2[128];
+                wsprintfA(b2, "SUBMITW calls=%ld paints=%ld mpo=%ld mpaints=%ld",
+                          (long)g_submitCalls, (long)g_submitPaints,
+                          (long)g_mpoCalls, (long)g_mpoPaints);
+                iwnHookLog(b2);
+            }
         }
     }
 
