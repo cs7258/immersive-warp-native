@@ -1071,6 +1071,109 @@ static void readbackTex(ID3D11Texture2D* tex, const char* tag) {
     }
 }
 
+// --------------------------------------------------- round 82: scanout source
+// CDWMSwapChain::GetBuffer (dwmcore+0xE6060): resolves a LOGICAL buffer index
+// to the real ID3D11Texture2D by calling wire->GetBuffer(idx, IID_Tex2D). This
+// is dwm's own accessor - the exact "get the composed desktop" function.
+static const GUID kIIDTex2D =
+    { 0xdc8e63f3, 0xd12b, 0x4952, { 0xb4, 0x7b, 0x5e, 0x45, 0x02, 0x6a, 0x86, 0x2d } };
+typedef HRESULT (STDMETHODCALLTYPE* PFN_SCGETBUF)(void*, UINT, const GUID&, void**);
+
+static ID3D11Texture2D* iwnWireBuffer(void* self, UINT idx) {
+    if (!self) return nullptr;
+    HMODULE core = GetModuleHandleW(L"dwmcore.dll");
+    if (!core) return nullptr;
+    PFN_SCGETBUF fn = (PFN_SCGETBUF)(void*)((char*)core + 0xE6060);
+    void* tex = nullptr;
+    __try {
+        if (FAILED(fn(self, idx, kIIDTex2D, &tex))) return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+    return (ID3D11Texture2D*)tex;    // caller owns the AddRef
+}
+
+// One-shot forensic dump: which of the wire buffers actually holds composed
+// desktop content at PresentInternal entry? Pairs with the LBIDX back index.
+static void iwnProbeWireBuffers(void* self) {
+    static volatile LONG s_done = 0;             // POD static - no TLS guard
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    UINT n = 3;
+    __try {
+        UINT c = *(UINT*)((char*)self + 0xa0);
+        if (c > 0 && c <= 4) n = c;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    char b[160];
+    wsprintfA(b, "WBUF: bufcnt=%u backIdx=%ld", n, (long)g_lbBackLast);
+    iwnHookLog(b);
+    for (UINT i = 0; i < n; i++) {
+        ID3D11Texture2D* t = iwnWireBuffer(self, i);
+        if (!t) { wsprintfA(b, "WBUF: idx=%u GetBuffer FAILED", i); iwnHookLog(b); continue; }
+        D3D11_TEXTURE2D_DESC d = {};
+        __try { t->GetDesc(&d); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        BOOL ours = (d.Width == (UINT)g_rtW && d.Height == (UINT)g_rtH);
+        wsprintfA(b, "WBUF: idx=%u tex=%p %lux%lu bind=0x%X misc=0x%X sameDev=%d",
+                  i, t, (unsigned long)d.Width, (unsigned long)d.Height,
+                  (unsigned)d.BindFlags, (unsigned)d.MiscFlags,
+                  (d.Width == (UINT)g_rtW && d.Height == (UINT)g_rtH) ? 1 : 0);
+        iwnHookLog(b);
+        if (ours) {
+            char tag[16];
+            wsprintfA(tag, "WB%d", i);
+            readbackTex(t, tag);
+        }
+        t->Release();
+    }
+}
+
+// The submit-side half: put our warped frame into the exact buffer dwm is
+// about to hand to scanout. Index comes from CDWMSwapChain::GetLogical+
+// BackBufferIndex (already ticked in IWN_PresentWrap), texture from
+// CDWMSwapChain::GetBuffer. Cross-device copies are the one thing that hard-
+// crashes dwm, so the device identity is checked before every CopyResource.
+static volatile LONG g_scanBlits = 0;
+static volatile LONG g_scanFails = 0;
+
+static void iwnBlitToScanout(void* self) {
+    if (!self || !g_target || !g_ctx) return;
+    UINT idx = (g_lbBackLast >= 0) ? (UINT)g_lbBackLast : 0;
+    ID3D11Texture2D* bb = iwnWireBuffer(self, idx);
+    if (!bb) {
+        InterlockedIncrement(&g_scanFails);
+    } else {
+        BOOL ok = FALSE;
+        __try {
+            ID3D11Device* d = nullptr;
+            D3D11_TEXTURE2D_DESC bd = {}, td = {};
+            bb->GetDesc(&bd);
+            g_target->GetDesc(&td);
+            bb->GetDevice(&d);
+            // CopyResource demands identical dimensions AND format
+            if (d && d == g_dev && bd.Width == td.Width && bd.Height == td.Height &&
+                bd.Format == td.Format && bd.SampleDesc.Count == td.SampleDesc.Count) {
+                g_ctx->CopyResource(bb, g_target);
+                ok = TRUE;
+            }
+            if (d) d->Release();
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        bb->Release();
+        if (ok) InterlockedIncrement(&g_scanBlits);
+        else    InterlockedIncrement(&g_scanFails);
+    }
+    {
+        static DWORD s_last = 0;             // POD static - no TLS guard
+        DWORD t = GetTickCount();
+        if (t - s_last > 5000) {
+            s_last = t;
+            char b[144];
+            wsprintfA(b, "SCANOUT idx=%u blits=%ld fails=%ld draws=%ld backIdx=%ld",
+                      idx, (long)g_scanBlits, (long)g_scanFails, (long)g_draws,
+                      (long)g_lbBackLast);
+            iwnHookLog(b);
+        }
+    }
+}
+
 static void readbackPixel(int i, const char* tag) {
     if (i < 0 || i >= g_tgtN || !g_tgt[i]) return;
     readbackTex(g_tgt[i], tag);
@@ -1736,6 +1839,8 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
         if (t != g_lastPaintTick) {            // one paint per compose
             g_lastPaintTick = t;
             InterlockedIncrement(&g_frames);
+            // round 82: one-shot forensic - which wire buffer holds the desktop?
+            iwnProbeWireBuffers(self);
             __try {
                 g_ctx->CopyResource(g_twin, g_target); // fresh COMPLETE frame
                 const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -1766,6 +1871,9 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
                         readbackPixel(i, "warp-present");
                     }
                 }
+                // round 82: hand the warped frame to the buffer dwm is about to
+                // submit - resolved with dwm's OWN accessor + logical index.
+                iwnBlitToScanout(self);
             }
         }
     }
@@ -2353,22 +2461,24 @@ void DwmWarpBeforeSubmit() {
     //   A  8-30s   CF_DEF paint (23:18-run visible reference), NO wrapper
     //   B 30-60s   PresentInternal wrapper entry paint (round-63 recipe)
     //   C 60-150s  back to CF_DEF (wrapper stays installed but passive)
-    if (el < 1500)       ph = IWN_PH_IDLE;
-    else if (el < 8000)  ph = IWN_PH_CF_IMM;
-    else if (el < 30000) ph = IWN_PH_CF_DEF;
-    // round 81: STRATEGIC RETREAT to the round-63 recipe. Evidence chain:
-    //   - r63: wrapper-entry paint + CF deferred restore WAS visible on screen
-    //     (corner wedge + PNG -40%) painting the texscan composed faces.
-    //   - r75+: applyWireFromSC REPLACED the paint targets with the wire back
-    //     buffers (black at wrapper entry) - every mode since then painted a
-    //     dead buffer, explaining the r74 "invisible in all modes" verdict.
-    //   - r78: dxgi COM Present slots (8/54/PresentDWM) - zero calls.
-    //   - r80: ctx Draw/Copy methods - zero calls even in self-heal windows,
-    //     AND the ctx vtable patch is force-reverted page-wide every ~2s.
-    // So: keep the texscan composed faces as paint targets, stay on CF paint
-    // with deferred restore all 150s, and re-judge visibility externally.
-    else if (el < 60000) ph = IWN_PH_CF_DEF;   // r81: was PRESNT (mode B)
-    else                 ph = IWN_PH_CF_DEF;
+    // round 82: back to dwm's OWN internal functions (fanxiushu model).
+    // The call graph was finally read out of dwmcore:
+    //   CComposition::Present (0x77538)
+    //     -> CRenderTargetManager::Present (0x7782C)
+    //          -> [rt+0x40]->vt[8] = CHwndRenderTarget::Present (0x5B2A0)
+    //               -> CHwndRenderTarget::InternalPresent (0x5B328)
+    //     -> CDWMSwapChain::PresentInternal (0x6C6B0)      <-- submit point
+    //          [self+0x1A8] = the wire DXGI swapchain
+    //          link lookup: [[self+0x10]+0x50]+0xF0, vtable slot 13 = Present
+    // So PresentInternal entry IS "render finished, not yet scanned out".
+    // The buffer to paint is resolved by dwm itself:
+    //   idx  = CDWMSwapChain::GetLogicalBackBufferIndex (0xC1580)
+    //          = (wire->GetCurrentBackBufferIndex() + off) % [this+0xA0]
+    //   tex  = CDWMSwapChain::GetBuffer (0xE6060) -> wire->vt[9](idx, IID_Tex2D)
+    // Every earlier round painted either a fingerprint-scanned render target
+    // or a blind GetBuffer(0) - never the buffer dwm is about to hand over.
+    if (el < 1000) ph = IWN_PH_IDLE;
+    else           ph = IWN_PH_PRESNT;
 
     if (ph != g_lastLoggedStage) {
         g_lastLoggedStage = ph;
@@ -2386,10 +2496,11 @@ void DwmWarpBeforeSubmit() {
         // Steady-warp entry: suppress MPO/DirectFlip so overlay-direct windows
         // (cmd.exe, video, fullscreen) are routed back through the composite
         // surface we paint. Restored on every shutdown path via restoreBaseline.
-        if (ph == IWN_PH_CF_DEF && !g_presntTried) {
-            // mode A entry: pure CF paint, wrapper deliberately NOT installed
+        if ((ph == IWN_PH_CF_DEF || ph == IWN_PH_PRESNT) && !g_presntTried) {
+            // r82: MPO/direct-flip suppression is required in BOTH modes - it is
+            // what routes overlay windows back through the surface dwm presents.
             DwmWarpSetMpoSuppressed(TRUE);
-            installLegacyPresentHook();   // round 69: dxgi legacy PresentDWM hook
+            installLegacyPresentHook();
         }
         if (ph == IWN_PH_PRESNT && !g_presntTried) {
             // mode B entry: install the wrapper once
