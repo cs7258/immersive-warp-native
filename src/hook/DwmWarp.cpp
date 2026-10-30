@@ -2237,6 +2237,7 @@ static void installChainHooks() {
     static const ULONG rvaTab[4] = { 0x77538, 0x7782C, 0x5B2A0, 0x5B328 };
     static const char* nameTab[4] = { "comp", "rtm", "hwnd", "int" };
     HMODULE bases[2] = { m1, m2 };
+    if (m2 == m1) iwnHookLog("dwm: CHAIN m2 == m1 (C vtable module = GetModuleHandle copy)");
     for (int inst = 0; inst < 2; inst++) {
         if (!bases[inst]) continue;
         if (inst == 1 && bases[1] == bases[0]) continue;   // same module twice?
@@ -3603,8 +3604,10 @@ void DwmWarpBeforeSubmit() {
                 }
             }
             // r93b: retry the chain hooks once g_submitC exists (the first
-            // attempt at PRESNT entry runs before m2 is discoverable)
-            if ((g_chainLive[0] & 0xF) != 0xF && (LONG)g_stage == IWN_PH_PRESNT)
+            // attempt at PRESNT entry runs before m2 is discoverable). Gate
+            // on the B bitmask - A completing must not cancel the retry.
+            if (g_submitC && (g_chainLive[1] & 0xF) != 0xF &&
+                (LONG)g_stage == IWN_PH_PRESNT)
                 installChainHooks();
             {
                 char b2[128];
