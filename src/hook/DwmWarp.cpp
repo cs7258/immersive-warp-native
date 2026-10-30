@@ -2211,7 +2211,7 @@ static void installChainHooks() {
         0x48, 0x89, 0x5C, 0x24, 0x10,                       // mov [r11+10h],rbx
         0x48, 0x89, 0x6C, 0x24, 0x18,                       // mov [r11+18h],rbp
         0x48, 0x89, 0x74, 0x24, 0x20, 0x57 };               // mov [r11+20h],rsi; push rdi
-    static const BYTE expRtm[13] = {
+    static const BYTE expRtm[14] = {
         0x48, 0x89, 0x5C, 0x24, 0x08,                       // mov [rsp+8],rbx
         0x4C, 0x89, 0x44, 0x24, 0x18,                       // mov [rsp+18h],r8
         0x89, 0x54, 0x24, 0x10 };                           // mov [rsp+10h],edx
@@ -2219,7 +2219,7 @@ static void installChainHooks() {
         0x48, 0x89, 0x5C, 0x24, 0x20,                       // mov [rsp+20h],rbx
         0x55, 0x56, 0x57,                                   // push rbp,rsi,rdi
         0x48, 0x83, 0xEC, 0x60 };                           // sub rsp,60h
-    static const BYTE expInt[25] = {
+    static const BYTE expInt[21] = {
         0x48, 0x8B, 0xC4,                                   // mov rax, rsp
         0x48, 0x89, 0x58, 0x08,                             // mov [rax+8],rbx
         0x48, 0x89, 0x68, 0x10,                             // mov [rax+10h],rbp
@@ -2231,9 +2231,9 @@ static void installChainHooks() {
                        const char* tag; };
     const CHAIN_ENT ents[4] = {
         { 0x77538, expComp, 19, (void*)&IWN_CompWrap,  &g_compTramp,  &g_compTrampMem,  "CHAIN[comp]" },
-        { 0x7782C, expRtm,  13, (void*)&IWN_RtmWrap,   &g_rtmTramp,   &g_rtmTrampMem,   "CHAIN[rtm]" },
+        { 0x7782C, expRtm,  14, (void*)&IWN_RtmWrap,   &g_rtmTramp,   &g_rtmTrampMem,   "CHAIN[rtm]" },
         { 0x5B2A0, expHwnd, 12, (void*)&IWN_HwndWrap,  &g_hwndTramp,  &g_hwndTrampMem,  "CHAIN[hwnd]" },
-        { 0x5B328, expInt,  25, (void*)&IWN_IntWrap,   &g_intTramp,   &g_intTrampMem,   "CHAIN[int]" },
+        { 0x5B328, expInt,  21, (void*)&IWN_IntWrap,   &g_intTramp,   &g_intTrampMem,   "CHAIN[int]" },
     };
     for (int i = 0; i < 4; i++) {
         if (g_chainLive & (1 << i)) continue;
