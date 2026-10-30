@@ -814,9 +814,34 @@ static PFN_CPY8 g_cpyOrigR[IWN_COBS_N] = {};
 static volatile LONG g_cpyCalls[IWN_COBS_N] = {};
 static volatile LONG g_cpyLogged = 0;
 static void** g_cpyVt = nullptr;               // ctx vtable base (self-check)
+static const void* const* g_cpyHooks = nullptr;
+static LONG g_cpyPatched = 0;
+static volatile LONG g_cpyRepatch = 0;         // round 80: self-heal counter
 static const char* kCpyNames[IWN_COBS_N] = {
     "DrawIndexed", "Draw", "OMSetRT", "CopySubres", "CopyResource",
     "UpdateSubres", "ClearRTV", "Resolve" };
+
+// round 80: patch (or re-patch) all 8 observed slots. Returns how many slots
+// were (re)written. Re-entrant - the heartbeat calls it to self-heal.
+static int patchCpySlots(const char* why) {
+    int n = 0;
+    for (int i = 0; i < IWN_COBS_N; i++) {
+        void** slot = &g_cpyVt[kCpySlots[i]];
+        if (*slot == g_cpyHooks[i]) continue;
+        DWORD op = 0;
+        if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) continue;
+        if (*slot != (void*)g_cpyHooks[i]) g_cpyOrigR[i] = (PFN_CPY8)*slot;
+        *slot = (void*)g_cpyHooks[i];
+        n++;
+    }
+    if (n) {
+        InterlockedExchangeAdd(&g_cpyRepatch, n);
+        char b[128];
+        wsprintfA(b, "dwm: CPYR %s re-patched %d slot(s)", why, n);
+        iwnHookLog(b);
+    }
+    return n;
+}
 
 static void IWN_CpyLog(int slot, void* a1, void* a2) {
     if (g_cpyLogged >= 40) return;
@@ -859,21 +884,11 @@ static void installCopyObserver() {
         (void*)&IWN_CObs0, (void*)&IWN_CObs1, (void*)&IWN_CObs2, (void*)&IWN_CObs3,
         (void*)&IWN_CObs4, (void*)&IWN_CObs5, (void*)&IWN_CObs6, (void*)&IWN_CObs7
     };
-    DWORD op = 0;
-    // patch slot by slot - the 8 slots are scattered, not contiguous
-    int n = 0;
-    for (int i = 0; i < IWN_COBS_N; i++) {
-        void** slot = &vt[kCpySlots[i]];
-        if (IsBadWritePtr(slot, 8) &&
-            !VirtualProtect(slot, 8, PAGE_READWRITE, &op)) continue;
-        if (*slot == (void*)hooks[i]) continue;   // already ours
-        g_cpyOrigR[i] = (PFN_CPY8)*slot;
-        *slot = (void*)hooks[i];
-        n++;
-    }
+    g_cpyHooks = hooks;
     g_cpyVt = vt;
+    patchCpySlots("install");
     char b[96];
-    wsprintfA(b, "dwm: CPYR v2 observer installed on %d/%d ctx slots", n, IWN_COBS_N);
+    wsprintfA(b, "dwm: CPYR v2 observer installed on %d/%d ctx slots", g_cpyPatched, IWN_COBS_N);
     iwnHookLog(b);
     // install-time selftest: one REAL CopyResource must tick slot idx 4
     // (g_stageTex <- g_twin, both screen-size). If it does not, the patch is
@@ -886,17 +901,39 @@ static void installCopyObserver() {
     }
 }
 
-// round 79: 10s heartbeat - per-slot counters + patch-alive self-check
+// round 80: 3s heartbeat with SELF-HEAL. Round 79 proved the patch IS
+// effective at install (selftest hit) but gets REVERTED within ~2s by an
+// unknown writer - while probe's IAT hooks survive the whole run. So: on every
+// heartbeat, re-patch any slot that no longer points at us (keeps the observer
+// alive), count the reverts, and forensically log the page protection of the
+// vtable page (VirtualProtect-based revert vs raw write) plus WHICH slots got
+// reverted (whole-page restore vs targeted slot).
 static void cpyObserverHeartbeat() {
-    if (!g_cpyVt) return;
+    if (!g_cpyVt || !g_cpyHooks) return;
     static DWORD s_last = 0;               // POD static - no TLS guard
     DWORD t = GetTickCount();
-    if (t - s_last < 10000) return;
+    if (t - s_last < 3000) return;
     s_last = t;
-    void* cur47 = g_cpyVt[47];
-    char b[300];
-    wsprintfA(b, "CPYR hb vt47=%s calls: DI=%ld D=%ld OM=%ld CSR=%ld CR=%ld US=%ld CRTV=%ld RS=%ld logged=%ld",
-              cur47 == (void*)&IWN_CObs4 ? "LIVE" : "REVERTED",
+    // count reverted slots + capture the page protection BEFORE re-patching
+    int rev = 0, firstRev = -1;
+    for (int i = 0; i < IWN_COBS_N; i++) {
+        if (g_cpyVt[kCpySlots[i]] != g_cpyHooks[i]) {
+            rev++;
+            if (firstRev < 0) firstRev = i;
+        }
+    }
+    DWORD prot = 0;
+    char pbuf[96] = "";
+    if (rev) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(&g_cpyVt[kCpySlots[firstRev]], &mbi, sizeof(mbi)))
+            prot = (DWORD)mbi.Protect;
+        wsprintfA(pbuf, " prot=0x%lX", prot);
+    }
+    int n = patchCpySlots(rev ? "self-heal" : "noop");
+    char b[320];
+    wsprintfA(b, "CPYR hb reverted=%d%s repatched=%d total=%ld calls: DI=%ld D=%ld OM=%ld CSR=%ld CR=%ld US=%ld CRTV=%ld RS=%ld logged=%ld",
+              rev, pbuf, n, (long)g_cpyRepatch,
               (long)g_cpyCalls[0], (long)g_cpyCalls[1], (long)g_cpyCalls[2],
               (long)g_cpyCalls[3], (long)g_cpyCalls[4], (long)g_cpyCalls[5],
               (long)g_cpyCalls[6], (long)g_cpyCalls[7], (long)g_cpyLogged);
