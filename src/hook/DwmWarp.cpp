@@ -527,8 +527,18 @@ bool DwmWarpAttachTargets(const IWNWarpTarget* list, int n) {
     }
 
     if (g_ready) {
-        // Re-attach while running (periodic rescan): rebuild the RTV set only.
-        // Twin/SRV/shaders stay alive; the frozen stage-4 baseline is preserved.
+        // r105: idempotent. The probe rescans textures every 10s and calls this
+        // again mid-frame; the old code released every RTV/target the paint path
+        // was still holding and rebuilt them. The 00:48 run did that at 14.8s,
+        // 24.9s and 36.0s, and dwm died 2.0s after the third one
+        // (dwmcore+0x637FF, HandleAdvanceFrame+0x55F, 0xE0464645 - the same
+        // signature as r96 and r103). At a fixed resolution one attach is good
+        // for the life of the process, so a rescan is a no-op.
+        static volatile LONG s_reAttach = 0;
+        InterlockedIncrement(&s_reAttach);
+        return true;
+    }
+    if (0) {
         for (int i = 0; i < g_tgtN; i++) {
             if (g_rtvA[i]) { g_rtvA[i]->Release(); g_rtvA[i] = nullptr; }
             if (g_tgt[i])  { g_tgt[i]->Release();  g_tgt[i]  = nullptr; }
@@ -2530,17 +2540,57 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_CHAIN4)(void*, void*, void*, void*);
 static HMODULE     g_chainBase[2];
 static PFN_CHAIN4  g_forceFullRender = nullptr;
 static volatile LONG g_fullRender = 0;        // successful ForceFullRender calls
+static volatile LONG g_ffrBad = 0;            // refused: implausible rtm shape
 
+// r105: the argument matters, and r104 got it wrong.
+//   CComposition::ForceFullRender(this, BOOL forceDDA)
+//     mov rcx,[rcx+0x40]      ; rcx = CRenderTargetManager*
+//     test dl,dl
+//     je  0xD5C24             ; forceDDA == FALSE -> CRenderTargetManager::ForceFullRender
+//     jmp 0x1877A4            ; forceDDA == TRUE  -> CRenderTargetManager::ForceDDAFullRender
+// The FALSE path walks every render target and calls [vt+0xE0] unconditionally.
+// The TRUE path first tests [vt+0xF8] per target and SKIPS the redraw when that
+// gate says no. r104 passed 1, so on this machine nothing was ever repainted -
+// which is exactly what the operator saw: a click on the status bar still made
+// it snap back to straight (dwm repainted that dirty rect only), the pointer
+// trail smeared (dirty rect redrawn over our warp), and everything outside the
+// dirty region kept the previous frame's warp (the recursion).
 static void fullFrameRedraw(void* comp) {
-    if (!g_forceFullRender || !comp || IsBadReadPtr(comp, 8)) return;
+    if (!g_forceFullRender || !comp || IsBadReadPtr(comp, 0x48)) return;
     DWORD t = GetTickCount();
     static DWORD s_last = 0;                  // POD static - no TLS guard
     if (t == s_last) return;
     s_last = t;
+    void* rtm = nullptr;
+    __try { rtm = *(void**)((char*)comp + 0x40); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!rtm || IsBadReadPtr(rtm, 0x68)) return;
+    // Shape check before handing dwm a pointer it will dereference: the walk
+    // reads [rtm+0x18] as an array of [rtm+0x30] entries and bails when either
+    // count is 0. A garbage `this` would otherwise walk wild memory.
+    DWORD n60 = 0, n30 = 0;
+    __try {
+        n60 = *(DWORD*)((char*)rtm + 0x60);
+        n30 = *(DWORD*)((char*)rtm + 0x30);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (n30 == 0 || n30 > 32 || n60 == 0 || n60 > 4096) {
+        if (InterlockedIncrement(&g_ffrBad) == 1) {
+            char bb[160];
+            wsprintfA(bb, "dwm: FFR refused rtm=%p n60=%lu n30=%lu",
+                      rtm, (unsigned long)n60, (unsigned long)n30);
+            iwnHookLog(bb);
+        }
+        return;
+    }
     __try {
         ((HRESULT (STDMETHODCALLTYPE*)(void*, unsigned char, void*, void*))
-            g_forceFullRender)(comp, 1, nullptr, nullptr);
-        InterlockedIncrement(&g_fullRender);
+            g_forceFullRender)(comp, 0, nullptr, nullptr);
+        if (InterlockedIncrement(&g_fullRender) == 1) {
+            char bb[176];
+            wsprintfA(bb, "dwm: FFR live forceDDA=0 rtm=%p n60=%lu n30=%lu",
+                      rtm, (unsigned long)n60, (unsigned long)n30);
+            iwnHookLog(bb);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
 }
 // r93b: hooks go into BOTH dwmcore instances. r93's live run proved the m1
@@ -4674,11 +4724,12 @@ void DwmWarpBeforeSubmit() {
                           (long)g_dxCalls[9], (long)g_dxCalls[10]);
                 iwnHookLog(b6);
                 char b7[192];
-                wsprintfA(b7, "r104 clean ok=%ld bk=%ld draw=%ld "
-                          "cfpre=%ld cfpost=%ld fullredraw=%ld draws=%ld",
+                wsprintfA(b7, "r105 clean ok=%ld bk=%ld draw=%ld "
+                          "cfpre=%ld cfpost=%ld fullredraw=%ld ffrBad=%ld draws=%ld",
                           (long)g_cleanOk, (long)g_cleanBk,
                           (long)g_cleanDraw, (long)g_ntbCfPre,
-                          (long)g_ntbCfPost, (long)g_fullRender, (long)g_draws);
+                          (long)g_ntbCfPost, (long)g_fullRender,
+                          (long)g_ffrBad, (long)g_draws);
                 iwnHookLog(b7);
             }
             {
