@@ -995,11 +995,25 @@ static void paintWarp() {
             g_ctx->ClearRenderTargetView(g_warpRTV, blk);
         }
         // r92: submit-point mode - draw into the wire buffers directly
+        // r98: EVERY wire buffer gets warped, not only the one we managed to
+        // build an RTV for. That `continue` is precisely why the console status
+        // bar stayed rectangular on the 20:10 run: it repaints into a buffer we
+        // never touched, and that buffer is the one that reached the panel.
+        // RTV-less buffers now render through our own RT and are copied in -
+        // the CopyResource path r94c proved reaches scanout (the magenta flash).
         if (g_wrtvN > 0) {
             for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
-                if (!g_wrtv[i].rtv) continue;
-                g_ctx->OMSetRenderTargets(1, &g_wrtv[i].rtv, nullptr);
-                g_ctx->Draw(g_vertCount, 0);
+                if (g_wrtv[i].rtv) {
+                    g_ctx->OMSetRenderTargets(1, &g_wrtv[i].rtv, nullptr);
+                    g_ctx->Draw(g_vertCount, 0);
+                } else if (g_wrtv[i].tex && g_warpRTV && g_warpRT) {
+                    g_ctx->OMSetRenderTargets(1, &g_warpRTV, nullptr);
+                    g_ctx->Draw(g_vertCount, 0);
+                    __try { g_ctx->CopyResource(g_wrtv[i].tex, g_warpRT); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+                } else {
+                    continue;
+                }
                 InterlockedIncrement(&g_draws);
             }
         } else {
@@ -1420,9 +1434,13 @@ static void iwnForensicsAfter(void* self) {
 // realization (re)created during the run is inspected, and any screen-size
 // texture hiding inside it is cached and joins the phase-B flash.
 #define IWN_PHASE_A_END 15000
+// r98: the flash window is closed. r97 settled it - buf0 magenta reached the
+// panel, green/blue never did, and the warp itself was seen on the screen with
+// the naked eye. No more colour probes: warp starts the moment the present
+// stage begins (el >= 15000) and every frame after that is a warp frame.
 #define IWN_FLASH_T0    15000
-#define IWN_FLASH_MID   21000
-#define IWN_FLASH_T1    27000
+#define IWN_FLASH_MID   15000
+#define IWN_FLASH_T1    15000
 
 static DWORD iwnEl() { return GetTickCount() - g_t0; }
 
@@ -1837,7 +1855,7 @@ static ID3D11RenderTargetView* g_flashStageRtv = nullptr;
 // If the panel flickers magenta but never green/blue, buf0 is the scanned one.
 // A painted buffer is never restored: dwm does not repaint what it thinks is
 // unchanged, so the desktop is cleaned by restarting dwm after the run.
-#define IWN_MARK_ONLY   1
+#define IWN_MARK_ONLY   0        // r98: channel is proven, warp owns the wire buffers
 #define IWN_MARK_S0     60000
 #define IWN_MARK_S1     70000
 #define IWN_MARK_S2     80000
@@ -1925,14 +1943,60 @@ static BOOL wirePaintCore(void) {
                 readbackTex(g_wrtv[0].tex, "SUBMIT-FLASH");
             }
         } else if (el >= IWN_FLASH_T1) {
-            __try { g_ctx->CopyResource(g_twin, g_wrtv[0].tex); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { }
-            int before = (int)g_draws;
-            paintWarp();
-            painted = ((int)g_draws != before);
-            static volatile LONG s_wp = 0;
-            if (painted && InterlockedCompareExchange(&s_wp, 1, 0) == 0)
-                iwnHookLog("SUBMIT: warp painted (post-compose, pre-submit)");
+            // r98: recursion fix. Until this round g_twin was refilled from the
+            // wire buffer every frame - and that buffer already held our own
+            // warped output, so the picture fed on itself (the nested frames the
+            // operator saw on the 20:10 run). The source is now the composition
+            // render target: dwm draws it, we never write it. If it turns out to
+            // BE one of the wire buffers, fall back once to a locked snapshot -
+            // a static desktop, but never a feedback loop.
+            static volatile LONG s_srcMode = -1;   // -1 undecided, 0 live comp, 1 locked
+            static volatile LONG s_srcFail = 0;
+            BOOL srcOk = FALSE;
+            if ((LONG)s_srcMode < 0) {
+                ID3D11Texture2D* src = g_target;
+                BOOL isWire = FALSE;
+                if (src)
+                    for (int i = 0; i < g_wrtvN; i++)
+                        if (g_wrtv[i].tex == src) { isWire = TRUE; break; }
+                if (src && !isWire) {
+                    __try { g_ctx->CopyResource(g_twin, src); srcOk = TRUE; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { }
+                    if (srcOk) {
+                        InterlockedExchange(&s_srcMode, 0);
+                        iwnHookLog("SUBMIT: warp source = live composition (recursion off)");
+                    }
+                }
+                if (!srcOk) {
+                    __try { g_ctx->CopyResource(g_twin, g_wrtv[0].tex); srcOk = TRUE; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { }
+                    if (srcOk) {
+                        InterlockedExchange(&s_srcMode, 1);
+                        iwnHookLog("SUBMIT: warp source = locked snapshot (comp == wire buffer)");
+                    }
+                }
+            } else if ((LONG)s_srcMode == 0 && g_target) {
+                __try { g_ctx->CopyResource(g_twin, g_target); srcOk = TRUE; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { }
+                if (!srcOk) {
+                    if (InterlockedIncrement(&s_srcFail) > 120) {
+                        InterlockedExchange(&s_srcMode, 1);
+                        iwnHookLog("SUBMIT: warp source -> locked snapshot (comp reads failing)");
+                    }
+                } else {
+                    InterlockedExchange(&s_srcFail, 0);
+                }
+            } else {
+                srcOk = TRUE;                       // locked: g_twin stays as is
+            }
+            if (srcOk && g_srv) {
+                int before = (int)g_draws;
+                paintWarp();
+                painted = ((int)g_draws != before);
+                static volatile LONG s_wp = 0;
+                if (painted && InterlockedCompareExchange(&s_wp, 1, 0) == 0)
+                    iwnHookLog("SUBMIT: warp painted (post-compose, pre-submit)");
+            }
         }
 #endif
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2519,7 +2583,7 @@ static void installNtbHooks() {
 // entry points were never actually measured. This round counts all of them.
 typedef LONG_PTR (*PFN_DXGI10)(void*, void*, void*, void*, void*, void*,
                                void*, void*, void*, void*);
-#define IWN_DXGI_N 5
+#define IWN_DXGI_N 11
 static volatile LONG g_dxCalls[IWN_DXGI_N];
 static volatile LONG g_dxLive = 0, g_dxPaints = 0, g_dxTick = 0,
                      g_dxNoLayout = 0, g_dxProbe = 0;
@@ -2643,6 +2707,16 @@ IWN_DX_WRAP(1, 0)   // CDXGISwapChain::PresentDWM           - count
 IWN_DX_WRAP(2, 0)   // CDXGISwapChain::FlipPresentToDWM     - count only (r96)
 IWN_DX_WRAP(3, 0)   // CDXGISwapChain::Present               - count
 IWN_DX_WRAP(4, 0)   // CDXGISwapChain::PresentImpl           - count
+// r98: route 2 is NOT written off on five samples. dxgi's pdb carries 154
+// present/flip symbols; Present@0x2A300 turned out to be a thunk into 0x4660
+// (already covered), but these six are genuine, untested entries. Count only -
+// no painting, so the probe costs nothing and cannot interfere with the warp.
+IWN_DX_WRAP(5, 0)   // CDXGISwapChain::PresentImplCore       - count
+IWN_DX_WRAP(6, 0)   // CDXGISwapChain::PresentFullscreenFlip - count
+IWN_DX_WRAP(7, 0)   // CDXGISwapChain::ComposePartialPresentation - count
+IWN_DX_WRAP(8, 0)   // CDXGISwapChain::FlipPresentHandleTransform - count
+IWN_DX_WRAP(9, 0)   // CFlipPresentToDWM::FlipPresentCore    - count
+IWN_DX_WRAP(10, 0)  // CDXGISwapChain::UseProxyFlipCore      - count
 
 static void installDxgiHooks() {
     if ((g_dxLive & ((1 << IWN_DXGI_N) - 1)) == ((1 << IWN_DXGI_N) - 1)) return;
@@ -2677,15 +2751,48 @@ static void installDxgiHooks() {
                                  0x41, 0x54, 0x41, 0x55,              // push r12,r13
                                  0x41, 0x56, 0x41, 0x57,              // push r14,r15
                                  0x48, 0x83, 0xEC, 0x70 };            // sub rsp,70h
-    static const ULONG rvas[IWN_DXGI_N] = { 0x1AE30, 0x9CA0, 0x47C0, 0x4660, 0x9EB0 };
-    static const BYTE* exps[IWN_DXGI_N] = { e0, e1, e2, e3, e4 };
-    static const int disps[IWN_DXGI_N] = { 13, 16, 13, 14, 16 };
+    static const ULONG rvas[IWN_DXGI_N] = { 0x1AE30, 0x9CA0, 0x47C0, 0x4660, 0x9EB0,
+                                            0xA270, 0x1FE5C, 0xB790, 0x5420, 0x5110,
+                                            0x15890 };
+    // r98 additions - bytes read from the PE, one instruction boundary each.
+    static const BYTE e5[12] = { 0x40, 0x55,                          // push rbp
+                                 0x53, 0x56, 0x57,                     // push rbx,rsi,rdi
+                                 0x41, 0x54, 0x41, 0x55,               // push r12,r13
+                                 0x41, 0x56, 0x41, 0x57 };             // push r14,r15
+    static const BYTE e6[16] = { 0x48, 0x8B, 0xC4,                    // mov rax,rsp
+                                 0x57,                                // push rdi
+                                 0x41, 0x54, 0x41, 0x55,              // push r12,r13
+                                 0x41, 0x56, 0x41, 0x57,              // push r14,r15
+                                 0x48, 0x83, 0xEC, 0x70 };            // sub rsp,70h
+    static const BYTE e7[19] = { 0x40, 0x53,                          // push rbx
+                                 0x56, 0x57,                          // push rsi,rdi
+                                 0x41, 0x54, 0x41, 0x55,              // push r12,r13
+                                 0x41, 0x56, 0x41, 0x57,              // push r14,r15
+                                 0x48, 0x81, 0xEC, 0xA0, 0x00, 0x00, 0x00 };  // sub rsp,0A0h
+    static const BYTE e8[11] = { 0x48, 0x83, 0xEC, 0x28,              // sub rsp,28h
+                                 0xF6, 0x81, 0x80, 0x01, 0x00, 0x00, 0x04 };  // test byte [rcx+180h],4
+    static const BYTE e9[12] = { 0x48, 0x8B, 0xC4,                    // mov rax,rsp
+                                 0x57,                                // push rdi
+                                 0x41, 0x54, 0x41, 0x55,              // push r12,r13
+                                 0x41, 0x56, 0x41, 0x57 };            // push r14,r15
+    static const BYTE e10[6] = { 0x40, 0x53,                          // push rbx
+                                 0x48, 0x83, 0xEC, 0x20 };            // sub rsp,20h
+    static const BYTE* exps[IWN_DXGI_N] = { e0, e1, e2, e3, e4,
+                                            e5, e6, e7, e8, e9, e10 };
+    static const int disps[IWN_DXGI_N] = { 13, 16, 13, 14, 16, 12, 16, 19, 11, 12, 6 };
     static const char* names[IWN_DXGI_N] = { "LegacyPresentDWM", "SwapChainPresentDWM",
                                              "FlipPresentToDWM", "SwapChainPresent",
-                                             "PresentImpl" };
+                                             "PresentImpl", "PresentImplCore",
+                                             "PresentFullscreenFlip",
+                                             "ComposePartialPresentation",
+                                             "FlipPresentHandleTransform",
+                                             "FlipPresentCore", "UseProxyFlipCore" };
     void* wraps[IWN_DXGI_N] = { (void*)&IWN_DxWrap0, (void*)&IWN_DxWrap1,
                                 (void*)&IWN_DxWrap2, (void*)&IWN_DxWrap3,
-                                (void*)&IWN_DxWrap4 };
+                                (void*)&IWN_DxWrap4, (void*)&IWN_DxWrap5,
+                                (void*)&IWN_DxWrap6, (void*)&IWN_DxWrap7,
+                                (void*)&IWN_DxWrap8, (void*)&IWN_DxWrap9,
+                                (void*)&IWN_DxWrap10 };
     for (int i = 0; i < IWN_DXGI_N; i++) {
         if (g_dxLive & (1 << i)) continue;
         BYTE* fn = (BYTE*)dx + rvas[i];
@@ -3929,13 +4036,19 @@ static void installSCPresentHook() {
 void DwmWarpBeforeSubmit() {
     if (!g_ready) return;
     DWORD el = GetTickCount() - g_t0;
-    if (el > 150000) {
+    // r98 safety rails. The 20:19 run ended in bugcheck 0x133
+    // (DPC_WATCHDOG_VIOLATION) on this NVS 4200M roughly seven minutes after
+    // the probe window closed - a 2011-era driver under sustained warp load.
+    // The budget is now 45s of warp, and a runaway failure count cuts it early.
+    if (el > 45000 || (LONG)g_fail > 400) {
+        BOOL failStop = ((LONG)g_fail > 400);
         g_ready = 0;
         g_stage = -1;
         // Hand the desktop back: dwm only redraws dirty regions, so the last
         // warped frame would otherwise sit on screen until a manual refresh.
-        restoreBaseline("150s budget spent");
-        iwnHookLog("dwm: WARP auto-off (150s budget spent)");
+        restoreBaseline("r98 budget spent");
+        iwnHookLog(failStop ? "dwm: WARP auto-off (failure budget - paint throws)"
+                            : "dwm: WARP auto-off (45s budget spent)");
         return;
     }
     LONG ph;
@@ -4075,6 +4188,13 @@ void DwmWarpBeforeSubmit() {
                           (long)g_dxCalls[4], (long)g_dxPaints,
                           (long)g_dxNoLayout, (long)g_dxProbe);
                 iwnHookLog(b5);
+                char b6[176];
+                wsprintfA(b6, "DXGI2 implCore=%ld fullscr=%ld compose=%ld "
+                          "handle=%ld flipCore=%ld proxy=%ld",
+                          (long)g_dxCalls[5], (long)g_dxCalls[6],
+                          (long)g_dxCalls[7], (long)g_dxCalls[8],
+                          (long)g_dxCalls[9], (long)g_dxCalls[10]);
+                iwnHookLog(b6);
             }
             {
                 char b2[128];
