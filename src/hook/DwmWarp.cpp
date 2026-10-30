@@ -1174,6 +1174,26 @@ static void iwnBlitToScanout(void* self) {
     }
 }
 
+// round 84 forensics: separate "blit never landed" from "landed but present
+// overwrote / never scanned out". Three samples per side, first 3 frames only.
+static void iwnForensicsBefore(void* self) {
+    static int s_n = 0;                      // POD static - no TLS guard
+    if (s_n >= 3) return;
+    s_n++;
+    readbackTex(g_target, "F-SRC");          // what we blit FROM
+    ID3D11Texture2D* bb = iwnWireBuffer(self, 0);
+    if (bb) { readbackTex(bb, "F-DST"); bb->Release(); }
+}
+
+static void iwnForensicsAfter(void* self) {
+    static int s_n = 0;                      // POD static - no TLS guard
+    if (s_n >= 3) return;
+    s_n++;
+    ID3D11Texture2D* bb = iwnWireBuffer(self, 0);
+    if (bb) { readbackTex(bb, "F-POST"); bb->Release(); }
+    readbackTex(g_target, "F-SRC2");         // is the source re-rendered too?
+}
+
 static void readbackPixel(int i, const char* tag) {
     if (i < 0 || i >= g_tgtN || !g_tgt[i]) return;
     readbackTex(g_tgt[i], tag);
@@ -1866,7 +1886,9 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
             }
         }
     }
+    if (painted) iwnForensicsBefore(self);
     HRESULT hr = g_presentTramp(self, a2, a3, a4, a5);
+    if (painted) iwnForensicsAfter(self);
     // Immediate post-present restore is INVISIBLE (07:42/08:01 runs: the flip
     // has not scanned out when Present returns). Defer to the next
     // ConfirmFrame, the proven policy: dwm draws window content AFTER CF, so
