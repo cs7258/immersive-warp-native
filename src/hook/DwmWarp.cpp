@@ -2002,62 +2002,11 @@ static BOOL wirePaintCore(void) {
                 iwnHookLog("MARK97: first paint (staging + CopyResource only)");
         }
 #else
-        int solid = 0;
-        if (sincePaint >= 3000 && sincePaint < 5000)       solid = 1;   // magenta
-        else if (sincePaint >= 5000 && sincePaint < 7000)  solid = 2;   // green
-        else if (sincePaint >= 7000 && sincePaint < 9000)  solid = 3;   // blue
-        if (solid) {
-            float col[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-            if (solid == 1) { col[0] = 1.0f; col[2] = 1.0f; }
-            else if (solid == 2) { col[1] = 1.0f; }
-            else { col[2] = 1.0f; }
-            painted = solidFillAll(col);
-            static volatile LONG s_last = 0;
-            if (InterlockedExchange(&s_last, (LONG)solid) != (LONG)solid) {
-                char b[128];
-                wsprintfA(b, "PROBE: solid %ld (%s) filled=%ld bufs=%ld",
-                          (long)solid,
-                          solid == 1 ? "magenta" : (solid == 2 ? "green" : "blue"),
-                          (long)painted, (long)g_wrtvN);
-                iwnHookLog(b);
-            }
-        } else if (sincePaint >= 13000 && sincePaint < 16000) {
-            // 14-17s: mirror test - copy the composite render target straight into
-            // the wire buffers, NO warp. If the panel keeps showing the desktop,
-            // that RT really is the final composed image (the operator's doubt
-            // answered in one direction); if the panel goes black or garbage, it
-            // is not the scanout content and every warp built on it is built on
-            // the wrong surface.
-            int done = 0;
-            for (int i = 0; i < g_wrtvN && i < IWN_WBUF_MAX; i++) {
-                if (!g_wrtv[i].tex || !g_target) continue;
-                __try { g_ctx->CopyResource(g_wrtv[i].tex, g_target); done++; }
-                __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
-            }
-            painted = (done > 0);
-            static volatile LONG s_mir = 0;
-            if (InterlockedCompareExchange(&s_mir, 1, 0) == 0) {
-                char b[128];
-                wsprintfA(b, "PROBE: mirror composite->wire done=%d bufs=%ld",
-                          done, (long)g_wrtvN);
-                iwnHookLog(b);
-                if (g_wrtvN) readbackTex(g_wrtv[0].tex, "MIRROR");
-            }
-        } else if (sincePaint >= 9000) {
-            // 9-13s: same mesh/shader/copy-back, but the texture it samples is a
-            // solid 4x4 red instead of the desktop - isolates the pipeline from
-            // the source. If the panel stays untouched here, the paint point (not
-            // the source) is what is broken.
-            InterlockedExchange(&g_forceSolid,
-                                (sincePaint < 13000) ? 1 : 0);
-            {
-                static volatile LONG s_wm = 0;
-                LONG want = (sincePaint < 13000) ? 1 : 2;
-                if (InterlockedExchange(&s_wm, want) != want) {
-                    if (want == 1) iwnHookLog("PROBE: warp mesh with SOLID red source");
-                    else           iwnHookLog("PROBE: warp mesh with REAL desktop source");
-                }
-            }
+        // r101: the colour / mirror / red-source probes are gone. They answered
+        // their question (the wire buffer IS scanned out) and only muddied the
+        // one thing that still has to be judged by eye: does a full-frame warp
+        // survive when it is written after the frame's own draw commands.
+        if (sincePaint >= 2000) {
             // r98: recursion fix. Until this round g_twin was refilled from the
             // wire buffer every frame - and that buffer already held our own
             // warped output, so the picture fed on itself (the nested frames the
@@ -2112,7 +2061,7 @@ static BOOL wirePaintCore(void) {
                 painted = ((int)g_draws != before);
                 static volatile LONG s_wp = 0;
                 if (painted && InterlockedCompareExchange(&s_wp, 1, 0) == 0)
-                    iwnHookLog("SUBMIT: warp painted (post-compose, pre-submit)");
+                    iwnHookLog("SUBMIT: warp painted (after the batch, before confirm)");
             }
         }
 #endif
@@ -2570,8 +2519,17 @@ static void installChainHooks() {
 typedef LONG (WINAPI* PFN_NTB4)(void*, void*, void*, void*);
 static volatile LONG g_ntbBegin = 0, g_ntbSubmit = 0, g_ntbUpdates = 0,
                      g_ntbPaints = 0;
-static PFN_NTB4  g_ntbTramps[3];
-static void**    g_ntbSlots[3];
+// r101: the confirm-frame anchor. r100's run showed the warp only sticking in
+// areas dwm does not repaint (static desktop) while the console status bar -
+// repainted every frame - stayed a clean rectangle. That is the signature of a
+// paint that happens BEFORE the frame's own draw commands: dwm's dirty-rect
+// commands land on top of our pixels for exactly the regions that changed.
+// NtDCompositionConfirmFrame is the only point that runs after the batch was
+// submitted and before the kernel latches the surface, so the paint moves there.
+static volatile LONG g_ntbConfirm = 0, g_ntbCfPre = 0, g_ntbCfPost = 0,
+                     g_ntbSubPost = 0;
+static PFN_NTB4  g_ntbTramps[4];
+static void**    g_ntbSlots[4];
 // r94b: the CDWMSwapChain as seen by the present wrapper (cached on every
 // wrapper entry, benign race). The NTB submit wrapper needs it to build the
 // wire RTV cache - the submit/mpo paths that used to build it never fire.
@@ -2581,40 +2539,65 @@ static LONG WINAPI IWN_NtbBeginWrap(void* a, void* b, void* c, void* d) {
     InterlockedIncrement(&g_ntbBegin);
     return g_ntbTramps[0](a, b, c, d);
 }
+// build the wire RTV cache once, from the swapchain the present wrapper saw
+static void ntbWireCache(void) {
+    void* sc = (void*)g_wireSelf;
+    if (g_wrtvN != 0 || !sc || IsBadReadPtr((char*)sc + 0xa0, 4)) return;
+    UINT cnt = 3;
+    UINT c = *(UINT*)((char*)sc + 0xa0);
+    if (c > 0 && c <= 4) cnt = c;
+    ID3D11Texture2D* bufs[IWN_WBUF_MAX] = { 0 };
+    int n = 0;
+    for (UINT i = 0; i < cnt && n < IWN_WBUF_MAX; i++) {
+        ID3D11Texture2D* tx = iwnWireBuffer(sc, i);   // AddRef'd
+        if (tx) bufs[n++] = tx;
+    }
+    wireCacheRefresh(bufs, n);
+    for (int i = 0; i < n; i++) { if (bufs[i]) bufs[i]->Release(); }
+}
+
+// r101: paint AFTER the batch was handed to the kernel. Painting before it
+// (r92..r100) meant dwm's own dirty-rect commands were executed on top of our
+// pixels: static regions kept the warp, every repainted region (the console
+// status bar) came back clean. That is exactly what the operator reported.
 static LONG WINAPI IWN_NtbSubmitWrap(void* a, void* b, void* c, void* d) {
     InterlockedIncrement(&g_ntbSubmit);
-    BOOL painted = FALSE;
-    // r94b: no stage gate - the phase machine returns to CF_DEF right after
-    // PRESNT entry, which blocked every paint in r94. wirePaintCore itself
-    // no-ops outside the flash/warp time windows.
-    if (g_ready && !g_quiet) {
-        DWORD t = GetTickCount();
-        if (t != g_lastPaintTick) {
-            g_lastPaintTick = t;
-            InterlockedIncrement(&g_frames);
-            __try {
-                // build the wire RTV cache once, from the wrapper's swapchain
-                void* sc = (void*)g_wireSelf;
-                if (g_wrtvN == 0 && sc && !IsBadReadPtr((char*)sc + 0xa0, 4)) {
-                    UINT cnt = 3;
-                    UINT c = *(UINT*)((char*)sc + 0xa0);
-                    if (c > 0 && c <= 4) cnt = c;
-                    ID3D11Texture2D* bufs[IWN_WBUF_MAX] = { 0 };
-                    int n = 0;
-                    for (UINT i = 0; i < cnt && n < IWN_WBUF_MAX; i++) {
-                        ID3D11Texture2D* tx = iwnWireBuffer(sc, i);   // AddRef'd
-                        if (tx) bufs[n++] = tx;
-                    }
-                    wireCacheRefresh(bufs, n);
-                    for (int i = 0; i < n; i++) { if (bufs[i]) bufs[i]->Release(); }
-                }
-                painted = wirePaintCore();
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
-        }
-    }
     LONG hr = g_ntbTramps[1](a, b, c, d);
-    if (painted) InterlockedIncrement(&g_ntbPaints);
+    BOOL painted = FALSE;
+    if (g_ready && !g_quiet) {
+        InterlockedIncrement(&g_frames);
+        __try {
+            ntbWireCache();
+            painted = wirePaintCore();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+    }
+    if (painted) {
+        InterlockedIncrement(&g_ntbPaints);
+        InterlockedIncrement(&g_ntbSubPost);
+    }
+    return hr;
+}
+// r101: the confirm anchor. Pre-call = the last instant before the kernel
+// latches this frame's surface; post-call = belt and braces (a second copy
+// costs one blit and cannot be overwritten by the frame it just closed).
+static LONG WINAPI IWN_NtbConfirmWrap(void* a, void* b, void* c, void* d) {
+    InterlockedIncrement(&g_ntbConfirm);
+    BOOL pre = FALSE, post = FALSE;
+    if (g_ready && !g_quiet) {
+        __try {
+            ntbWireCache();
+            pre = wirePaintCore();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+    }
+    LONG hr = g_ntbTramps[3](a, b, c, d);
+    if (g_ready && !g_quiet) {
+        __try { post = wirePaintCore(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+    }
+    if (pre)  InterlockedIncrement(&g_ntbCfPre);
+    if (post) InterlockedIncrement(&g_ntbCfPost);
     return hr;
 }
 static LONG WINAPI IWN_NtbUpdWrap(void* a, void* b, void* c, void* d) {
@@ -2675,13 +2658,14 @@ static void installNtbHooks() {
     if (g_ntbSlots[0]) return;                       // already live
     HMODULE core = GetModuleHandleW(L"dwmcore.dll");
     if (!core) return;
-    static const char* names[3] = { "NtDCompositionBeginFrame",
+    static const char* names[4] = { "NtDCompositionBeginFrame",
                                     "NtDCompositionSubmitDWMBatch",
-                                    "NtDCompositionGetFrameSurfaceUpdates" };
-    static PFN_NTB4 wraps[3] = { &IWN_NtbBeginWrap, &IWN_NtbSubmitWrap,
-                                 &IWN_NtbUpdWrap };
+                                    "NtDCompositionGetFrameSurfaceUpdates",
+                                    "NtDCompositionConfirmFrame" };
+    static PFN_NTB4 wraps[4] = { &IWN_NtbBeginWrap, &IWN_NtbSubmitWrap,
+                                 &IWN_NtbUpdWrap, &IWN_NtbConfirmWrap };
     char b[128];
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         if (g_ntbSlots[i]) continue;
         void** slot = iwnFindIat(core, "win32u.dll", names[i]);
         if (!slot) {
@@ -4359,14 +4343,17 @@ void DwmWarpBeforeSubmit() {
                 iwnHookLog(b3);
             }
             {
-                char b4[160];
+                char b4[208];
                 wsprintfA(b4, "NTB begin=%ld submit=%ld updates=%ld "
-                          "ntbpaints=%ld mark=%ld seg=%ld live=%d%d%d",
+                          "ntbpaints=%ld mark=%ld seg=%ld live=%d%d%d "
+                          "confirm=%ld cfpre=%ld cfpost=%ld subpost=%ld",
                           (long)g_ntbBegin, (long)g_ntbSubmit,
                           (long)g_ntbUpdates, (long)g_ntbPaints,
                           (long)g_markPaints, (long)g_markSegLog,
                           g_ntbSlots[0] ? 1 : 0, g_ntbSlots[1] ? 1 : 0,
-                          g_ntbSlots[2] ? 1 : 0);
+                          g_ntbSlots[2] ? 1 : 0,
+                          (long)g_ntbConfirm, (long)g_ntbCfPre,
+                          (long)g_ntbCfPost, (long)g_ntbSubPost);
                 iwnHookLog(b4);
             }
         }
