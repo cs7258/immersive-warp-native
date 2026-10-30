@@ -1170,6 +1170,92 @@ static void iwnIdentifySubmit(void* self) {
     }
 }
 
+// r86: the bind info handed to the DComposition core. Layout comes straight
+// from CGlobalCompositionSurfaceInfo::CBindInfo::UnpinResources (0xEFEF8):
+//   +0xB4  hasResources flag
+//   +0xD0  resource array A          +0xD8  resource array B
+//   +0xE0  count
+// Those resources are what the kernel compositor composites/scans out - the
+// user-mode swapchain buffers are only staging.
+static volatile LONG g_bindBlits = 0;
+static volatile LONG g_bindFails = 0;
+
+static void iwnBlitToBindInfo(void* self) {
+    if (!self || !g_target || !g_ctx) return;
+    char* A = nullptr; char* B = nullptr; char* C = nullptr;
+    __try {
+        A = *(char**)((char*)self + 0x10);
+        if (!A || IsBadReadPtr(A + 0x50, 8)) return;
+        B = *(char**)(A + 0x50);
+        if (!B || IsBadReadPtr(B + 0xf0, 8)) return;
+        C = *(char**)(B + 0xf0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!C || IsBadReadPtr(C + 0xE0, 4)) return;
+
+    UINT n = 0; void** arr = nullptr; void** arr2 = nullptr;
+    __try {
+        n = *(UINT*)(C + 0xE0);
+        if (!IsBadReadPtr(C + 0xD0, 8)) arr = *(void***)(C + 0xD0);
+        if (!IsBadReadPtr(C + 0xD8, 8)) arr2 = *(void***)(C + 0xD8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (n == 0 || n > 8) return;
+
+    D3D11_TEXTURE2D_DESC td = {};
+    __try { g_target->GetDesc(&td); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+
+    static volatile LONG s_dumped = 0;         // POD static - no TLS guard
+    BOOL dump = (InterlockedCompareExchange(&s_dumped, 1, 0) == 0);
+    UINT done = 0;
+    for (int which = 0; which < 2; which++) {
+        void** list = which ? arr2 : arr;
+        if (!list || IsBadReadPtr(list, (size_t)n * 8)) continue;
+        for (UINT i = 0; i < n; i++) {
+            void* r = nullptr;
+            __try { r = list[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            if (!r || IsBadReadPtr(r, 8)) continue;
+            ID3D11Texture2D* tex = nullptr;
+            __try {
+                if (SUCCEEDED(((IUnknown*)r)->QueryInterface(kIIDTex2D, (void**)&tex)) && tex) {
+                    D3D11_TEXTURE2D_DESC d = {};
+                    tex->GetDesc(&d);
+                    if (dump) {
+                        char b[192];
+                        wsprintfA(b, "BIND arr%d[%u]=%p %lux%lu bind=0x%X misc=0x%X fmt=%u",
+                                  which, i, tex, (unsigned long)d.Width,
+                                  (unsigned long)d.Height, (unsigned)d.BindFlags,
+                                  (unsigned)d.MiscFlags, (unsigned)d.Format);
+                        iwnHookLog(b);
+                    }
+                    if (d.Width == td.Width && d.Height == td.Height &&
+                        d.Format == td.Format && d.SampleDesc.Count == td.SampleDesc.Count) {
+                        ID3D11Device* dv = nullptr;
+                        tex->GetDevice(&dv);
+                        if (dv && dv == g_dev) {
+                            g_ctx->CopyResource(tex, g_target);
+                            done++;
+                        }
+                        if (dv) dv->Release();
+                    }
+                    tex->Release();
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        }
+    }
+    if (done) InterlockedIncrement(&g_bindBlits);
+    else      InterlockedIncrement(&g_bindFails);
+    {
+        static DWORD s_last = 0;
+        DWORD t = GetTickCount();
+        if (t - s_last > 5000) {
+            s_last = t;
+            char b[160];
+            wsprintfA(b, "BINDBLIT n=%u done=%u ok=%ld fail=%ld draws=%ld",
+                      n, done, (long)g_bindBlits, (long)g_bindFails, (long)g_draws);
+            iwnHookLog(b);
+        }
+    }
+}
+
 static void iwnBlitToScanout(void* self) {
     if (!self || !g_target || !g_ctx) return;
     UINT n = 3;
@@ -1926,6 +2012,9 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentWrap(void* self, void* a2, void* a3,
                 // round 82: hand the warped frame to the buffer dwm is about to
                 // submit - resolved with dwm's OWN accessor + logical index.
                 iwnBlitToScanout(self);
+                // round 86: and to the bind-info resources the kernel
+                // compositor actually consumes.
+                iwnBlitToBindInfo(self);
             }
         }
     }
