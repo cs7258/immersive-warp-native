@@ -38,6 +38,29 @@
 
 extern void iwnHookLog(const char* line);
 
+// ---- r106: instantaneous warp (the "桌面扭曲技术全解" recipe) ----------------
+// Every earlier round painted into dwm's PERSISTENT composition canvas and
+// fought the resulting recursive self-warp with mirrors and forced full
+// redraws (r105 ended in bugcheck 0x133). The working architecture from the
+// merged article (same machine class: 18362, NVS 4200M, 1366x768) is:
+//
+//   MPO off          double registry key OverlayTestMode=5 + dwm restart
+//   compwin          a layered alpha=1 topmost window, managed by an
+//                    independent worker thread, forces PresentDWM 40-60/s
+//   v10c             inside CDXGISwapChainDWMLegacy::PresentDWM:
+//     1 CopyResource(clean, backbuffer)   absorb dwm's frame (canvas stays clean)
+//     2 warp-draw clean -> backbuffer
+//     3 original PresentDWM               the panel scans the warped frame
+//     4 CopyResource(backbuffer, clean)   restore BEFORE anything else reads
+//
+// The warp lives only for the duration of ONE present call - the pollution is
+// wiped between frames, so the recursive path physically does not exist and
+// NO forced full redraw is ever needed. Per frame cost: 2 full-screen copies
+// + 1 full-screen draw = exactly the 3-op budget that r99-r102 ran stably.
+// All legacy paint paths (FFR, CF paint, submit paint, dxgi detour paint) are
+// dead under this switch; their hooks stay only as counters.
+#define IWN_V10C 1
+
 // ---------------------------------------------------------------- tiny float fmt
 // wsprintfA has no %f support, and linking the CRT float formatter into a
 // manual-mapped DLL is not worth it for log lines.
@@ -1811,6 +1834,7 @@ static BOOL wirePaintCore(void);                        // r92c: shared paint co
 static void wireCacheRefresh(ID3D11Texture2D** bufs, int n);
 
 static BOOL submitPaint(void* wireSC) {
+    if (IWN_V10C) return FALSE;   // r106: the only paint point is PresentDWM
     if (!g_ctx || !g_dev || !g_target || !g_twin) return FALSE;
     ID3D11Texture2D* bufs[IWN_WBUF_MAX] = { 0 };
     int n = 0;
@@ -2608,8 +2632,9 @@ static void*      g_chainTrampMems[2][4];
 static HRESULT STDMETHODCALLTYPE NAME(void* a, void* b, void* c, void* d) {    \
     InterlockedIncrement(&g_chainCalls[INST][IDX]);                            \
     BOOL painted = FALSE;                                                      \
-    if (IDX == 0 && g_ready && !g_quiet) fullFrameRedraw(a);                   \
-    if (IDX == 3 && g_ready && !g_quiet && (LONG)g_stage == IWN_PH_PRESNT) {   \
+    if (IDX == 0 && !IWN_V10C && g_ready && !g_quiet) fullFrameRedraw(a);      \
+    if (IDX == 3 && !IWN_V10C && g_ready && !g_quiet &&                        \
+        (LONG)g_stage == IWN_PH_PRESNT) {                                      \
         DWORD t = GetTickCount();                                              \
         if (t != g_lastPaintTick) {                                            \
             g_lastPaintTick = t;                                               \
@@ -3211,8 +3236,9 @@ static LONG_PTR IWN_DxWrap##IDX(void* a, void* b, void* c, void* d, void* e,    
     if (painted) InterlockedIncrement(&g_dxPaints);                            \
     return r;                                                                  \
 }
-IWN_DX_WRAP(0, 1)   // CDXGISwapChainDWMLegacy::PresentDWM  - r102: THE paint
-                    // point (getbuffer -> warp -> copy back -> org present)
+IWN_DX_WRAP(0, 0)   // CDXGISwapChainDWMLegacy::PresentDWM  - r106: COUNT ONLY.
+                    // The vtable-slot hook (IWN_PresentDWMWrap) owns the paint;
+                    // painting here too would warp the same frame twice.
 IWN_DX_WRAP(1, 0)   // CDXGISwapChain::PresentDWM           - count
 IWN_DX_WRAP(2, 0)   // CDXGISwapChain::FlipPresentToDWM     - count only (r96)
 IWN_DX_WRAP(3, 0)   // CDXGISwapChain::Present               - count
@@ -4272,6 +4298,22 @@ struct IWN_ScInfo {                    // all POD - no dynamic static init
     ID3D11Texture2D*      tex[IWN_SC_MAX];
     ID3D11Texture2D*      stage;       // CPU_READ readback target
     ID3D11Texture2D*      marker;      // 8x8 marker source on the SC device
+    // r106: v10c instantaneous-warp resources, built on the SC device. The
+    // article (11.4) forbids assuming the present swapchain shares the
+    // fingerprint device - never paint across devices.
+    ID3D11RenderTargetView*   rtv[IWN_SC_MAX];   // one RTV per swapchain buffer
+    ID3D11Texture2D*          clean;             // clean canvas (absorb source)
+    ID3D11ShaderResourceView* cleanSrv;
+    ID3D11VertexShader*       vs;
+    ID3D11PixelShader*        ps;
+    ID3D11InputLayout*        il;
+    ID3D11Buffer*             vb;
+    ID3D11Buffer*             cb;
+    ID3D11SamplerState*       smp;
+    ID3D11RasterizerState*    rs;
+    ID3D11BlendState*         bs;
+    UINT                      vertCount;
+    IDXGISwapChain*           qi;      // r106: QI-discovered public interface
     UINT                  w, h;
     int                   n;
 };
@@ -4280,6 +4322,9 @@ static volatile LONG     g_scInited = 0;
 static volatile LONG     g_pdwCalls = 0;
 static volatile LONG     g_pdwMarks = 0;
 static volatile LONG     g_pdwHooked = 0;
+static volatile LONG     g_v10cPaints = 0;     // r106: warp draws issued
+static volatile LONG     g_v10cRestores = 0;   // r106: post-present restores done
+static volatile LONG     g_v10cBad = 0;        // r106: warp skipped / failed
 static void*             g_pdwTramp = nullptr; // original PresentDWM
 static void*             g_pdwBackIdxFn = nullptr; // dxgi+0x20610
 typedef HRESULT (STDMETHODCALLTYPE* PFN_PDW10)(void*, void*, void*, void*, void*,
@@ -4312,6 +4357,23 @@ static void scReadback(ULONG cur, const char* tag) {
 }
 
 // One-time per process: identify the swapchain, its device and every buffer.
+// r106 (article ch.6): PresentDWM's `this` is a private COM class - its vtable
+// layout is NOT guaranteed to match IDXGISwapChain. Discover the real
+// interface with QueryInterface first (self, then the inner object at +0x40
+// that the wrapper forwards to); raw slots 7/9 stay as the fallback.
+static IDXGISwapChain* qiTrySwapChain(void* obj) {
+    if (!obj || IsBadReadPtr(obj, 8)) return nullptr;
+    void** vt = *(void***)obj;
+    if (!vt || IsBadReadPtr(vt, 8)) return nullptr;
+    IDXGISwapChain* qi = nullptr;
+    typedef HRESULT (STDMETHODCALLTYPE* PFN_QI)(void*, const IID&, void**);
+    HRESULT hr = E_FAIL;
+    __try { hr = ((PFN_QI)vt[0])(obj, __uuidof(IDXGISwapChain), (void**)&qi); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    if (FAILED(hr) || !qi) return nullptr;
+    return qi;
+}
+
 static void scInspect(void* self) {
     char b[192];
     g_sc.self = self;
@@ -4324,12 +4386,35 @@ static void scInspect(void* self) {
         else   wsprintfA(b, "PDW: vt[%d]=%p (no module)", i, vt[i]);
         iwnHookLog(b);
     }
-    PFN_SCGETDEV getDev = (PFN_SCGETDEV)vt[7];
-    PFN_SCGETBUF getBuf = (PFN_SCGETBUF)vt[9];
-    HRESULT hr = getDev(self, __uuidof(ID3D11Device), (void**)&g_sc.dev);
+    // article ch.6: interface discovery instead of vtable guessing
+    g_sc.qi = qiTrySwapChain(self);
+    void* scObj = self;
+    if (!g_sc.qi) {
+        void* alt = nullptr;
+        __try { alt = *(void**)((char*)self + 0x40); } __except (1) { alt = nullptr; }
+        g_sc.qi = qiTrySwapChain(alt);
+        if (g_sc.qi) { scObj = alt; iwnHookLog("PDW: QI OK on inner object at +0x40"); }
+    }
+    if (g_sc.qi) iwnHookLog("PDW: QI(IDXGISwapChain) OK - public interface layout");
+    PFN_SCGETDEV getDev;
+    PFN_SCGETBUF getBuf;
+    if (g_sc.qi) {
+        // route through the discovered IDXGISwapChain (slots 7/9 of the PUBLIC
+        // interface, not the private class layout)
+        getDev = nullptr;   // unused in this branch; direct COM calls below
+        getBuf = nullptr;
+    } else {
+        getDev = (PFN_SCGETDEV)vt[7];
+        getBuf = (PFN_SCGETBUF)vt[9];
+        iwnHookLog("PDW: QI FAILED - falling back to raw slots 7/9");
+    }
+    HRESULT hr = E_FAIL;
+    if (g_sc.qi) hr = g_sc.qi->GetDevice(__uuidof(ID3D11Device), (void**)&g_sc.dev);
+    else         hr = getDev(scObj, __uuidof(ID3D11Device), (void**)&g_sc.dev);
     if (FAILED(hr) || !g_sc.dev) {
         wsprintfA(b, "PDW: GetDevice FAILED hr=0x%lX", (unsigned long)hr);
         iwnHookLog(b);
+        if (g_sc.qi) { g_sc.qi->Release(); g_sc.qi = nullptr; }
         return;
     }
     g_sc.dev->GetImmediateContext(&g_sc.ctx);
@@ -4338,7 +4423,8 @@ static void scInspect(void* self) {
     iwnHookLog(b);
     for (UINT i = 0; i < IWN_SC_MAX; i++) {
         ID3D11Texture2D* t = nullptr;
-        hr = getBuf(self, i, __uuidof(ID3D11Texture2D), (void**)&t);
+        if (g_sc.qi) hr = g_sc.qi->GetBuffer(i, __uuidof(ID3D11Texture2D), (void**)&t);
+        else         hr = getBuf(scObj, i, __uuidof(ID3D11Texture2D), (void**)&t);
         if (FAILED(hr) || !t) break;
         D3D11_TEXTURE2D_DESC d;
         t->GetDesc(&d);
@@ -4386,21 +4472,297 @@ static void scInspect(void* self) {
     iwnHookLog(b);
 }
 
-// 8x8 colour block onto the live back buffer. Colour names the buffer:
-// 0 RED / 1 LIME / 2 BLUE / 3 YELLOW. Whichever shows up in an external
-// screenshot is the buffer dwm really blts to the display. dwm redraws the
-// back buffer every present, so no restore is needed - the marker lives one
-// frame unless repainted.
-static void scMarkBack(ULONG cur) {
-    if (!g_sc.marker || !g_sc.ctx || (int)cur >= g_sc.n || !g_sc.tex[cur]) return;
-    static const UINT cols[4] = { 0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFF00FFFFu };
-    UINT px = cols[cur & 3];
-    g_sc.ctx->UpdateSubresource(g_sc.marker, 0, nullptr, &px, 32, 0);
-    D3D11_BOX bx = { 0, 0, 0, 8, 8, 1 };
+// ---- r106: v10c instantaneous warp, all resources on the SC device ----------
+// The article is explicit (section 11.4): painting on SOMEONE ELSE'S device
+// context leaks pipeline state into the owner's next frame. Everything below
+// is created on g_sc.dev and driven through g_sc.ctx, and every Set* we issue
+// is undone by sc10cStateRestore before PresentDWM's original body runs.
+static void sc10cStateSave(IWNState* s) {
+    if (!s || !g_sc.ctx) return;
+    ZeroMemory(s, sizeof(*s));
+    s->nvp = IWN_MAX_VP;
     __try {
-        g_sc.ctx->CopySubresourceRegion(g_sc.tex[cur], 0, 4, 4, 0, g_sc.marker, 0, &bx);
-        InterlockedIncrement(&g_pdwMarks);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+        g_sc.ctx->OMGetRenderTargets(1, &s->rtv, &s->dsv);
+        g_sc.ctx->RSGetViewports(&s->nvp, s->vp);
+        g_sc.ctx->VSGetShader(&s->vs, nullptr, nullptr);
+        g_sc.ctx->PSGetShader(&s->ps, nullptr, nullptr);
+        g_sc.ctx->IAGetInputLayout(&s->il);
+        g_sc.ctx->IAGetPrimitiveTopology(&s->topo);
+        g_sc.ctx->IAGetVertexBuffers(0, 1, &s->vb, &s->stride, &s->offset);
+        g_sc.ctx->PSGetShaderResources(0, 1, &s->srv);
+        g_sc.ctx->PSGetSamplers(0, 1, &s->smp);
+        g_sc.ctx->PSGetConstantBuffers(0, 1, &s->cb);
+        g_sc.ctx->RSGetState(&s->rs);
+        g_sc.ctx->OMGetBlendState(&s->bs, s->bf, &s->mask);
+        g_sc.ctx->OMGetDepthStencilState(&s->dss, &s->stencil);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+static void sc10cStateRestore(IWNState* s) {
+    if (!s || !g_sc.ctx) return;
+    __try {
+        if (s->rtv) g_sc.ctx->OMSetRenderTargets(1, &s->rtv, s->dsv);
+        else        g_sc.ctx->OMSetRenderTargets(0, nullptr, s->dsv);
+        g_sc.ctx->RSSetViewports(s->nvp <= IWN_MAX_VP ? s->nvp : IWN_MAX_VP, s->vp);
+        g_sc.ctx->VSSetShader(s->vs, nullptr, 0);
+        g_sc.ctx->PSSetShader(s->ps, nullptr, 0);
+        g_sc.ctx->IASetInputLayout(s->il);
+        g_sc.ctx->IASetPrimitiveTopology(s->topo);
+        g_sc.ctx->IASetVertexBuffers(0, 1, &s->vb, &s->stride, &s->offset);
+        g_sc.ctx->PSSetShaderResources(0, 1, &s->srv);
+        g_sc.ctx->PSSetSamplers(0, 1, &s->smp);
+        g_sc.ctx->PSSetConstantBuffers(0, 1, &s->cb);
+        g_sc.ctx->RSSetState(s->rs);
+        g_sc.ctx->OMSetBlendState(s->bs, s->bf, s->mask);
+        g_sc.ctx->OMSetDepthStencilState(s->dss, s->stencil);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    if (s->rtv) s->rtv->Release();
+    if (s->dsv) s->dsv->Release();
+    if (s->vs)  s->vs->Release();
+    if (s->ps)  s->ps->Release();
+    if (s->il)  s->il->Release();
+    if (s->vb)  s->vb->Release();
+    if (s->srv) s->srv->Release();
+    if (s->smp) s->smp->Release();
+    if (s->cb)  s->cb->Release();
+    if (s->rs)  s->rs->Release();
+    if (s->bs)  s->bs->Release();
+    if (s->dss) s->dss->Release();
+    ZeroMemory(s, sizeof(*s));
+}
+
+// same corner-blend math as fillGrid(), but into the SC device's VB
+static void scFillGrid() {
+    if (!g_sc.ctx || !g_sc.vb) return;
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(g_sc.ctx->Map(g_sc.vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) || !m.pData) return;
+    IWNVtx* out = (IWNVtx*)m.pData;
+    const int n = IWN_GRID_N;
+    for (int gy = 0; gy < n - 1; gy++) {
+        for (int gx = 0; gx < n - 1; gx++) {
+            int cx[4] = { gx, gx + 1, gx,     gx + 1 };
+            int cy[4] = { gy, gy,     gy + 1, gy + 1 };
+            IWNVtx q[4];
+            for (int k = 0; k < 4; k++) {
+                float u = (float)cx[k] / (float)(n - 1);
+                float v = (float)cy[k] / (float)(n - 1);
+                float du = (1 - u) * (1 - v) * g_cTLu + u * (1 - v) * g_cTRu
+                         + (1 - u) * v * g_cBLu + u * v * g_cBRu;
+                float dv = (1 - u) * (1 - v) * g_cTLv + u * (1 - v) * g_cTRv
+                         + (1 - u) * v * g_cBLv + u * v * g_cBRv;
+                q[k].x = du * 2.0f - 1.0f;
+                q[k].y = 1.0f - dv * 2.0f;
+                q[k].u = u;
+                q[k].v = v;
+            }
+            *out++ = q[0]; *out++ = q[1]; *out++ = q[2];
+            *out++ = q[1]; *out++ = q[3]; *out++ = q[2];
+        }
+    }
+    g_sc.ctx->Unmap(g_sc.vb, 0);
+}
+
+static void scFillCb() {
+    if (!g_sc.ctx || !g_sc.cb) return;
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(g_sc.ctx->Map(g_sc.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) || !m.pData) return;
+    float* f = (float*)m.pData;
+    f[0] = g_fadeL; f[1] = g_fadeR; f[2] = g_fadeT; f[3] = g_fadeB;
+    f[4] = g_gain;  f[5] = g_gamma; f[6] = 0.0f;    f[7] = 0.0f;
+    g_sc.ctx->Unmap(g_sc.cb, 0);
+}
+
+// one-time: RTV per swapchain buffer + clean canvas + full pipeline on g_sc.dev
+static BOOL sc10cEnsure() {
+    if (g_sc.clean && g_sc.vs && g_sc.ps && g_sc.rtv[0]) return TRUE;
+    if (!g_sc.dev || !g_sc.ctx || g_sc.n == 0) return FALSE;
+    char b[192];
+
+    for (int i = 0; i < g_sc.n && i < IWN_SC_MAX; i++) {
+        if (!g_sc.tex[i]) continue;
+        if (g_sc.rtv[i]) continue;
+        ID3D11RenderTargetView* rv = nullptr;
+        HRESULT hr = g_sc.dev->CreateRenderTargetView(g_sc.tex[i], nullptr, &rv);
+        if (FAILED(hr) || !rv) {
+            wsprintfA(b, "v10c: RTV buf%d FAILED hr=0x%08lX", i, (unsigned long)hr);
+            iwnHookLog(b);
+            return FALSE;
+        }
+        g_sc.rtv[i] = rv;
+    }
+
+    if (!g_sc.clean) {
+        ID3D11Texture2D* t0 = g_sc.tex[0];
+        if (!t0) return FALSE;
+        D3D11_TEXTURE2D_DESC td = {};
+        __try { t0->GetDesc(&td); } __except (EXCEPTION_EXECUTE_HANDLER) { return FALSE; }
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        HRESULT hr = g_sc.dev->CreateTexture2D(&td, nullptr, &g_sc.clean);
+        if (FAILED(hr) || !g_sc.clean) {
+            wsprintfA(b, "v10c: clean canvas FAILED hr=0x%08lX", (unsigned long)hr);
+            iwnHookLog(b);
+            return FALSE;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = td.Format;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+        hr = g_sc.dev->CreateShaderResourceView(g_sc.clean, &sd, &g_sc.cleanSrv);
+        if (FAILED(hr) || !g_sc.cleanSrv) {
+            wsprintfA(b, "v10c: clean SRV FAILED hr=0x%08lX", (unsigned long)hr);
+            iwnHookLog(b);
+            return FALSE;
+        }
+    }
+
+    if (!g_sc.vs) {
+        ID3DBlob* vsb = nullptr;
+        ID3DBlob* psb = nullptr;
+        ID3DBlob* err = nullptr;
+        HRESULT h1 = D3DCompile(kSrc, lstrlenA(kSrc), "iwn_warp_vs", nullptr, nullptr,
+                                "VSMain", "vs_5_0", 0, 0, &vsb, &err);
+        if (err) { iwnHookLog((const char*)err->GetBufferPointer()); err->Release(); err = nullptr; }
+        HRESULT h2 = S_OK;
+        if (SUCCEEDED(h1) && vsb)
+            h2 = D3DCompile(kSrc, lstrlenA(kSrc), "iwn_warp_ps", nullptr, nullptr,
+                            "PSMain", "ps_5_0", 0, 0, &psb, &err);
+        if (err) { iwnHookLog((const char*)err->GetBufferPointer()); err->Release(); err = nullptr; }
+        if (FAILED(h1) || FAILED(h2) || !vsb || !psb) {
+            if (vsb) vsb->Release();
+            if (psb) psb->Release();
+            iwnHookLog("v10c: shader compile FAILED");
+            return FALSE;
+        }
+        D3D11_INPUT_ELEMENT_DESC el[2] = {};
+        el[0].SemanticName = "POSITION";
+        el[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+        el[0].InputSlot = 0;
+        el[0].AlignedByteOffset = 0;
+        el[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        el[1].SemanticName = "TEXCOORD";
+        el[1].SemanticIndex = 0;
+        el[1].Format = DXGI_FORMAT_R32G32_FLOAT;
+        el[1].InputSlot = 0;
+        el[1].AlignedByteOffset = 8;
+        el[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        HRESULT h3 = g_sc.dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g_sc.vs);
+        HRESULT h4 = g_sc.dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g_sc.ps);
+        HRESULT h5 = g_sc.dev->CreateInputLayout(el, 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &g_sc.il);
+        vsb->Release();
+        psb->Release();
+        if (FAILED(h3) || FAILED(h4) || FAILED(h5)) {
+            wsprintfA(b, "v10c: shader objects vs=0x%08lX ps=0x%08lX il=0x%08lX",
+                      (unsigned long)h3, (unsigned long)h4, (unsigned long)h5);
+            iwnHookLog(b);
+            return FALSE;
+        }
+
+        const int quads = (IWN_GRID_N - 1) * (IWN_GRID_N - 1);
+        g_sc.vertCount = (UINT)(quads * 6);
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = g_sc.vertCount * (UINT)sizeof(IWNVtx);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(g_sc.dev->CreateBuffer(&bd, nullptr, &g_sc.vb)) || !g_sc.vb) {
+            iwnHookLog("v10c: VB create FAILED");
+            return FALSE;
+        }
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth = 32;
+        cbd.Usage = D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(g_sc.dev->CreateBuffer(&cbd, nullptr, &g_sc.cb)) || !g_sc.cb) {
+            iwnHookLog("v10c: CB create FAILED");
+            return FALSE;
+        }
+        D3D11_SAMPLER_DESC smp = {};
+        smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        smp.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        smp.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        smp.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(g_sc.dev->CreateSamplerState(&smp, &g_sc.smp)) || !g_sc.smp) {
+            iwnHookLog("v10c: sampler FAILED");
+            return FALSE;
+        }
+        D3D11_RASTERIZER_DESC rd = {};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        rd.DepthClipEnable = FALSE;
+        rd.ScissorEnable = FALSE;
+        if (FAILED(g_sc.dev->CreateRasterizerState(&rd, &g_sc.rs)) || !g_sc.rs) {
+            iwnHookLog("v10c: rasterizer FAILED");
+            return FALSE;
+        }
+        D3D11_BLEND_DESC bld = {};
+        bld.RenderTarget[0].BlendEnable = FALSE;
+        bld.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(g_sc.dev->CreateBlendState(&bld, &g_sc.bs)) || !g_sc.bs) {
+            iwnHookLog("v10c: blend FAILED");
+            return FALSE;
+        }
+        scFillGrid();
+        scFillCb();
+        wsprintfA(b, "v10c: pipeline ready dev=%p (g_dev=%p %s) verts=%u bufs=%d",
+                  (void*)g_sc.dev, (void*)g_dev, g_sc.dev == g_dev ? "SAME" : "CROSS",
+                  g_sc.vertCount, g_sc.n);
+        iwnHookLog(b);
+    }
+    return TRUE;
+}
+
+// steps 1+2 of the article's v10c: absorb dwm's frame into the clean canvas,
+// then warp-draw the canvas straight onto the back buffer. Steps 3 (original
+// present = scanout) and 4 (restore) live in the caller around the trampoline.
+// NO ClearRenderTargetView: the old pipeline needed one because a separate RT
+// had to start black; here the mesh covers the keystone quad and the margins
+// keep dwm's own frame - zero extra full-screen ops. Budget: 2 copies + 1 draw.
+static BOOL sc10cWarp(ULONG cur) {
+    if ((int)cur >= g_sc.n || !g_sc.tex[cur] || !g_sc.rtv[cur] ||
+        !g_sc.clean || !g_sc.cleanSrv || !g_sc.vs || !g_sc.ps) return FALSE;
+    ID3D11Texture2D* bb = g_sc.tex[cur];
+    ID3D11DeviceContext* ctx = g_sc.ctx;
+    IWNState st;
+    __try {
+        ctx->CopyResource(g_sc.clean, bb);          // 1: absorb (canvas = dwm's frame)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        return FALSE;
+    }
+    scFillGrid();                                    // corner params can change live
+    scFillCb();
+    sc10cStateSave(&st);
+    D3D11_VIEWPORT vp = { 0, 0, (float)g_sc.w, (float)g_sc.h, 0.0f, 1.0f };
+    UINT stride = sizeof(IWNVtx), off = 0;
+    __try {
+        ctx->RSSetViewports(1, &vp);
+        ctx->RSSetState(g_sc.rs);
+        ctx->OMSetBlendState(g_sc.bs, nullptr, 0xFFFFFFFF);
+        ctx->OMSetDepthStencilState(nullptr, 0);
+        ctx->IASetInputLayout(g_sc.il);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->IASetVertexBuffers(0, 1, &g_sc.vb, &stride, &off);
+        ctx->VSSetShader(g_sc.vs, nullptr, 0);
+        ctx->PSSetShader(g_sc.ps, nullptr, 0);
+        ctx->PSSetShaderResources(0, 1, &g_sc.cleanSrv);
+        ctx->PSSetSamplers(0, 1, &g_sc.smp);
+        ctx->PSSetConstantBuffers(0, 1, &g_sc.cb);
+        ctx->OMSetRenderTargets(1, &g_sc.rtv[cur], nullptr);
+        ctx->Draw(g_sc.vertCount, 0);                // 2: warp onto the back buffer
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_fail);
+        iwnHookLog("v10c: draw EXCEPTION");
+    }
+    sc10cStateRestore(&st);                          // article 11.4: leave NOTHING bound
+    InterlockedIncrement(&g_draws);
+    return TRUE;
 }
 
 static HRESULT STDMETHODCALLTYPE IWN_PresentDWMWrap(void* self, void* a2, void* a3, void* a4,
@@ -4421,26 +4783,64 @@ static HRESULT STDMETHODCALLTYPE IWN_PresentDWMWrap(void* self, void* a2, void* 
             iwnHookLog(b);
         }
     }
-    if (InterlockedCompareExchange(&g_scInited, 1, 0) == 0) scInspect(self);
+    if (InterlockedCompareExchange(&g_scInited, 1, 0) == 0 && !g_hardStop)
+        scInspect(self);
     ULONG cur = 0;
     if (g_pdwBackIdxFn && g_sc.self == self) {
         __try { cur = ((PFN_SCBACKIDX)g_pdwBackIdxFn)(self); }
         __except (EXCEPTION_EXECUTE_HANDLER) { cur = 0; }
     }
-    // marker only while the warp session is actually running
-    if (g_ready && (LONG)g_stage >= IWN_PH_CF_DEF) scMarkBack(cur);
-    if ((calls & 255) == 0) scReadback(cur, "tick");
-    return ((PFN_PDW10)g_pdwTramp)(self, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+    // r106 v10c: the whole warp lives inside this one call.
+    BOOL warped = FALSE;
+    if (g_ready && !g_quiet && (LONG)g_stage >= IWN_PH_CF_DEF &&
+        g_sc.self == self && (int)cur < g_sc.n) {
+        if (sc10cEnsure()) {
+            __try { warped = sc10cWarp(cur); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); warped = FALSE; }
+            if (warped) InterlockedIncrement(&g_v10cPaints);
+            else        InterlockedIncrement(&g_v10cBad);
+        } else {
+            InterlockedIncrement(&g_v10cBad);
+        }
+    }
+    HRESULT hr = ((PFN_PDW10)g_pdwTramp)(self, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+    if (warped && (int)cur < g_sc.n && g_sc.clean && g_sc.ctx && g_sc.tex[cur]) {
+        // 4: restore BEFORE anything else can sample the canvas - this is the
+        // line that kills the recursion. dwm's next frame starts clean.
+        __try { g_sc.ctx->CopyResource(g_sc.tex[cur], g_sc.clean); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_fail); }
+        InterlockedIncrement(&g_v10cRestores);
+        static volatile LONG s_first = 0;
+        if (InterlockedCompareExchange(&s_first, 1, 0) == 0)
+            iwnHookLog("v10c: first restore done - canvas clean between frames");
+    }
+    return hr;
 }
 
 static void scRelease() {
     if (g_sc.marker) { g_sc.marker->Release(); g_sc.marker = nullptr; }
     if (g_sc.stage)  { g_sc.stage->Release();  g_sc.stage  = nullptr; }
+    // r106: v10c resources
+    for (int i = 0; i < IWN_SC_MAX; i++) {
+        if (g_sc.rtv[i]) { g_sc.rtv[i]->Release(); g_sc.rtv[i] = nullptr; }
+    }
+    if (g_sc.cleanSrv) { g_sc.cleanSrv->Release(); g_sc.cleanSrv = nullptr; }
+    if (g_sc.clean)    { g_sc.clean->Release();    g_sc.clean    = nullptr; }
+    if (g_sc.bs)  { g_sc.bs->Release();  g_sc.bs  = nullptr; }
+    if (g_sc.rs)  { g_sc.rs->Release();  g_sc.rs  = nullptr; }
+    if (g_sc.smp) { g_sc.smp->Release(); g_sc.smp = nullptr; }
+    if (g_sc.cb)  { g_sc.cb->Release();  g_sc.cb  = nullptr; }
+    if (g_sc.vb)  { g_sc.vb->Release();  g_sc.vb  = nullptr; }
+    if (g_sc.il)  { g_sc.il->Release();  g_sc.il  = nullptr; }
+    if (g_sc.ps)  { g_sc.ps->Release();  g_sc.ps  = nullptr; }
+    if (g_sc.vs)  { g_sc.vs->Release();  g_sc.vs  = nullptr; }
+    g_sc.vertCount = 0;
     for (int i = 0; i < IWN_SC_MAX; i++) {
         if (g_sc.tex[i]) { g_sc.tex[i]->Release(); g_sc.tex[i] = nullptr; }
     }
     if (g_sc.ctx) { g_sc.ctx->Release(); g_sc.ctx = nullptr; }
     if (g_sc.dev) { g_sc.dev->Release(); g_sc.dev = nullptr; }
+    if (g_sc.qi)  { g_sc.qi->Release();  g_sc.qi  = nullptr; }
     g_sc.n = 0; g_sc.self = nullptr;
     g_scInited = 0;
 }
@@ -4491,6 +4891,77 @@ static void installLegacyPresentHook() {
     } else {
         iwnHookLog("PDW: no .rdata slot pointed at PresentDWM - hook NOT installed");
     }
+}
+
+// ---- r106: compwin - the forced-full-composition window (article 13.1) ------
+// Even with MPO disabled by registry, dwm keeps plane-promoting its own
+// swapchain until something forces a full composition every frame. A layered
+// (alpha=1), click-through, topmost window is that lever: while it exists,
+// PresentDWM runs 40-60 calls/s and the v10c paint point is reached.
+//
+// NON-NEGOTIABLE (the article's chicken-and-egg deadlock): this window must be
+// managed by a worker thread that is independent of the PresentDWM detour.
+// Spawning it inside the detour is a deadlock - PresentDWM only fires when the
+// window exists, and the window would only be created when PresentDWM fires.
+// The thread also owns a real exit path: while(!g_hardStop) + DestroyWindow
+// from the thread that created the window (the original's for(;;) version left
+// an invisible fullscreen topmost window behind after shutdown).
+static HWND          g_compwinHwnd = nullptr;   // touched only by the compwin thread
+static HANDLE        g_compwinThread = nullptr;
+static volatile LONG g_compwinLive = 0;
+
+static DWORD WINAPI iwnCompwinThread(LPVOID) {
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    WNDCLASSW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"IWNCompwin";
+    RegisterClassW(&wc);          // second registration just fails harmlessly
+    while (!g_hardStop) {
+        BOOL want = (g_ready && !g_quiet && (LONG)g_stage >= IWN_PH_CF_DEF) ? 1 : 0;
+        if (want && !g_compwinHwnd) {
+            HWND h = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+                                     WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                     L"IWNCompwin", L"", WS_POPUP,
+                                     0, 0, GetSystemMetrics(SM_CXSCREEN),
+                                     GetSystemMetrics(SM_CYSCREEN),
+                                     nullptr, nullptr, hInst, nullptr);
+            if (h) {
+                SetLayeredWindowAttributes(h, 0, 1, LWA_ALPHA);
+                ShowWindow(h, SW_SHOWNOACTIVATE);
+                g_compwinHwnd = h;
+                InterlockedExchange(&g_compwinLive, 1);
+                iwnHookLog("compwin: layered topmost window active (alpha=1)");
+            } else {
+                static volatile LONG s_cwFail = 0;
+                if (InterlockedCompareExchange(&s_cwFail, 1, 0) == 0)
+                    iwnHookLog("compwin: CreateWindowExW FAILED");
+            }
+        } else if (!want && g_compwinHwnd) {
+            HWND h = g_compwinHwnd;
+            g_compwinHwnd = nullptr;
+            if (h) DestroyWindow(h);      // same thread created it - legal here
+            InterlockedExchange(&g_compwinLive, 0);
+            iwnHookLog("compwin: window destroyed");
+        }
+        MSG m;                            // drain the queue: no ghosted window
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        Sleep(500);
+    }
+    if (g_compwinHwnd) { DestroyWindow(g_compwinHwnd); g_compwinHwnd = nullptr; }
+    InterlockedExchange(&g_compwinLive, 0);
+    return 0;
+}
+
+static void startCompwinThread() {
+    if (g_compwinThread) return;
+    g_compwinThread = CreateThread(nullptr, 0, iwnCompwinThread, nullptr, 0, nullptr);
+    iwnHookLog(g_compwinThread ? "compwin: spawning composition-forcer thread"
+                               : "compwin: thread create FAILED");
 }
 
 // ---- round 76: wire swapchain Present hook ----------------------------------
@@ -4557,7 +5028,11 @@ void DwmWarpBeforeSubmit() {
     // (DPC_WATCHDOG_VIOLATION) on this NVS 4200M roughly seven minutes after
     // the probe window closed - a 2011-era driver under sustained warp load.
     // The budget is now 45s of warp, and a runaway failure count cuts it early.
-    if (el > 45000 || (LONG)g_fail > 400) {
+    if (el > (IWN_V10C ? 600000u : 45000u) || (LONG)g_fail > 400) {
+        // r106: the 45s budget was sized for the >=5-fullscreen-ops rounds that
+        // bugchecked. v10c runs exactly 3 full-screen ops per frame (article's
+        // own session: 40k+ frames on this GPU class), so the budget goes to
+        // 10 minutes; the failure latch stays as the hard rail.
         BOOL failStop = ((LONG)g_fail > 400);
         g_ready = 0;
         g_stage = -1;
@@ -4620,6 +5095,11 @@ void DwmWarpBeforeSubmit() {
             // what routes overlay windows back through the surface dwm presents.
             DwmWarpSetMpoSuppressed(TRUE);
             installLegacyPresentHook();
+            // r106: compwin forces full composition so PresentDWM fires every
+            // frame. Started from THIS worker context, never from a detour -
+            // spawning inside PresentDWM is the article's chicken-and-egg
+            // deadlock (window needs PresentDWM, PresentDWM needs window).
+            startCompwinThread();
         }
         if (ph == IWN_PH_PRESNT && !g_presntTried) {
             // mode B entry: install the wrapper once
@@ -4731,6 +5211,17 @@ void DwmWarpBeforeSubmit() {
                           (long)g_ntbCfPost, (long)g_fullRender,
                           (long)g_ffrBad, (long)g_draws);
                 iwnHookLog(b7);
+                // r106: the load-bearing signal. pdw must tick 40-60/s (compwin
+                // + registry MPO off) and warp/restore must tick in lockstep.
+                // Independent of any event log - the article's 14.1 lesson:
+                // throttled event logs masquerade as "stopped at frame 8".
+                char b8[160];
+                wsprintfA(b8, "r106 v10c pdw=%ld warp=%ld rest=%ld bad=%ld "
+                          "compwin=%ld quiet=%ld",
+                          (long)g_pdwCalls, (long)g_v10cPaints,
+                          (long)g_v10cRestores, (long)g_v10cBad,
+                          (long)g_compwinLive, (long)g_quiet);
+                iwnHookLog(b8);
             }
             {
                 char b2[128];
@@ -4773,7 +5264,9 @@ void DwmWarpBeforeSubmit() {
     // round 72: quiet dump window. Round 74: opens at el=120s (after the mode
     // comparison); dumpFacesTick itself is scheduled independently so rounds
     // r1/r2 fire inside modes A/B while the warp is live.
-    if (g_dwin == 0 && el > 120000) {
+    // r106: no auto-quiet under v10c - the warp is a live feature now, not a
+    // 150s experiment. Diagnostics stay available through the config.
+    if (g_dwin == 0 && el > 120000 && !IWN_V10C) {
         g_dwin = 1;
         g_quiet = 1;
         iwnHookLog("FACE DUMP window open (paint quiet until el=140s)");
@@ -4848,7 +5341,7 @@ void DwmWarpBeforeSubmit() {
     }
 
     InterlockedIncrement(&g_frames);
-    if (!g_quiet) paintAtConfirmFrame(ph);
+    if (!g_quiet && !IWN_V10C) paintAtConfirmFrame(ph);
 
     if (g_fail > 30) {
         g_ready = 0;
@@ -4861,6 +5354,7 @@ void DwmWarpBeforeSubmit() {
 
 void DwmWarpAfterSubmit() {
     if (!g_ready) return;
+    if (IWN_V10C) return;   // r106: restore happens inside PresentDWMWrap
     LONG st = g_stage;
     if (st == IWN_PH_CF_IMM) {
         // Hand the surfaces back clean BEFORE dwm renders the next frame's
